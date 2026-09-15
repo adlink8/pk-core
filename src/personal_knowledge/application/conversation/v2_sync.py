@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from personal_knowledge.adapters.conversation_sources.contracts import (
+    PROBE_CONTENT_HASH,
     AdaptationResult,
     SourceArtifact,
     SourceArtifactSet,
@@ -80,7 +81,7 @@ def _probe_artifact(relative: str, size: int, head: bytes = b"") -> SourceArtifa
         artifact_id=relative,
         family="",
         source_kind=kind,
-        content_hash="probe",
+        content_hash=PROBE_CONTENT_HASH,
         capture_method="probe",
         relative_path=relative,
         byte_size=size,
@@ -116,7 +117,8 @@ def probe_conversation_sources(
             event_estimate = 0
             if status == "detected" and len(matches) == 1:
                 event_estimate = _estimate_events(
-                    matches[0], store, owner, byte_limit, count_limit
+                    matches[0], store, owner, byte_limit, count_limit,
+                    source_root=source_root,
                 )
             items.append({
                 "family": name,
@@ -146,6 +148,11 @@ def _detect_families(source_root: Path) -> dict[str, list[Path]]:
     """
     detected: dict[str, list[Path]] = {}
     known = set(known_families())
+    from personal_knowledge.adapters.conversation_sources.discovery import (
+        CAPTURE_TEMP_PREFIXES,
+        mirror_path_for,
+    )
+
     for dirpath, dirnames, filenames in os.walk(source_root):
         dirnames[:] = sorted(
             d for d in dirnames if d not in (".staging", "artifacts", ".hashes.json")
@@ -162,7 +169,10 @@ def _detect_families(source_root: Path) -> dict[str, list[Path]]:
         except ValueError:
             hint = None
         for name in sorted(filenames):
-            if name == ".hashes.json":
+            # Capture intermediates share the stage tree with real sources but
+            # are derived from one of them, so adapting them duplicates events
+            # (and their ids). Never treat them as sources.
+            if name == ".hashes.json" or name.startswith(CAPTURE_TEMP_PREFIXES):
                 continue
             f = parent / name
             head = b""
@@ -187,12 +197,23 @@ def _detect_families(source_root: Path) -> dict[str, list[Path]]:
 
 def _estimate_events(
     path: Path, store: Path, family: str, byte_limit: int, count_limit: int,
+    *, source_root: Path | None = None,
 ) -> int:
     """Best-effort typed event count for a single detected file."""
+
+    # Local import, matching the other discovery uses in this module.
+    # ``mirror_path_for`` was previously referenced here without being imported,
+    # so every estimate raised NameError and was swallowed into ``0``.
+    from personal_knowledge.adapters.conversation_sources.discovery import (
+        mirror_path_for,
+    )
+
     try:
+        mirror_path = mirror_path_for(family, path, source_root=source_root)
         artifact, blob = capture_file(
             path, store, relative_path=path.name,
             byte_limit=byte_limit, count_limit=count_limit,
+            family=family, mirror_path=mirror_path,
         )
         result = adapt_for(
             family, SourceArtifactSet((artifact,)), artifact_root=blob.parent
@@ -207,6 +228,7 @@ def _estimate_events(
 
 def _adapt_source_file(
     path: Path, store: Path, *, byte_limit: int, count_limit: int, family: str,
+    mirror_path: str,
 ) -> tuple[SourceArtifact, AdaptationResult]:
     """Capture one source file (file or WAL-safe SQLite) then adapt it.
 
@@ -228,11 +250,13 @@ def _adapt_source_file(
         artifact, blob = capture_sqlite(
             path, store, allowed_tables=tables, allowed_columns=columns,
             byte_limit=byte_limit, count_limit=count_limit,
+            family=family, mirror_path=mirror_path,
         )
     else:
         artifact, blob = capture_file(
             path, store, relative_path=path.name,
             byte_limit=byte_limit, count_limit=count_limit,
+            family=family, mirror_path=mirror_path,
         )
     result = adapt_for(
         family, SourceArtifactSet((artifact,)), artifact_root=blob.parent
@@ -280,7 +304,7 @@ def shadow_conversation_generation(
     life = GenerationLifecycle(db)
     generations = _stage_all_families(
         life, by_family, artifact_store, byte_limit=byte_limit,
-        count_limit=count_limit,
+        count_limit=count_limit, source_root=source_root,
     )
     report = {
         "mode": "shadow",
@@ -329,8 +353,17 @@ def _stage_all_families(
     *,
     byte_limit: int,
     count_limit: int,
+    source_root: Path | None = None,
 ) -> dict[str, dict]:
     """Stage all detected owners as one atomic multi-family cohort."""
+
+    # Local import, matching the other discovery uses in this module.
+    # ``mirror_path_for`` was previously referenced here without being imported,
+    # so every family raised NameError and was reported as ``adapt_failed``.
+    from personal_knowledge.adapters.conversation_sources.discovery import (
+        mirror_path_for,
+    )
+
     owner_entries: dict[str, dict] = {}
     generation_inputs: list[GenerationInput] = []
     all_digests: list[str] = []
@@ -348,14 +381,29 @@ def _stage_all_families(
         if matches:
             try:
                 results: list[AdaptationResult] = []
+                seen_content: set[str] = set()
                 for path in matches:
+                    mirror_path = mirror_path_for(owner, path, source_root=source_root)
                     artifact, result = _adapt_source_file(
                         path, store, byte_limit=byte_limit,
                         count_limit=count_limit, family=owner,
+                        mirror_path=mirror_path,
                     )
+                    # Dedup is keyed by ``content_hash`` (product decision, kept):
+                    # since milestone 1 the slot ``artifact_id`` is derived from
+                    # (family, mirror path), so two byte-identical files in
+                    # different directories have DIFFERENT artifact ids but the
+                    # SAME content hash. Two staged copies of one payload must
+                    # still be adapted once, or they emit the same event ids and
+                    # fail the merge contract (observed: three byte-identical
+                    # grok chat_history.jsonl in distinct session dirs).
+                    if artifact.content_hash in seen_content:
+                        continue
+                    seen_content.add(artifact.content_hash)
                     results.append(result)
                     all_hashes.append(artifact.content_hash)
                 merged = _merge_family_results(owner, results)
+                _assert_referential_integrity(owner, merged)
                 cap = capability_for(owner)
                 family_manifest = _digest("manifest", *sorted(
                     a.content_hash for a in merged.artifacts
@@ -436,6 +484,38 @@ def _report_digest(report: dict) -> str:
     ).hexdigest()
 
 
+def _assert_referential_integrity(family: str, merged: AdaptationResult) -> None:
+    """Fail closed when a family emits rows the generation cannot carry.
+
+    ``ce_events`` has foreign keys onto ``ce_sessions(generation_id, session_id)``
+    and ``ce_source_artifacts(artifact_id)``, and SQLite's ``INSERT OR IGNORE``
+    does *not* suppress foreign-key violations — a dangling reference aborts the
+    whole cohort write with an opaque ``IntegrityError``. Check it per family so
+    the report names the family and the offending id instead.
+    """
+    from personal_knowledge.core.conversation_events import EventContractError
+
+    session_ids = {s.session_id for s in merged.sessions}
+    artifact_ids = {a.artifact_id for a in merged.artifacts}
+    for session in merged.sessions:
+        if session.provenance.artifact_id not in artifact_ids:
+            raise EventContractError(
+                f"{family}: session {session.session_id} references artifact "
+                f"{session.provenance.artifact_id} outside this family"
+            )
+    for event in merged.events:
+        if event.session_id not in session_ids:
+            raise EventContractError(
+                f"{family}: event {event.event_id} references session "
+                f"{event.session_id} with no session record"
+            )
+        if event.provenance.artifact_id not in artifact_ids:
+            raise EventContractError(
+                f"{family}: event {event.event_id} references artifact "
+                f"{event.provenance.artifact_id} outside this family"
+            )
+
+
 def _merge_family_results(
     family: str, results: list[AdaptationResult]
 ) -> AdaptationResult:
@@ -459,7 +539,7 @@ def _merge_family_results(
 
 def _stage_family(
     life: GenerationLifecycle, family: str, path: Path, store: Path,
-    *, byte_limit: int, count_limit: int,
+    *, byte_limit: int, count_limit: int, source_root: Path | None = None,
 ) -> dict:
     """Stage one family's generation and return its metadata-only entry.
 
@@ -473,9 +553,11 @@ def _stage_family(
         "privacy_blocked": False,
     }
     try:
+        mirror_path = mirror_path_for(family, path, source_root=source_root)
         artifact, result = _adapt_source_file(
             path, store, byte_limit=byte_limit,
             count_limit=count_limit, family=family,
+            mirror_path=mirror_path,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed into a blocked status
         blocked["reason"] = f"adapt_failed:{type(exc).__name__}"
@@ -604,6 +686,8 @@ def activate_conversation_generation(
     if delta_publisher is not None:
         delta = delta_publisher({
             "generation_id": generation_id,
+            "delta_id": result["delta_id"],
+            "source_manifest_id": entry["source_manifest_id"],
             "projection_digest": result["projection_digest"],
             "dataset_digest": entry["dataset_digest"],
             "artifact_hashes": entry.get("artifact_hashes", []),

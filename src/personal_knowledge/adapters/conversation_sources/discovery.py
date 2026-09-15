@@ -34,14 +34,62 @@ from personal_knowledge.adapters.conversation_sources import (
     mimo_opencode,
     zcode,
 )
-from personal_knowledge.adapters.conversation_sources.contracts import SourceArtifact
+from personal_knowledge.adapters.conversation_sources.contracts import (
+    PROBE_CONTENT_HASH,
+    SourceArtifact,
+)
 from personal_knowledge.adapters.conversation_sources.registry import (
     ALIASES,
     detect_family,
+    resolve_family,
 )
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _HEAD_BYTES = 16
+
+# Filename prefixes of capture intermediates written by
+# :func:`snapshot_sqlite_to_file`. They are never source data: any consumer
+# that walks a stage tree must ignore them, or a leaked temp is misread as a
+# second copy of the trajectory it was derived from.
+CAPTURE_TEMP_PREFIXES = (".snap-", ".filtered-", ".tmp-")
+
+
+def capture_temp_root() -> Path:
+    """Project-local scratch dir holding capture intermediates.
+
+    Deliberately outside every stage root (see :func:`snapshot_sqlite_to_file`).
+    """
+    from personal_knowledge.core.project_paths import VAR_TMP
+
+    return VAR_TMP / "conversation-capture"
+
+
+def mirror_path_for(
+    family: str, source: Path, *, source_root: Path | None = None
+) -> str:
+    """Stable, family-scoped, directory-qualified path used for slot identity.
+
+    The slot ``artifact_id`` is derived from ``family`` + this mirror path, so the
+    path MUST be unique per (family, source file) and constant across content
+    edits. We prefer the source's path relative to ``source_root`` (when the sync
+    is driven by an explicit root, e.g. the v2 shadow stage), else relative to the
+    family's native client root, else fall back to the bare filename.
+
+    The bare-filename fallback is only reached for sources outside every known
+    root and is acceptable because such sources are not staged for live sync.
+    """
+    if source_root is not None:
+        try:
+            return str(source.relative_to(source_root))
+        except ValueError:
+            pass
+    for root in FAMILY_CLIENT_ROOTS.get(resolve_family(family), ()):
+        try:
+            return str(source.relative_to(root))
+        except ValueError:
+            continue
+    return source.name
+
 
 # Maximum depth of recursive discovery under one family root.
 MAX_DEPTH = 8
@@ -132,7 +180,7 @@ def _artifact_for(path: Path) -> SourceArtifact:
         artifact_id=path.name,
         family="",
         source_kind=probe_source_kind(path),
-        content_hash="probe",
+        content_hash=PROBE_CONTENT_HASH,
         capture_method="probe",
         relative_path=path.name,
         byte_size=size,
@@ -220,13 +268,20 @@ def snapshot_sqlite_to_file(
     content hash of the snapshot bytes.
     """
     import sqlite3
-    import tempfile
     import uuid
 
     staging_dir = target.parent
     staging_dir.mkdir(parents=True, exist_ok=True)
-    staging = staging_dir / f".snap-{uuid.uuid4().hex}.sqlite"
-    filtered = staging_dir / f".filtered-{uuid.uuid4().hex}.sqlite"
+    # Capture temps live OUTSIDE the stage tree. ``staging_dir`` is itself
+    # re-scanned by the v2 shadow detector on the next run, so a leaked temp
+    # (blocked cleanup, killed process) would be re-adapted as a second copy of
+    # the same trajectory and collide on event ids. ``var/tmp`` sits on the same
+    # volume as the stage root; the atomic publish below still writes its own
+    # ``.tmp-`` marker next to ``target`` so the rename stays same-volume.
+    temp_root = capture_temp_root()
+    temp_root.mkdir(parents=True, exist_ok=True)
+    staging = temp_root / f".snap-{uuid.uuid4().hex}.sqlite"
+    filtered = temp_root / f".filtered-{uuid.uuid4().hex}.sqlite"
     try:
         src = sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True)
         dst = sqlite3.connect(str(staging))

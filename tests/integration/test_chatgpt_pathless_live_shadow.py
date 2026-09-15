@@ -178,8 +178,13 @@ def test_live_shadow_adapts_each_pathless_chatgpt_session_and_message(tmp_path: 
     ]
     assert all(summary is None for _kind, _content, summary, _locator in rows)
 
-    artifact_id = chatgpt["artifact_refs"][0]["artifact_id"]
-    captured = artifact_store / "artifacts" / artifact_id
+    # Expectation changed: the blob store is content-addressed, so a captured
+    # file is named ``content_hash[:32]``. ``artifact_id`` is now the stable
+    # per-slot identity (sha256("art|<family>|<mirror path>")), so using it as
+    # the file name here resolved to a non-existent blob and the test failed
+    # with "unable to open database file".
+    content_hash = chatgpt["artifact_refs"][0]["content_hash"]
+    captured = artifact_store / "artifacts" / content_hash[:32]
     snapshot = sqlite3.connect(f"file:{captured.as_posix()}?mode=ro", uri=True)
     try:
         tables = {
@@ -268,8 +273,9 @@ def test_live_shadow_adapts_pathless_grok_through_filtered_observation(
         ("assistant_message", "second grok session body"),
     ]
 
-    artifact_id = grok["artifact_refs"][0]["artifact_id"]
-    captured = artifact_store / "artifacts" / artifact_id
+    # blobs are addressed by content_hash[:32], not by the slot artifact_id
+    content_hash = grok["artifact_refs"][0]["content_hash"]
+    captured = artifact_store / "artifacts" / content_hash[:32]
     snapshot = sqlite3.connect(f"file:{captured.as_posix()}?mode=ro", uri=True)
     try:
         sessions = snapshot.execute(
@@ -354,8 +360,10 @@ def test_live_shadow_merges_native_and_pathless_grok_without_counting_observatio
     observation = next(
         ref for ref in grok["artifact_refs"] if ref["source_kind"] == "sqlite"
     )
+    # blob id = content_hash[:32]; artifact_id is the slot identity (see above)
     observation_bytes = (
-        tmp_path / "artifact-store" / "artifacts" / observation["artifact_id"]
+        tmp_path / "artifact-store" / "artifacts"
+        / observation["content_hash"][:32]
     ).read_bytes()
     assert b"available-native-grok-secret-must-not-enter-observation" not in observation_bytes
     assert b"available-native-private-thinking" not in observation_bytes

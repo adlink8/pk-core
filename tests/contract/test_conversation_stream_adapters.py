@@ -84,7 +84,12 @@ class TestCodex:
     def test_versions(self, adapted):
         assert adapted.family == "codex"
         assert adapted.adapter_version
-        assert adapted.contract_version == "1"
+        # Expectation changed from "1" to "2": the conversation contract version
+        # was bumped because ``artifact_id`` stopped being the content hash and
+        # became the stable per-slot identity. Ids produced under "1" and "2"
+        # must never coexist in one database, so the declared version moved with
+        # the identity change.
+        assert adapted.contract_version == "2"
 
     def test_session_and_events(self, adapted):
         assert len(adapted.sessions) == 1

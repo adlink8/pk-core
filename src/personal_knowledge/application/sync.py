@@ -177,6 +177,30 @@ def _cmd_conversations(write: bool, args) -> int:
     from personal_knowledge.application.run_pipeline import run_agentsview_stage
     from personal_knowledge.application.serving.versions import file_checksum
 
+    # Milestone 3: live sync / background listener (stage -> incremental apply).
+    # Opt-in and mutually exclusive with the v2 generation modes: mixing them
+    # would silently ignore one of the two, so it fails closed instead.
+    live_flags = (
+        getattr(args, "live_sync", False)
+        or getattr(args, "live_dry_run", False)
+        or getattr(args, "watch", False)
+        or getattr(args, "live_status", False)
+    )
+    if live_flags:
+        if (args.v2_dry_run or args.v2_shadow or args.v2_activate or
+                args.v2_native or args.v2_native_dry_run):
+
+            print(
+                "[error] --live-* / --watch cannot be combined with a --v2-* mode",
+                file=sys.stderr,
+            )
+            return 2
+        from personal_knowledge.application.conversation.watch import (
+            cmd_conversations_live,
+        )
+
+        return cmd_conversations_live(args)
+
     # Phase 62-04: explicit v2 dry-run / shadow / activation. These modes are
     # opt-in and never change the default canonical service behavior (62-04
     # Task 3: default stays as-is until Plan 62-08).
@@ -422,6 +446,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     add_conversations_v2_args(conv)
+
+    # Milestone 3: live-sync / watch flags (additive, opt-in).
+    from personal_knowledge.application.conversation.watch import (
+        add_conversation_watch_args,
+    )
+
+    add_conversation_watch_args(conv)
 
     turns = sub.add_parser("turns", help="Turn summaries → conversation_turns vector publication")
     turns.add_argument("--write", action="store_true", help="Publish after build verification (default dry-run)")

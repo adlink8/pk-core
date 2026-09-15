@@ -86,6 +86,66 @@ def test_dry_run_probes_every_registered_family(tmp_path: Path) -> None:
 
 # --------------------------------------------------------------------- shadow
 
+def test_detect_families_ignores_capture_temps(tmp_path: Path) -> None:
+    """Capture intermediates sit in the same tree as the source they derive from.
+
+    Adapting one would emit a second copy of the same events under the same ids,
+    so detection must never treat ``.snap-``/``.filtered-``/``.tmp-`` as sources.
+    """
+    from personal_knowledge.application.conversation.v2_sync import _detect_families
+
+    src = tmp_path / "sources"
+    src.mkdir()
+    real = src / "codex.jsonl"
+    shutil.copy2(FIXTURES / "codex_agent_sessions.jsonl", real)
+    payload = real.read_bytes()
+    for name in (".snap-abc.sqlite", ".filtered-abc.sqlite", ".tmp-abc"):
+        (src / name).write_bytes(payload)
+
+    detected = _detect_families(src)
+
+    assert [p.name for p in detected.get("codex", [])] == ["codex.jsonl"]
+    assert sum(len(v) for v in detected.values()) == 1
+
+
+def test_identical_content_files_are_adapted_once(tmp_path: Path) -> None:
+    """Identical bytes are adapted once, keyed by ``content_hash``.
+
+    Two staged copies of the same bytes must contribute their events once, not
+    twice: adapting both would emit the same event ids and block the family with
+    an event-contract failure (observed on grok's duplicated chat histories).
+
+    Note the key is ``content_hash``, not ``artifact_id``: since milestone 1 the
+    slot ``artifact_id`` is derived from (family, mirror path), so two copies in
+    different directories now have *different* artifact ids while sharing one
+    content hash. The dedup seam was deliberately left content-based.
+    """
+    src = tmp_path / "sources"
+    src.mkdir()
+    payload = (FIXTURES / "codex_agent_sessions.jsonl").read_bytes()
+    (src / "a.jsonl").write_bytes(payload)
+    (src / "b.jsonl").write_bytes(payload)
+
+    single = tmp_path / "single"
+    single.mkdir()
+    (single / "a.jsonl").write_bytes(payload)
+
+    def _run(root: Path, tag: str) -> dict:
+        return shadow_conversation_generation(
+            source_root=root,
+            db=tmp_path / f"{tag}.sqlite",
+            artifact_store=tmp_path / f"artifacts-{tag}",
+            report_path=tmp_path / f"report-{tag}.json",
+        )
+
+    baseline = _run(single, "one")["generations"]["codex"]
+    doubled = _run(src, "two")["generations"]["codex"]
+
+    assert doubled["status"] != "blocked", doubled.get("reason")
+    assert doubled["snapshot_count"] == 2  # both files were discovered
+    assert doubled["event_count"] == baseline["event_count"]  # adapted once
+
+
 def test_shadow_stages_non_active_generation_and_report(tmp_path: Path) -> None:
     report, db, _src, report_path = _shadow(tmp_path)
     assert report_path.exists()
@@ -217,6 +277,8 @@ def test_activation_delta_fires_only_after_success(tmp_path: Path) -> None:
         approval=ACTIVATION_APPROVAL,
     )
     assert result["delta"]["published"] is True
+    assert calls[0]["delta_id"] == result["delta_id"]
+    assert isinstance(result["delta_id"], int)
     assert len(calls) == 1
 
     # blocked activation never publishes a delta
