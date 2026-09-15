@@ -150,3 +150,6 @@ latest_logs/
 tmp/
 .planning/tmp/
 scratch/
+
+# playwright CLI 本地缓存
+.playwright-cli/
