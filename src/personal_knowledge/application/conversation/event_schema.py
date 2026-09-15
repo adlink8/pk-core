@@ -20,6 +20,13 @@ Tables:
   - ``ce_field_dispositions``    — explicit field mapping decisions (D-07)
   - ``ce_generation_authority``  — active-generation pointer (read-only here;
                                   activation owned by a later orchestration plan)
+  - ``ce_live_slots``            — stable per-source-slot registry: ``slot_id``
+                                  IS the slot ``artifact_id``
+                                  (``sha256("art|<family>|<mirror_path>")``),
+                                  unique per (family, mirror_path) and constant
+                                  across content edits (Milestone 1, additive)
+  - ``ce_live_sync_log``         — append-only log of live in-place applies
+  - ``ce_live_state``            — singleton live-sync coordination state
 """
 
 from __future__ import annotations
@@ -39,6 +46,9 @@ V2_TABLES = (
     "ce_field_dispositions",
     "ce_generation_authority",
     "ce_schema_meta",
+    "ce_live_slots",
+    "ce_live_sync_log",
+    "ce_live_state",
 )
 
 _DDL: tuple[str, ...] = (
@@ -175,6 +185,62 @@ _DDL: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS ce_dispositions_generation_event
         ON ce_field_dispositions(generation_id, event_id)
+    """,
+    # ---- Live-sync overlay (Milestone 1) ---------------------------------
+    # Additive only. ``artifact_id`` is now a *slot* identity derived from
+    # ``sha256("art|" + family + "|" + mirror_path)``
+    # (snapshots.make_slot_artifact_id), constant across content edits, while
+    # ``content_hash`` keeps holding ``sha256(bytes)``. A slot therefore always
+    # has exactly one *current* content hash, and the event/session/relation rows
+    # that belong to a (generation, artifact) are indexed so a live rewrite can
+    # locate and replace them without rescanning the whole generation.
+    # ``UNIQUE(family, mirror_path)`` is what makes the slot key unambiguous:
+    # the same mirror path must never map to two slots.
+    """
+    CREATE TABLE IF NOT EXISTS ce_live_slots (
+        slot_id        TEXT PRIMARY KEY,
+        family         TEXT NOT NULL,
+        mirror_path    TEXT NOT NULL,
+        content_hash   TEXT,
+        byte_size      INTEGER,
+        first_seen_at  TEXT NOT NULL,
+        last_synced_at TEXT,
+        active         INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(family, mirror_path)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ce_live_sync_log (
+        sync_id        TEXT PRIMARY KEY,
+        started_at     TEXT NOT NULL,
+        finished_at    TEXT,
+        n_added        INTEGER,
+        n_changed      INTEGER,
+        n_removed      INTEGER,
+        rows_pruned    INTEGER,
+        rows_inserted  INTEGER,
+        per_family     TEXT,
+        status         TEXT NOT NULL,
+        detail         TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ce_live_state (
+        key         TEXT PRIMARY KEY,
+        value       TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_ce_events_gen_art
+        ON ce_events(generation_id, artifact_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_ce_sessions_gen_art
+        ON ce_sessions(generation_id, artifact_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_ce_rel_gen_target
+        ON ce_event_relations(generation_id, target_event_id)
     """,
 )
 

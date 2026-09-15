@@ -118,17 +118,40 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def make_slot_artifact_id(family: str, mirror_path: str) -> str:
+    """Stable per-source-slot identity, constant across content changes.
+
+    Replaces the old content-addressed ``artifact_id``
+    (``sha256(bytes)[:32]``). Two captures of the *same* mirror path under the
+    *same* family yield the SAME slot id even when the bytes differ, so editing a
+    single source file no longer rotates every event and session id it produced
+    (the core milestone-1 fix).
+
+    ``mirror_path`` must be the stable source path relative to its source root
+    (family-scoped, directory-qualified) — NOT a bare filename, so two files
+    with the same name in different session directories stay distinct. The on-disk
+    blob store remains content-addressed (see :func:`_publish_blob`); only the
+    logical ``artifact_id`` changes.
+    """
+    return hashlib.sha256(f"art|{family}|{mirror_path}".encode("utf-8")).hexdigest()
+
+
 def _blob_root(dest_dir: Path) -> Path:
     return dest_dir / _ARTIFACT_DIR
 
 
 def _publish_blob(dest_dir: Path, data: bytes) -> str:
-    """Content-addressed, deduplicated blob publish. Returns artifact id."""
+    """Content-addressed, deduplicated blob publish. Returns the blob id.
+
+    The returned id is ``content_hash[:32]`` -- the *blob* address, never the
+    logical ``artifact_id`` (which is now the stable per-slot identity). Every
+    path lookup in this module must go through this id / ``content_hash``.
+    """
     content_hash = _sha256_bytes(data)
-    artifact_id = content_hash[:32]
+    blob_id = content_hash[:32]
     blob_dir = _blob_root(dest_dir)
     blob_dir.mkdir(parents=True, exist_ok=True)
-    blob = blob_dir / artifact_id
+    blob = blob_dir / blob_id
     if not blob.exists():
         # write atomically: temp + rename so a crash never leaves a partial blob
         tmp = blob_dir / f".tmp-{uuid.uuid4().hex}"
@@ -146,7 +169,7 @@ def _publish_blob(dest_dir: Path, data: bytes) -> str:
                 if attempt == 3:
                     raise
                 time.sleep(0.05 * (attempt + 1))
-    return artifact_id
+    return blob_id
 
 
 def _resolve_relative(root: Path, relative: str) -> Path:
@@ -207,11 +230,20 @@ def capture_file(
     relative_path: str,
     byte_limit: int,
     count_limit: int,
+    family: str = "",
+    mirror_path: str | None = None,
 ) -> tuple[SourceArtifact, Path]:
     """Immutable content-addressed capture of a single file.
 
     Raises :class:`CaptureError` before publishing anything on any validation
     failure (symlink escape, missing file, byte/count limit).
+
+    ``family`` + ``mirror_path`` are optional: when both are supplied the emitted
+    ``artifact_id`` is the stable slot identity (:func:`make_slot_artifact_id`,
+    constant across content edits); when omitted it falls back to the legacy
+    content-addressed id so existing callers/tests are unaffected. The on-disk
+    blob is always content-addressed (named by ``content_hash[:32]``), independent
+    of ``artifact_id``.
     """
     if count_limit < 1:
         raise CaptureError(f"count_limit must be >= 1, got {count_limit}")
@@ -224,11 +256,15 @@ def capture_file(
     _validate_file_for_capture(source, relative_path, byte_limit)
 
     data = source.read_bytes()
-    artifact_id = _publish_blob(dest_dir, data)
-    blob = _blob_root(dest_dir) / artifact_id
+    blob_id = _publish_blob(dest_dir, data)
+    blob = _blob_root(dest_dir) / blob_id
+    if family and mirror_path:
+        artifact_id = make_slot_artifact_id(family, mirror_path)
+    else:
+        artifact_id = blob_id  # legacy content-addressed fallback
     artifact = SourceArtifact(
         artifact_id=artifact_id,
-        family="",  # set by the owning adapter
+        family=family,  # set by the owning adapter; may be "" for legacy callers
         source_kind="file",
         content_hash=_sha256_bytes(data),
         capture_method="sha256",
@@ -245,6 +281,8 @@ def capture_directory(
     include_relative: tuple[str, ...],
     byte_limit: int,
     count_limit: int,
+    family: str = "",
+    mirror_path: str | None = None,
 ) -> tuple[CaptureManifest, tuple[SourceArtifact, ...]]:
     """Capture an allowlisted set of files from a directory.
 
@@ -276,11 +314,15 @@ def capture_directory(
     artifacts: list[SourceArtifact] = []
     for relative, candidate in candidates:
         data = candidate.read_bytes()
-        artifact_id = _publish_blob(dest_dir, data)
+        blob_id = _publish_blob(dest_dir, data)
+        if family and mirror_path:
+            artifact_id = make_slot_artifact_id(family, f"{mirror_path}/{relative}")
+        else:
+            artifact_id = blob_id  # legacy content-addressed fallback
         artifacts.append(
             SourceArtifact(
                 artifact_id=artifact_id,
-                family="",
+                family=family,
                 source_kind="file",
                 content_hash=_sha256_bytes(data),
                 capture_method="sha256",
@@ -334,11 +376,15 @@ def read_manifest(path: Path) -> CaptureManifest:
 
 
 def replay_manifest(manifest: CaptureManifest, blob_root: Path) -> ReplayResult:
-    """Verify every artifact blob is present and byte-identical."""
+    """Verify every artifact blob is present and byte-identical.
+
+    The blob store is content-addressed (named by ``content_hash[:32]``), so the
+    blob is located via ``content_hash`` rather than the logical ``artifact_id``.
+    """
     missing: list[str] = []
     mismatched: list[str] = []
     for artifact in manifest.artifacts:
-        blob = blob_root / artifact.artifact_id
+        blob = blob_root / artifact.content_hash[:32]
         if not blob.exists():
             missing.append(artifact.artifact_id)
             continue
@@ -396,6 +442,8 @@ def capture_sqlite(
     allowed_columns: dict[str, tuple[str, ...]],
     byte_limit: int,
     count_limit: int,
+    family: str = "",
+    mirror_path: str | None = None,
 ) -> tuple[SourceArtifact, Path]:
     """WAL-safe, allowlisted capture of a mutable SQLite store.
 
@@ -433,8 +481,12 @@ def capture_sqlite(
                 f"sqlite snapshot of {len(filtered_bytes)} bytes exceeds "
                 f"byte_limit {byte_limit}"
             )
-        artifact_id = _publish_blob(dest_dir, filtered_bytes)
-        filtered = _blob_root(dest_dir) / artifact_id
+        blob_id = _publish_blob(dest_dir, filtered_bytes)
+        filtered = _blob_root(dest_dir) / blob_id
+        if family and mirror_path:
+            artifact_id = make_slot_artifact_id(family, mirror_path)
+        else:
+            artifact_id = blob_id  # legacy content-addressed fallback
 
         con = _read_only_connect(source)
         try:
@@ -445,7 +497,7 @@ def capture_sqlite(
         privacy = tuple(f"excluded_table:{t}" for t in excluded)
         artifact = SourceArtifact(
             artifact_id=artifact_id,
-            family="",
+            family=family,
             source_kind="sqlite",
             content_hash=_sha256_bytes(filtered_bytes),
             capture_method="sqlite_online_backup",

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping
 
 from personal_knowledge.core.conversation_events import (
@@ -35,9 +36,15 @@ from personal_knowledge.core.conversation_events import (
 
 @dataclass(frozen=True)
 class SourceArtifact:
-    """A content-addressed immutable source artifact (Phase 62 D-05/D-09).
+    """An immutable source artifact captured from one stable source slot.
 
-    ``artifact_id`` is content-addressed; ``content_hash`` is the byte hash.
+    ``artifact_id`` is the *slot* identity — ``sha256("art|<family>|<mirror
+    path>")`` (see ``snapshots.make_slot_artifact_id``), constant across content
+    edits so event/session ids do not rotate when a file is edited.
+    ``content_hash`` is the byte hash (``sha256(bytes)``) and is what addresses
+    the on-disk blob store. Paths are therefore always resolved through
+    ``content_hash``, never through ``artifact_id``.
+
     ``schema_digest``/``privacy_dispositions`` are metadata-only — never bodies
     or credentials.
     """
@@ -68,6 +75,37 @@ class SourceArtifactSet:
 
     def by_id(self) -> dict[str, SourceArtifact]:
         return {a.artifact_id: a for a in self.artifacts}
+
+
+# ``content_hash`` sentinel carried by *probe* artifacts. A probe is built from a
+# file head before the file is captured (``v2_sync._probe_artifact``,
+# ``discovery._artifact_for``) and is rooted at the source directory, so it has no
+# byte hash and no blob yet.
+PROBE_CONTENT_HASH = "probe"
+
+
+def artifact_bytes_path(artifact_root: Path, artifact: SourceArtifact) -> Path:
+    """Resolve the file that holds ``artifact``'s bytes under ``artifact_root``.
+
+    Two different rooting conventions reach the same call site, and only one of
+    the two identity fields is meaningful for each:
+
+    * a **captured** artifact lives in the content-addressed blob store, keyed by
+      ``content_hash[:32]`` (never by the slot ``artifact_id``);
+    * a **probe** artifact (``content_hash == PROBE_CONTENT_HASH``) is rooted at
+      the source directory it was probed from, and resolves through
+      ``relative_path``.
+
+    Deriving the path from ``content_hash`` alone silently broke every probe: it
+    looked for a file literally named ``probe``, so ``detect()`` returned False
+    for every source and ``pk-sync --v2-native`` reported ``no_source`` for all
+    families. Deriving it from ``artifact_id`` is the mirror-image bug (see the
+    module docstring of :mod:`.snapshots`). Adapters must call this helper
+    instead of joining either field themselves.
+    """
+    if artifact.content_hash == PROBE_CONTENT_HASH:
+        return Path(artifact_root) / artifact.relative_path
+    return Path(artifact_root) / artifact.content_hash[:32]
 
 
 @dataclass(frozen=True)
