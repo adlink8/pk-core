@@ -31,6 +31,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
 )
 from personal_knowledge.adapters.conversation_sources.jsonl_stream import (
     iter_jsonl_lines,
@@ -53,7 +54,7 @@ from personal_knowledge.core.conversation_events import (
 
 FAMILY = "pi"
 ADAPTER_VERSION = "1.3.0"
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "2"
 
 _COMPLETE = {
     FidelityDimension.SOURCE_AVAILABILITY: FidelityLevel.COMPLETE,
@@ -160,7 +161,7 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
     if not (artifact.relative_path or "").lower().endswith(".jsonl"):
         return False
     try:
-        with (artifact_root / artifact.artifact_id).open("r", encoding="utf-8") as h:
+        with artifact_bytes_path(artifact_root, artifact).open("r", encoding="utf-8") as h:
             for raw in h:
                 line = raw.strip()
                 if not line:
@@ -364,7 +365,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             f"{FAMILY} adapter requires exactly one artifact, got {len(artifact_set.artifacts)}"
         )
     artifact = artifact_set.artifacts[0]
-    records = list(iter_jsonl_lines(artifact_root / artifact.artifact_id))
+    records = list(iter_jsonl_lines(artifact_root / artifact.content_hash[:32]))
 
     session_id = make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION,
                                None, kind=EventKind.SESSION_LIFECYCLE, native_locator="session")

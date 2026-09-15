@@ -19,6 +19,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
 )
 from personal_knowledge.adapters.conversation_sources.time_utils import (
     normalize_timestamp,
@@ -40,7 +41,7 @@ from personal_knowledge.core.conversation_events import (
 )
 
 ADAPTER_VERSION = "1.4.0"
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "2"
 
 ALLOWED_TABLES: tuple[str, ...] = ("sessions", "messages", "message_parts")
 ALLOWED_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -117,7 +118,7 @@ class _Family:
         if artifact.source_kind != "sqlite":
             return False
         try:
-            con = sqlite3.connect(f"file:{artifact_root / artifact.artifact_id}?mode=ro", uri=True)
+            con = sqlite3.connect(f"file:{artifact_bytes_path(artifact_root, artifact)}?mode=ro", uri=True)
             try:
                 rows = con.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
@@ -325,7 +326,7 @@ class _Family:
         if artifact.source_kind != "sqlite":
             raise EventContractError(f"{self.family} adapter requires a sqlite artifact")
         try:
-            con = sqlite3.connect(f"file:{artifact_root / artifact.artifact_id}?mode=ro", uri=True)
+            con = sqlite3.connect(f"file:{artifact_root / artifact.content_hash[:32]}?mode=ro", uri=True)
             con.row_factory = sqlite3.Row
             try:
                 tables = {r[0] for r in con.execute(

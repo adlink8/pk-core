@@ -22,6 +22,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
 )
 from personal_knowledge.adapters.conversation_sources.time_utils import (
     normalize_timestamp,
@@ -44,7 +45,7 @@ from personal_knowledge.core.conversation_events import (
 
 FAMILY = "zcode"
 ADAPTER_VERSION = "1.5.0"
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "2"
 
 ALLOWED_TABLES: tuple[str, ...] = ("conversation_traces", "conversation_parts")
 ALLOWED_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -190,7 +191,7 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
     if artifact.source_kind != "sqlite":
         return False
     try:
-        con = sqlite3.connect(f"file:{artifact_root / artifact.artifact_id}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{artifact_bytes_path(artifact_root, artifact)}?mode=ro", uri=True)
         try:
             rows = con.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
@@ -244,7 +245,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             f"{FAMILY} adapter requires exactly one artifact, got {len(artifact_set.artifacts)}"
         )
     artifact = artifact_set.artifacts[0]
-    blob = artifact_root / artifact.artifact_id
+    blob = artifact_root / artifact.content_hash[:32]
     if artifact.source_kind != "sqlite":
         raise EventContractError(f"{FAMILY} adapter requires a sqlite artifact")
 

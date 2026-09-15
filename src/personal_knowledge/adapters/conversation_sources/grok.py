@@ -17,6 +17,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
 )
 from personal_knowledge.adapters.conversation_sources.agentsview_pathless import (
     adapt_pathless_observation,
@@ -38,8 +39,32 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "grok"
-ADAPTER_VERSION = "1.1.0"
-CONTRACT_VERSION = "1"
+ADAPTER_VERSION = "1.2.0"
+CONTRACT_VERSION = "2"
+
+# Native ``chat_history.jsonl`` record type -> canonical event kind.
+#
+# Grok tags every transcript record with ``type`` and never with ``role``
+# (62-RESEARCH format matrix). The previous revision read this file through a
+# ``role`` envelope, which matched nothing: the whole transcript degraded to
+# zero content events and the session was reported as summary-only. Map the
+# observed native types explicitly instead of guessing at a foreign shape.
+_RECORD_KINDS: dict[str, EventKind] = {
+    "user": EventKind.USER_MESSAGE,
+    "human": EventKind.USER_MESSAGE,
+    "assistant": EventKind.ASSISTANT_MESSAGE,
+    "ai": EventKind.ASSISTANT_MESSAGE,
+    "model": EventKind.ASSISTANT_MESSAGE,
+    "system": EventKind.SYSTEM_MESSAGE,
+    "developer": EventKind.DEVELOPER_MESSAGE,
+    "tool_result": EventKind.TOOL_RESULT,
+    "tool_use": EventKind.TOOL_CALL,
+    # Backend-side tool invocations (e.g. web_search) carry their payload in a
+    # nested ``kind`` object rather than a tool_call id.
+    "backend_tool_call": EventKind.TOOL_CALL,
+    "reasoning": EventKind.REASONING,
+    "usage": EventKind.USAGE,
+}
 
 # Declared allowlist for the directory capture (D-08): conversation files only.
 ALLOWED_RELATIVE_PATHS: tuple[str, ...] = (
@@ -80,13 +105,16 @@ def capability() -> CapabilityDescriptor:
         supported_event_kinds=(
             EventKind.SESSION_LIFECYCLE, EventKind.USER_MESSAGE,
             EventKind.ASSISTANT_MESSAGE, EventKind.DEVELOPER_MESSAGE,
-            EventKind.SYSTEM_MESSAGE, EventKind.COMPACTION_SUMMARY,
+            EventKind.SYSTEM_MESSAGE, EventKind.REASONING,
+            EventKind.TOOL_CALL, EventKind.TOOL_RESULT,
+            EventKind.COMPACTION_SUMMARY,
             EventKind.SUBAGENT_BOUNDARY, EventKind.USAGE,
             EventKind.UNKNOWN_NATIVE,
         ),
         supported_relation_kinds=(
             RelationKind.SOURCE_SESSION_CROSSWALK,
             RelationKind.COMPACTED_RANGE,
+            RelationKind.CALL_RESULT,
         ),
         fidelity_dimensions=tuple(FidelityDimension),
         capabilities={
@@ -109,12 +137,24 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
     ):
         return False
     try:
-        head = (artifact_root / artifact.artifact_id).read_text(encoding="utf-8")[:512]
+        head = artifact_bytes_path(artifact_root, artifact).read_text(encoding="utf-8")[:16384]
     except OSError:
         return False
+    # Whitespace-stripped comparison: a JSON formatter emitting ``"type": "user"``
+    # must not disqualify the transcript. The window is deliberately wider than a
+    # single line — a Grok session opens with a multi-kilobyte system prompt, so
+    # the original 512-byte probe never reached the first message record and the
+    # whole transcript was silently excluded as "not a Grok file".
+    compact = "".join(head.split())
     return (
         "# Summary" in head or "grok_session" in head or '"role"' in head
         or '"session_summary"' in head
+        or '"type":"system"' in compact
+        or '"type":"user"' in compact
+        or '"type":"assistant"' in compact
+        or '"tool_calls"' in compact
+        or '"model_fingerprint"' in compact
+        or '"encrypted_content"' in compact
     )
 
 
@@ -140,7 +180,7 @@ def _event(artifact, *, session_id, kind, locator, native_id=None, occurred_at=N
 
 def _read_jsonl_blob(root: Path, artifact: SourceArtifact) -> list[dict]:
     try:
-        text = (root / artifact.artifact_id).read_text(encoding="utf-8")
+        text = (root / artifact.content_hash[:32]).read_text(encoding="utf-8")
     except OSError:
         return []
     rows = []
@@ -155,6 +195,72 @@ def _read_jsonl_blob(root: Path, artifact: SourceArtifact) -> list[dict]:
         if isinstance(obj, dict):
             rows.append(obj)
     return rows
+
+
+def _flatten_content(value) -> str | None:
+    """Recover text from a native content value without inventing content.
+
+    Grok mixes shapes: ``user`` rows carry a list of typed parts
+    (``{"type": "text", "text": ...}``) while ``assistant`` / ``tool_result`` /
+    ``system`` rows carry a bare string. A plain ``str(value)`` would persist a
+    Python repr for the list shape, so flatten the parts explicitly.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        saw_text = False
+        for item in value:
+            if isinstance(item, str):
+                saw_text = True
+                parts.append(item)
+            elif isinstance(item, dict) and (
+                item.get("type") in ("text", "summary_text") or "text" in item
+            ):
+                raw = item.get("text")
+                saw_text = True
+                parts.append("" if raw is None else str(raw))
+        return "\n".join(parts) if saw_text else None
+    if isinstance(value, dict):
+        raw = value.get("text")
+        return str(raw) if isinstance(raw, str) else None
+    return None
+
+
+def _tool_call_text(call: dict) -> str | None:
+    """One-line rendering of a native tool invocation (name + arguments)."""
+    name = call.get("name") or call.get("tool_name")
+    arguments = call.get("arguments")
+    if isinstance(arguments, (dict, list)):
+        try:
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        except (TypeError, ValueError):
+            arguments = str(arguments)
+    if name and arguments:
+        return f"{name} {arguments}"
+    if name or arguments:
+        return str(name or arguments)
+    return None
+
+
+def _backend_call_text(row: dict) -> str | None:
+    """One-line rendering of a backend-side invocation (e.g. web_search)."""
+    kind_obj = row.get("kind")
+    if not isinstance(kind_obj, dict):
+        return None
+    parts: list[str] = []
+    tool_type = kind_obj.get("tool_type")
+    if isinstance(tool_type, str) and tool_type:
+        parts.append(tool_type)
+    action = kind_obj.get("action")
+    if isinstance(action, dict):
+        for key in ("type", "query", "url"):
+            value = action.get(key)
+            if isinstance(value, str) and value:
+                parts.append(value)
+    return " ".join(parts)[:2048] if parts else None
 
 
 def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> AdaptationResult:
@@ -182,7 +288,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     summary_artifact = by_path.get("summary.md")
     if summary_artifact is not None:
         try:
-            summary_text = (artifact_root / summary_artifact.artifact_id).read_text(encoding="utf-8")
+            summary_text = (artifact_root / summary_artifact.content_hash[:32]).read_text(encoding="utf-8")
         except OSError:
             summary_text = ""
         native_session = _first_line(summary_text)
@@ -194,7 +300,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     if summary_json is not None:
         try:
             doc = json.loads(
-                (artifact_root / summary_json.artifact_id).read_text(encoding="utf-8")
+                (artifact_root / summary_json.content_hash[:32]).read_text(encoding="utf-8")
             )
         except (OSError, ValueError):
             doc = {}
@@ -227,34 +333,98 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
 
     chat = by_path.get("chat_history.jsonl")
     if chat is not None:
+        # Native tool-call id -> emitted TOOL_CALL event id, so a later
+        # tool_result can be linked back to the call it answers.
+        pending_calls: dict[str, str] = {}
+        # Grok reuses one native reasoning id across several distinct rows of a
+        # session (observed: a single ``rs_...`` id on 10 separate reasoning
+        # rows). Event ids are content-addressed per (artifact, native id) and
+        # exclude the event kind, so a reused id would collapse distinct rows
+        # into duplicate events and fail the contract. Disambiguate repeats
+        # positionally; the first occurrence keeps the bare native id.
+        seen_native: dict[str, int] = {}
         for index, row in enumerate(_read_jsonl_blob(artifact_root, chat)):
-            role = row.get("role")
-            kind = EventKind.USER_MESSAGE if role == "user" else (
-                EventKind.ASSISTANT_MESSAGE if role in ("assistant", "model") else None)
+            rtype = str(row.get("type") or row.get("role") or "")
             locator = f"chat_history.jsonl#{index}"
+            native_id = str(row.get("id") or f"row-{index}")
+            repeat = seen_native.get(native_id, 0)
+            seen_native[native_id] = repeat + 1
+            if repeat:
+                native_id = f"{native_id}#{repeat}"
+            occurred_at = row.get("timestamp")
+            kind = _RECORD_KINDS.get(rtype)
             if kind is None:
                 events.append(_event(chat, session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
-                                     locator=locator, native_id=row.get("id") or f"row-{index}",
-                                     occurred_at=row.get("timestamp"),
+                                     locator=locator, native_id=native_id,
+                                     occurred_at=occurred_at,
                                      fidelity=_fidelity(STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
                                                         RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
                                                         CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
                                      native_session=native_session))
                 continue
-            source_content = row.get("content")
-            exact_content = None if source_content is None else str(source_content)
+
+            if kind is EventKind.REASONING:
+                # Native reasoning ships as an encrypted blob plus an optional
+                # plaintext summary. Only the summary is recoverable text; the
+                # ciphertext is preserved by reference, never decoded.
+                event = _event(chat, session_id=session_id, kind=kind, locator=locator,
+                               native_id=native_id, occurred_at=occurred_at,
+                               content=_flatten_content(row.get("summary")),
+                               fidelity=_fidelity(CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
+                               native_session=native_session)
+                if row.get("encrypted_content"):
+                    event = _with_disposition(
+                        event, field_name="encrypted_content",
+                        disposition=FieldDisposition.PRESERVED_BY_REFERENCE,
+                        reason="reasoning content is encrypted; plaintext not available",
+                    )
+                events.append(event)
+                continue
+
+            if kind is EventKind.TOOL_CALL:
+                # Backend-side invocations carry no id; the nested ``kind``
+                # object holds the tool type and its action payload.
+                events.append(_event(chat, session_id=session_id, kind=kind,
+                                     locator=f"{locator}#kind", native_id=native_id,
+                                     occurred_at=occurred_at,
+                                     content=_backend_call_text(row),
+                                     native_session=native_session))
+                continue
+
             events.append(_event(chat, session_id=session_id, kind=kind, locator=locator,
-                                 native_id=row.get("id") or f"row-{index}",
-                                 occurred_at=row.get("timestamp"),
-                                 content=exact_content,
+                                 native_id=native_id, occurred_at=occurred_at,
+                                 content=_flatten_content(row.get("content")),
                                  native_session=native_session))
+            if kind is EventKind.TOOL_RESULT:
+                call_id = str(row.get("tool_call_id") or "")
+                if call_id and call_id in pending_calls:
+                    relations.append(EventRelation(
+                        relation_id=make_event_id(FAMILY, chat.artifact_id, CONTRACT_VERSION,
+                                                  f"rel-call:{call_id}:{native_id}"),
+                        source_event_id=pending_calls[call_id],
+                        target_event_id=events[-1].event_id,
+                        relation_kind=RelationKind.CALL_RESULT,
+                    ))
+            # An assistant turn may carry any number of tool invocations; each
+            # becomes its own typed event so call/result pairing survives.
+            for call_index, call in enumerate(row.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                call_id = str(call.get("id") or f"{native_id}:call:{call_index}")
+                call_event = _event(chat, session_id=session_id, kind=EventKind.TOOL_CALL,
+                                    locator=f"{locator}#tool_call:{call_index}",
+                                    native_id=call_id, occurred_at=occurred_at,
+                                    content=_tool_call_text(call),
+                                    native_session=native_session)
+                events.append(call_event)
+                pending_calls[call_id] = call_event.event_id
             usage_summary = _row_usage_summary(row)
             if usage_summary:
                 events.append(_event(
                     chat, session_id=session_id, kind=EventKind.USAGE,
                     locator=f"chat_history.jsonl#usage:{index}",
-                    native_id=f"{row.get('id') or f'row-{index}'}:usage",
-                    occurred_at=row.get("timestamp"), content=None,
+                    native_id=f"{native_id}:usage",
+                    occurred_at=occurred_at, content=None,
                     summary=usage_summary,
                     fidelity=_fidelity(CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
                     native_session=native_session,
@@ -266,7 +436,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         if artifact is None:
             continue
         try:
-            text = (artifact_root / artifact.artifact_id).read_text(encoding="utf-8")
+            text = (artifact_root / artifact.content_hash[:32]).read_text(encoding="utf-8")
         except OSError:
             continue
         compactor = _event(artifact, session_id=session_id, kind=EventKind.COMPACTION_SUMMARY,
@@ -296,7 +466,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     sub_artifact = by_path.get("subagents.json")
     if sub_artifact is not None:
         try:
-            sub_doc = json.loads((artifact_root / sub_artifact.artifact_id).read_text(encoding="utf-8"))
+            sub_doc = json.loads((artifact_root / sub_artifact.content_hash[:32]).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             sub_doc = []
         subs = sub_doc if isinstance(sub_doc, list) else sub_doc.get("subagents", [])
@@ -340,9 +510,11 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 session=native_session, native_id=native_session,
             ),
             fidelity=_fidelity(
-                CONTENT_AVAILABILITY=FidelityLevel.PARTIAL,
-                STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
-                RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
+                CONTENT_AVAILABILITY=content_level,
+                STRUCTURE_COMPLETENESS=structure_level,
+                RELATION_COMPLETENESS=(
+                    FidelityLevel.COMPLETE if has_chat else FidelityLevel.UNKNOWN
+                ),
             ),
             native_session_id=native_session,
             started_at=doc.get("created_at") if isinstance(doc, dict) else None,
@@ -352,6 +524,40 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             git_branch=_grok_branch(info, doc),
             title=_grok_title(info, doc),
         ))
+
+    # ce_events carries a (generation_id, session_id) foreign key into
+    # ce_sessions, so every session id an event carries must be backed by a
+    # session record. A multi-file session directory is staged and adapted one
+    # file at a time, so a lone ``chat_history.jsonl`` (no summary.md /
+    # summary.json in the artifact set) emits transcript events with no summary
+    # anchor to build the record from. Backfill one record per used id,
+    # anchored to the artifact that actually carries those events.
+    known_sessions = {session.session_id for session in sessions}
+    for event in events:
+        if event.session_id in known_sessions:
+            continue
+        anchor = next(
+            (a for a in artifacts if a.artifact_id == event.provenance.artifact_id),
+            None,
+        )
+        if anchor is None:
+            continue
+        sessions.append(AdaptedSession(
+            session_id=event.session_id,
+            provenance=_provenance(
+                anchor, f"{anchor.relative_path}#session",
+                session=native_session, native_id=native_session,
+            ),
+            fidelity=_fidelity(
+                CONTENT_AVAILABILITY=content_level,
+                STRUCTURE_COMPLETENESS=structure_level,
+                RELATION_COMPLETENESS=(
+                    FidelityLevel.COMPLETE if has_chat else FidelityLevel.UNKNOWN
+                ),
+            ),
+            native_session_id=native_session,
+        ))
+        known_sessions.add(event.session_id)
 
     return AdaptationResult(
         family=FAMILY, adapter_version=ADAPTER_VERSION, contract_version=CONTRACT_VERSION,

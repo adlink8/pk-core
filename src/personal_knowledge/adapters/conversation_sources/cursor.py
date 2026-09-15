@@ -18,6 +18,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
 )
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
@@ -33,7 +34,7 @@ from personal_knowledge.core.conversation_events import (
 
 FAMILY = "cursor"
 ADAPTER_VERSION = "1.0.0"
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "2"
 
 # Versioned schema probes: supported stores carry thread/session tables.
 SUPPORTED_PROBES: dict[str, tuple[str, ...]] = {
@@ -96,7 +97,7 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
     """True for a Cursor store whose schema matches a supported probe version."""
     if artifact.source_kind == "file" and artifact.relative_path.lower().endswith(".jsonl"):
         try:
-            with (artifact_root / artifact.artifact_id).open("r", encoding="utf-8") as handle:
+            with artifact_bytes_path(artifact_root, artifact).open("r", encoding="utf-8") as handle:
                 first = next((json.loads(line) for line in handle if line.strip()), {})
             return first.get("role") in ("user", "assistant") and isinstance(
                 first.get("message"), (dict, str)
@@ -105,7 +106,7 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
             return False
     if artifact.source_kind != "sqlite":
         return False
-    version, _tables = _probe_schema(artifact_root / artifact.artifact_id)
+    version, _tables = _probe_schema(artifact_bytes_path(artifact_root, artifact))
     return version is not None
 
 
@@ -122,7 +123,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     if artifact.source_kind != "sqlite":
         raise EventContractError(f"{FAMILY} adapter requires sqlite or JSONL")
 
-    version, tables = _probe_schema(artifact_root / artifact.artifact_id)
+    version, tables = _probe_schema(artifact_root / artifact.content_hash[:32])
     if version is None:
         # Unsafe/ambiguous/attribution-only store: honest blocked result.
         session_id = make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION,
@@ -142,7 +143,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     sessions: list[AdaptedSession] = []
 
     try:
-        con = sqlite3.connect(f"file:{artifact_root / artifact.artifact_id}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{artifact_root / artifact.content_hash[:32]}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         try:
             threads = con.execute("SELECT * FROM threads").fetchall()
@@ -338,7 +339,7 @@ def _first_user_message(rows):
 def _adapt_jsonl(artifact: SourceArtifact, *, artifact_root: Path) -> AdaptationResult:
     rows: list[dict] = []
     try:
-        for line in (artifact_root / artifact.artifact_id).read_text(
+        for line in (artifact_root / artifact.content_hash[:32]).read_text(
             encoding="utf-8"
         ).splitlines():
             if line.strip():

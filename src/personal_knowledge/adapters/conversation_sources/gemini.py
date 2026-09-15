@@ -20,6 +20,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
 )
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
@@ -38,7 +39,7 @@ from personal_knowledge.core.conversation_events import (
 
 FAMILY = "gemini"
 ADAPTER_VERSION = "1.1.0"
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "2"
 
 _COMPLETE = {
     FidelityDimension.SOURCE_AVAILABILITY: FidelityLevel.COMPLETE,
@@ -109,7 +110,7 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
     if not (artifact.relative_path or "").lower().endswith(".json"):
         return False
     try:
-        with (artifact_root / artifact.artifact_id).open("r", encoding="utf-8") as h:
+        with artifact_bytes_path(artifact_root, artifact).open("r", encoding="utf-8") as h:
             doc = json.load(h)
     except (OSError, ValueError):
         return False
@@ -146,7 +147,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         )
     artifact = artifact_set.artifacts[0]
     try:
-        with (artifact_root / artifact.artifact_id).open("r", encoding="utf-8") as h:
+        with (artifact_root / artifact.content_hash[:32]).open("r", encoding="utf-8") as h:
             doc = json.load(h)
     except (OSError, ValueError) as exc:
         raise EventContractError(f"{FAMILY} artifact is not a JSON document: {exc}") from exc

@@ -10,21 +10,31 @@ fidelity for step kinds that are not user/assistant prose.
 
 from __future__ import annotations
 
+import datetime
 import json
 import sqlite3
 from pathlib import Path
+from typing import NamedTuple
 
 from personal_knowledge.adapters.conversation_sources.contracts import (
     AdaptationResult,
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
+)
+from personal_knowledge.adapters.conversation_sources.protobuf_wire import (
+    PbMessage,
+    WireFormatError,
+    as_text,
 )
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
     EventContractError,
     EventKind,
     EventRelation,
+    FieldDisposition,
+    FieldDispositionRecord,
     FidelityDimension,
     FidelityLevel,
     FidelityProfile,
@@ -35,8 +45,13 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "antigravity"
-ADAPTER_VERSION = "1.1.0"
-CONTRACT_VERSION = "1"
+# 1.2.0 decodes the live store's binary protobuf ``step_payload`` column from the
+# wire format instead of preserving it by reference (1.1.0).
+# 1.2.1 also recovers NUL-padded UTF-16 tool output, reads the ``f140/f1``
+# tool-execution annotations, and keeps annotation-only executions as events
+# rather than dropping them.
+ADAPTER_VERSION = "1.2.1"
+CONTRACT_VERSION = "2"
 
 ALLOWED_TABLES: tuple[str, ...] = ("trajectories", "steps", "subtrajectories")
 ALLOWED_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -92,8 +107,9 @@ def capability() -> CapabilityDescriptor:
         capabilities={
             "native_shape": "sqlite_trajectory_store",
             "hierarchy": "trajectory_step_subtrajectory",
-            "transcript_fidelity": "partial_for_non_prose_steps",
-            "content_availability": "unavailable_when_protobuf_without_schema",
+            "transcript_fidelity": "decoded_from_protobuf_wire_format",
+            "content_availability": "decoded_via_wire_format_when_schema_absent",
+            "usage_field_mapping": "raw_field_numbers_no_schema_names",
         },
     )
 
@@ -102,7 +118,7 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
     if artifact.source_kind != "sqlite":
         return False
     try:
-        con = sqlite3.connect(f"file:{artifact_root / artifact.artifact_id}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{artifact_bytes_path(artifact_root, artifact)}?mode=ro", uri=True)
         try:
             rows = con.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
@@ -145,7 +161,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     if artifact.source_kind != "sqlite":
         raise EventContractError(f"{FAMILY} adapter requires a sqlite artifact")
     try:
-        con = sqlite3.connect(f"file:{artifact_root / artifact.artifact_id}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{artifact_root / artifact.content_hash[:32]}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         try:
             tables = {r[0] for r in con.execute(
@@ -279,22 +295,20 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
 def _adapt_live_store(
     con: sqlite3.Connection, artifact: SourceArtifact
 ) -> AdaptationResult:
-    """Adapt the live Antigravity store (trajectory_meta + steps)."""
-    # Live schema: every steps.step_payload is a binary protobuf Step message
-    # (step_format = 0; first byte is the protobuf varint framing for
-    #   field 1, wire type 0). No .proto schema ships with the store, so
-    #   steps are kept by reference as UNKNOWN_NATIVE with
-    #   content_availability = unavailable, never invented. JSON-encoded
-    #   payloads (future/alternate stores) are decoded.
-    from personal_knowledge.core.conversation_events import (
-        FieldDisposition,
-        FieldDispositionRecord,
-    )
+    """Adapt the live Antigravity store (trajectory_meta + steps).
 
+    Live schema: every ``steps.step_payload`` is a binary protobuf ``Step``
+    message (``step_format = 0``). No ``.proto`` schema ships with the store, but
+    the wire format is self-describing, so the transcript is decoded structurally
+    -- see :func:`_decode_live_step` for the field mapping recovered from real
+    artifacts. Payloads that are not well-formed protobuf stay preserved by
+    reference, never invented. JSON-encoded payloads (future/alternate stores)
+    are decoded too.
+    """
     trajectories = con.execute("SELECT * FROM trajectory_meta").fetchall()
     steps = con.execute("SELECT * FROM steps ORDER BY idx").fetchall()
-    sessions: list[AdaptedSession] = []
     events: list[TypedEvent] = []
+    relations: list[EventRelation] = []
     warnings: list[str] = []
     partial = _fidelity(
         STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
@@ -303,6 +317,9 @@ def _adapt_live_store(
         COMPACTION_VISIBILITY=FidelityLevel.UNKNOWN,
     )
     by_session: dict[str, str] = {}
+    # Session records are built once decoding finishes so their fidelity reflects
+    # what was actually recovered; the events only need the session id up front.
+    session_specs: list[tuple[str, Provenance, str]] = []
 
     for trajectory in trajectories:
         native_session = str(trajectory["trajectory_id"])
@@ -315,29 +332,26 @@ def _adapt_live_store(
         provenance = _provenance(
             artifact, locator, session=native_session, native_id=native_session
         )
-        sessions.append(AdaptedSession(
-            session_id=session_id, provenance=provenance,
-            fidelity=partial, native_session_id=native_session,
-        ))
+        session_specs.append((session_id, provenance, native_session))
         events.append(_event(
             artifact, session_id=session_id,
             kind=EventKind.SESSION_LIFECYCLE, locator=locator,
-            native_id=native_session, fidelity=partial,
+            native_id=native_session, fidelity=_fidelity(),
             native_session=native_session,
         ))
 
     # Steps carry no trajectory FK on the live schema: attribute the whole flat
     # step list to the first trajectory (real stores hold a single trajectory),
     # and flag the ambiguity when several trajectories are present.
-    if not sessions:
+    if not session_specs:
         return AdaptationResult(
-            family=FAMILY, adapter_version="1.1.0",
+            family=FAMILY, adapter_version=ADAPTER_VERSION,
             contract_version=CONTRACT_VERSION, artifacts=(artifact,),
             sessions=(), events=(), relations=(), fidelity=partial,
             warnings=("live store has no trajectory_meta rows; nothing adapted",),
         )
-    anchor_session = by_session[str(trajectories[0]["trajectory_id"])]
-    anchor_native = str(trajectories[0]["trajectory_id"])
+    anchor_session = session_specs[0][0]
+    anchor_native = session_specs[0][2]
     if len(trajectories) > 1:
         warnings.append(
             "live store has multiple trajectory_meta rows but steps carry no "
@@ -345,8 +359,14 @@ def _adapt_live_store(
         )
 
     protobuf_steps = 0
+    decoded_steps = 0
+    empty_steps = 0
+    undecodable_steps = 0
+    annotation_only_results = 0
     json_steps = 0
     unreadable = 0
+    call_owner: dict[str, list[str]] = {}
+    pending_results: list[tuple[str, str]] = []
     for step in steps:
         idx = int(step["idx"])
         step_locator = f"{artifact.relative_path}#step:{idx}"
@@ -362,7 +382,60 @@ def _adapt_live_store(
             continue
 
         if payload_kind == "protobuf":
-            protobuf_steps += 1
+            step_decode = _decode_live_step(
+                int(step["step_type"]), bytes(step["step_payload"])
+            )
+            if step_decode is not None:
+                protobuf_steps += 1
+                if not step_decode.parts:
+                    empty_steps += 1
+                    continue
+                decoded_steps += 1
+                seen_keys: dict[str, int] = {}
+                for part in step_decode.parts:
+                    kind = _PART_KINDS.get(part.role)
+                    if kind is None:
+                        continue
+                    if part.role == "tool_result" and part.text is None:
+                        annotation_only_results += 1
+                    # The step is the store's only stable identity for a
+                    # payload, and a call id may legitimately repeat across
+                    # steps (real artifacts reuse e.g. ``call_285840`` twice),
+                    # so the step index is part of the native id while
+                    # ``link`` carries the call correlation. A role repeated
+                    # within one step would otherwise collide too.
+                    key = part.native or part.role
+                    seen_keys[key] = seen_keys.get(key, 0) + 1
+                    repeat = f":{seen_keys[key]}" if seen_keys[key] > 1 else ""
+                    native = f"{anchor_native}:step:{idx}:{key}{repeat}"
+                    event = TypedEvent(
+                        event_id=make_event_id(
+                            FAMILY, artifact.artifact_id, CONTRACT_VERSION,
+                            native, kind=kind, session_id=anchor_session,
+                        ),
+                        session_id=anchor_session, kind=kind,
+                        provenance=_provenance(
+                            artifact, f"{step_locator}#{part.role}",
+                            session=anchor_native, native_id=native,
+                        ),
+                        fidelity=_decoded_fidelity(),
+                        occurred_at=_iso_utc(step_decode.epoch),
+                        ordinal=idx,
+                        content=part.text,
+                        summary=part.summary,
+                        field_dispositions=part.dispositions,
+                        native_payload_ref=f"{artifact.artifact_id}:{step_locator}",
+                    )
+                    events.append(event)
+                    if part.role == "tool_call" and part.link:
+                        call_owner.setdefault(part.link, []).append(event.event_id)
+                    elif part.role == "tool_result" and part.link:
+                        pending_results.append((part.link, event.event_id))
+                continue
+
+            # Not well-formed protobuf: keep the bytes addressable rather than
+            # inventing content that cannot actually be recovered.
+            undecodable_steps += 1
             events.append(TypedEvent(
                 event_id=make_event_id(
                     FAMILY, artifact.artifact_id, CONTRACT_VERSION,
@@ -378,7 +451,8 @@ def _adapt_live_store(
                 field_dispositions=(
                     FieldDispositionRecord(
                         "step_payload", FieldDisposition.PRESERVED_BY_REFERENCE,
-                        "binary protobuf Step message; no .proto schema available",
+                        "binary Step payload that is not well-formed protobuf "
+                        "wire format; no .proto schema available",
                     ),
                 ),
                 ordinal=idx,
@@ -407,21 +481,421 @@ def _adapt_live_store(
 
     if protobuf_steps:
         warnings.append(
-            f"{protobuf_steps} step payload(s) are binary protobuf "
-            "(step_format=0) with no available .proto schema; preserved by "
+            f"{protobuf_steps} protobuf step payload(s) decoded from the wire "
+            "format (no .proto schema ships with the store); field numbers are "
+            "authoritative, field names follow real-artifact recon"
+        )
+    if undecodable_steps:
+        warnings.append(
+            f"{undecodable_steps} step payload(s) were not well-formed protobuf "
+            "wire format (no .proto schema ships with the store); preserved by "
             "reference, semantic decode unavailable"
+        )
+    if empty_steps:
+        warnings.append(
+            f"{empty_steps} protobuf step payload(s) carried no recoverable "
+            "transcript content and produced no event"
+        )
+    if annotation_only_results:
+        warnings.append(
+            f"{annotation_only_results} tool execution step(s) carried no "
+            "recoverable result text; their f140/f1 annotations were recorded "
+            "in the event summary and the step payload stays addressable"
         )
     if json_steps:
         warnings.append(f"{json_steps} step payload(s) decoded from JSON")
     if unreadable:
         warnings.append(f"{unreadable} step payload(s) were empty/unreadable")
 
-    return AdaptationResult(
-        family=FAMILY, adapter_version="1.1.0",
-        contract_version=CONTRACT_VERSION, artifacts=(artifact,),
-        sessions=tuple(sessions), events=tuple(events), relations=(),
-        fidelity=partial, warnings=tuple(warnings),
+    linked = 0
+    unmatched = 0
+    for call_id, result_event_id in pending_results:
+        owners = call_owner.get(call_id)
+        if not owners:
+            unmatched += 1
+            continue
+        # A call id can repeat within one store, so owners are consumed in
+        # step order: the earliest unclaimed call is the result's owner.
+        call_event_id = owners.pop(0)
+        linked += 1
+        relations.append(EventRelation(
+            relation_id=make_event_id(
+                FAMILY, artifact.artifact_id, CONTRACT_VERSION,
+                f"rel-call-result:{call_id}:{linked}",
+            ),
+            source_event_id=result_event_id, target_event_id=call_event_id,
+            relation_kind=RelationKind.CALL_RESULT,
+        ))
+    if unmatched:
+        warnings.append(
+            f"{unmatched} tool result(s) had no matching tool call "
+            "in the same store"
+        )
+
+    recovered = decoded_steps > 0
+    session_fidelity = _fidelity(
+        STRUCTURE_COMPLETENESS=(
+            FidelityLevel.COMPLETE if recovered else FidelityLevel.PARTIAL
+        ),
+        RELATION_COMPLETENESS=(
+            FidelityLevel.PARTIAL if relations else FidelityLevel.UNKNOWN
+        ),
+        CONTENT_AVAILABILITY=(
+            FidelityLevel.COMPLETE if recovered else FidelityLevel.UNAVAILABLE
+        ),
+        COMPACTION_VISIBILITY=FidelityLevel.COMPLETE,
     )
+    sessions = tuple(
+        AdaptedSession(
+            session_id=session_id, provenance=provenance,
+            fidelity=session_fidelity, native_session_id=native_session,
+        )
+        for session_id, provenance, native_session in session_specs
+    )
+
+    return AdaptationResult(
+        family=FAMILY, adapter_version=ADAPTER_VERSION,
+        contract_version=CONTRACT_VERSION, artifacts=(artifact,),
+        sessions=sessions, events=tuple(events),
+        relations=tuple(relations),
+        fidelity=session_fidelity,
+        warnings=tuple(warnings),
+    )
+
+
+class _Part(NamedTuple):
+    """One recoverable content fragment of a protobuf step."""
+
+    role: str
+    text: str | None = None
+    native: str | None = None
+    summary: str | None = None
+    dispositions: tuple = ()
+    link: str | None = None
+    """Correlation key joining a tool result to its tool call (the call id).
+    Kept separate from ``native`` because the native id must stay unique per
+    event while the call id is deliberately shared across the call and result.
+    """
+
+
+class _StepDecode(NamedTuple):
+    """A decoded step: its timestamp plus every content fragment found."""
+
+    epoch: int | None
+    parts: tuple[_Part, ...]
+
+
+# Protobuf step roles -> typed conversation event kinds.
+_PART_KINDS = {
+    "user": EventKind.USER_MESSAGE,
+    "assistant": EventKind.ASSISTANT_MESSAGE,
+    "reasoning": EventKind.REASONING,
+    "tool_call": EventKind.TOOL_CALL,
+    "tool_result": EventKind.TOOL_RESULT,
+    "usage": EventKind.USAGE,
+    "subagent": EventKind.SUBAGENT_BOUNDARY,
+    "compaction": EventKind.COMPACTION_SUMMARY,
+    "error": EventKind.UNKNOWN_NATIVE,
+}
+
+
+def _decoded_fidelity() -> FidelityProfile:
+    """Fidelity for a fragment recovered from the protobuf wire format."""
+    return _fidelity(
+        STRUCTURE_COMPLETENESS=FidelityLevel.COMPLETE,
+        RELATION_COMPLETENESS=FidelityLevel.PARTIAL,
+        CONTENT_AVAILABILITY=FidelityLevel.COMPLETE,
+        COMPACTION_VISIBILITY=FidelityLevel.COMPLETE,
+    )
+
+
+def _iso_utc(epoch: int | None) -> str | None:
+    """Render the step's ``f5/f1/f1`` epoch seconds as an ISO-8601 UTC stamp."""
+    if epoch is None:
+        return None
+    try:
+        moment = datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Rendering limits for tool-execution annotations (kept small: these are
+# narrative labels, and the large values duplicate the tool call arguments).
+_ANNOTATION_VALUE_LIMIT = 300
+_ANNOTATION_SUMMARY_LIMIT = 1200
+# Short human-readable keys used to label a tool result when the result text
+# itself is present. Chosen from the real-artifact key census.
+_ANNOTATION_LABEL_KEYS = ("toolSummary", "toolAction")
+
+
+def _annotations(node: PbMessage) -> list[tuple[str, str]]:
+    """Decode the repeated ``f140/f1`` annotation pairs of a tool execution.
+
+    Each entry is a ``StringPair`` message: ``f1`` the key (``toolSummary``,
+    ``toolAction``, ``CommandLine``, ``TargetFile``, ``CodeContent`` ...), ``f2``
+    the value. A key census over the live stores shows these annotations mirror
+    the ``step_type=15`` tool-call arguments, so they matter mainly for the
+    steps that carry no arguments elsewhere.
+    """
+    pairs: list[tuple[str, str]] = []
+    for value in node.blobs(1):
+        pair = PbMessage(value, strict=False)
+        key = pair.text(1)
+        if not key:
+            continue
+        pairs.append((key, pair.text(2, lenient=True) or ""))
+    return pairs
+
+
+def _render_annotations(
+    pairs: list[tuple[str, str]], *, keys: tuple[str, ...] | None = None,
+) -> str | None:
+    """Render annotation pairs as ``key=value`` text, bounded in length."""
+    chosen = [
+        (key, value) for key, value in pairs
+        if keys is None or key in keys
+    ]
+    if not chosen:
+        return None
+    rendered: list[str] = []
+    for key, value in chosen:
+        if not value:
+            rendered.append(key)
+            continue
+        if len(value) > _ANNOTATION_VALUE_LIMIT:
+            value = value[:_ANNOTATION_VALUE_LIMIT] + "…"
+        rendered.append(f"{key}={value}")
+    summary = " | ".join(rendered)
+    if len(summary) > _ANNOTATION_SUMMARY_LIMIT:
+        summary = summary[:_ANNOTATION_SUMMARY_LIMIT] + "…"
+    return summary
+
+
+_ANNOTATIONS_REFERENCE_ONLY = (
+    FieldDispositionRecord(
+        "step_payload.f140.f2",
+        FieldDisposition.PRESERVED_BY_REFERENCE,
+        "tool result text absent or not recoverable text; the step payload "
+        "stays addressable through the event's payload reference. Any "
+        "f140/f1 annotations recovered by raw field number are recorded in "
+        "the event summary (the store ships no .proto schema to name them)",
+    ),
+)
+
+
+def _decode_live_step(step_type: int, payload: bytes) -> _StepDecode | None:
+    """Decode one binary protobuf ``Step`` payload into content fragments.
+
+    The store ships no ``.proto`` schema, so field *numbers* are authoritative
+    and the semantic mapping below was recovered from real artifacts (70 stores,
+    ~1.3k user turns, ~12.5k model turns, ~21k tool calls):
+
+    =========  ===============================================================
+    step_type  layout
+    =========  ===============================================================
+    14         ``f19/f2`` user prompt; ``f19/f7|f9|f11`` attachments, whose
+               ``f1`` is a ``file://``/``http`` URI and whose ``f11/f2/f1``
+               carries attached prose
+    15         ``f20/f1`` assistant reply (``f20/f8`` mirrors it, so it is
+               skipped); ``f20/f3`` reasoning trace; ``f20/f7`` tool call
+               ``{f1: call_id, f2: tool name, f3: JSON arguments}``;
+               ``f5/f9`` token counters
+    132        ``f5/f4`` tool call ``{f1: call_id, f2: tool name, f3: arguments}``;
+               ``f140/f1`` repeated execution annotations ``{f1: key, f2:
+               value}`` (``toolSummary``/``toolAction``/``CommandLine``/...),
+               and ``f140/f2/f1`` the textual tool result
+    17         ``f24/f3`` execution error ``{f1: title, f2: detail, f7: HTTP}``
+    23         ``f30/f5`` compaction summary body (the ``<summary>`` tag is
+               present in only a minority of them); ``f30/f4`` the session
+               title on the steps that carry no body
+    101        ``f114/f2/f1`` message title, ``f114/f2/f2`` message body,
+               ``f114/f3`` message kind
+    =========  ===============================================================
+
+    Returns ``None`` when the payload is not well-formed protobuf, letting the
+    caller fall back to preserving the bytes by reference.
+    """
+    try:
+        top = PbMessage(payload, strict=True)
+    except WireFormatError:
+        return None
+
+    parts: list[_Part] = []
+    meta = top.sub1(5, strict=False)
+    epoch: int | None = None
+    if meta is not None:
+        stamp = meta.sub1(1, strict=False)
+        if stamp is not None:
+            epoch = stamp.integer(1)
+
+    if step_type == 14:
+        node = top.sub1(19, strict=False)
+        if node is not None:
+            texts: list[str] = []
+            attachments: list[str] = []
+            for number, wire_type, value in node.fields:
+                if wire_type != 2:
+                    continue
+                if number == 2:
+                    text = as_text(value, lenient=True)
+                    if text:
+                        texts.append(text)
+                elif number in (7, 9, 11):
+                    child = PbMessage(value, strict=False)
+                    uri = child.text(1)
+                    if uri and "://" in uri:
+                        attachments.append(uri)
+                    nested = child.sub1(2, strict=False)
+                    if nested is not None:
+                        attached = nested.text(1)
+                        if attached:
+                            texts.append(attached)
+            if texts or attachments:
+                parts.append(_Part(
+                    role="user",
+                    text="\n\n".join(texts) or None,
+                    summary=(
+                        "attachments: " + " ".join(attachments)
+                        if attachments else None
+                    ),
+                ))
+
+    elif step_type == 15:
+        for blob in top.blobs(20):
+            node = PbMessage(blob, strict=False)
+            for number, wire_type, value in node.fields:
+                if wire_type != 2:
+                    continue
+                if number == 1:
+                    text = as_text(value, lenient=True)
+                    if text:
+                        parts.append(_Part(role="assistant", text=text))
+                elif number == 3:
+                    text = as_text(value, lenient=True)
+                    if text:
+                        parts.append(_Part(role="reasoning", text=text))
+                elif number == 7:
+                    call = PbMessage(value, strict=False)
+                    call_id = call.text(1)
+                    tool = call.text(2)
+                    arguments = call.text(3)
+                    if call_id or tool:
+                        parts.append(_Part(
+                            role="tool_call", text=arguments,
+                            native=f"call:{call_id}" if call_id else None,
+                            summary=tool, link=call_id,
+                        ))
+        if meta is not None:
+            usage = meta.sub1(9, strict=False)
+            if usage is not None:
+                counters = [
+                    (number, value) for number, wire_type, value in usage.fields
+                    if wire_type == 0 and number not in (1, 6)
+                ]
+                if counters:
+                    parts.append(_Part(
+                        role="usage",
+                        summary=" ".join(f"f{n}={v}" for n, v in counters),
+                        dispositions=(FieldDispositionRecord(
+                            "step_payload.f5.f9",
+                            FieldDisposition.PRESERVED_BY_REFERENCE,
+                            "token counters recovered by raw field number; the "
+                            "store ships no .proto schema to name them",
+                        ),),
+                    ))
+
+    elif step_type == 132:
+        # Tool execution: f5/f4 identifies the call ({f1: call_id, f2: name,
+        # f3: JSON arguments}); f140/f1 carries repeated key/value annotations
+        # and f140/f2/f1 the textual result. The call itself is already emitted
+        # from the step_type=15 turn, so only the result is produced here and
+        # linked back by call_id.
+        call_id = None
+        if meta is not None:
+            request = meta.sub1(4, strict=False)
+            if request is not None:
+                call_id = request.text(1)
+        for blob in top.blobs(140):
+            node = PbMessage(blob, strict=False)
+            annotations = _annotations(node)
+            result_node = node.sub1(2, strict=False)
+            text = (
+                result_node.text(1, lenient=True)
+                if result_node is not None else None
+            )
+            # When the result text survives it is the content and the
+            # annotations only supply a human-readable label. When it does not,
+            # the annotations are the only surviving trace of the execution --
+            # they are then rendered in full rather than dropped.
+            if text is not None:
+                summary = _render_annotations(
+                    annotations, keys=_ANNOTATION_LABEL_KEYS,
+                )
+                dispositions: tuple = ()
+            else:
+                summary = _render_annotations(annotations)
+                dispositions = _ANNOTATIONS_REFERENCE_ONLY
+                if summary is None and result_node is not None:
+                    summary = "tool result is not recoverable text"
+            if text is None and summary is None:
+                # Neither a result nor annotations: nothing to emit beyond the
+                # payload reference the step already carries.
+                break
+            parts.append(_Part(
+                role="tool_result", text=text, summary=summary,
+                native=f"call:{call_id}:result" if call_id else None,
+                link=call_id, dispositions=dispositions,
+            ))
+            break
+
+    elif step_type == 17:
+        for blob in top.blobs(24):
+            node = PbMessage(blob, strict=False)
+            error = node.sub1(3, strict=False)
+            if error is None:
+                continue
+            pieces = [p for p in (error.text(1), error.text(2)) if p]
+            summary = " | ".join(pieces) or "agent execution error"
+            code = error.integer(7)
+            if code:
+                summary += f" (http {code})"
+            parts.append(_Part(role="error", summary=summary))
+            break
+
+    elif step_type == 23:
+        # Compaction / session continuation. The body lives in f30/f5, but the
+        # ``<summary>`` tag appears in only a minority of them (26 of 75 real
+        # summaries), so the marker cannot be the selector. The steps that
+        # carry no body hold a session title in f30/f4 instead. f30/f15 is a
+        # transcript.jsonl URI and f30/f19 repeats user prompts already
+        # captured as user messages, so neither is content here.
+        for blob in top.blobs(30):
+            node = PbMessage(blob, strict=False)
+            body = node.text(5, lenient=True)
+            if body:
+                parts.append(_Part(role="compaction", text=body))
+                break
+            title = node.text(4, lenient=True)
+            if title:
+                parts.append(_Part(role="compaction", summary=title))
+                break
+
+    elif step_type == 101:
+        for blob in top.blobs(114):
+            node = PbMessage(blob, strict=False)
+            body = node.sub1(2, strict=False)
+            title = body.text(1) if body is not None else None
+            text = body.text(2) if body is not None else None
+            kind = node.text(3)
+            if text:
+                parts.append(_Part(
+                    role="subagent", text=text, summary=title or kind,
+                ))
+            elif title:
+                parts.append(_Part(role="subagent", summary=title))
+
+    return _StepDecode(epoch=epoch, parts=tuple(parts))
 
 
 def _classify_step_payload(raw) -> tuple:

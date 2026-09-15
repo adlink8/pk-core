@@ -20,6 +20,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
 )
 from personal_knowledge.adapters.conversation_sources.jsonl_stream import (
     iter_jsonl_lines,
@@ -44,7 +45,7 @@ ADAPTER_VERSION = "1.4.0"
 
 # Round-4 fix: attachment payloads are projected as bounded event content.
 _ATTACHMENT_CAP = 50_000
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "2"
 
 # P1-F4 content-fidelity limits for tool blocks.
 # tool_result carries the full native output into ``content`` up to a high
@@ -378,7 +379,7 @@ class _Family:
         if not (artifact.relative_path or "").lower().endswith(".jsonl"):
             return False
         try:
-            lines = (artifact_root / artifact.artifact_id).read_text(encoding="utf-8").splitlines()
+            lines = artifact_bytes_path(artifact_root, artifact).read_text(encoding="utf-8").splitlines()
         except OSError:
             return False
         if self.dag_shape and not any('"uuid"' in l and '"parentUuid"' in l for l in lines):
@@ -689,7 +690,7 @@ class _Family:
                 f"{self.family} adapter requires exactly one artifact, got {len(artifact_set.artifacts)}"
             )
         artifact = artifact_set.artifacts[0]
-        records = list(iter_jsonl_lines(artifact_root / artifact.artifact_id))
+        records = list(iter_jsonl_lines(artifact_root / artifact.content_hash[:32]))
 
         session_id = make_event_id(self.family, artifact.artifact_id, CONTRACT_VERSION,
                                    None, kind=EventKind.SESSION_LIFECYCLE, native_locator="session")

@@ -18,6 +18,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
 )
 from personal_knowledge.adapters.conversation_sources.jsonl_stream import (
     iter_jsonl_lines,
@@ -78,7 +79,7 @@ def _block_text(value) -> str | None:
     parts = [b["text"] for b in value
              if isinstance(b, dict) and isinstance(b.get("text"), str)]
     return " ".join(parts) if parts else None
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "2"
 
 _COMPLETE = {
     FidelityDimension.SOURCE_AVAILABILITY: FidelityLevel.COMPLETE,
@@ -403,7 +404,7 @@ class _Family:
         if not (artifact.relative_path or "").lower().endswith(".jsonl"):
             return False
         try:
-            with (artifact_root / artifact.artifact_id).open("r", encoding="utf-8") as h:
+            with artifact_bytes_path(artifact_root, artifact).open("r", encoding="utf-8") as h:
                 for raw in h:
                     line = raw.strip()
                     if line and any(m in line for m in self.markers):
@@ -731,7 +732,7 @@ class _Family:
                 f"artifact, got {len(main_artifacts)}"
             )
         artifact = main_artifacts[0]
-        records = list(iter_jsonl_lines(artifact_root / artifact.artifact_id))
+        records = list(iter_jsonl_lines(artifact_root / artifact.content_hash[:32]))
 
         session_id = make_event_id(self.family, artifact.artifact_id, CONTRACT_VERSION,
                                    None, kind=EventKind.SESSION_LIFECYCLE, native_locator="session")
@@ -870,7 +871,7 @@ class _Family:
             sub_filename = Path(sub_artifact.relative_path).name
             sub_records: list[dict] = []
             try:
-                sub_records = list(iter_jsonl_lines(artifact_root / sub_artifact.artifact_id))
+                sub_records = list(iter_jsonl_lines(artifact_root / sub_artifact.content_hash[:32]))
             except OSError:
                 warnings.append(f"subagent artifact {sub_artifact.artifact_id} unreadable")
                 continue

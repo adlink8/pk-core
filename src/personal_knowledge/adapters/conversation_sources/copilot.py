@@ -18,6 +18,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     CapabilityDescriptor,
     SourceArtifact,
     SourceArtifactSet,
+    artifact_bytes_path,
 )
 from personal_knowledge.adapters.conversation_sources.jsonl_stream import (
     iter_jsonl_lines,
@@ -40,7 +41,7 @@ from personal_knowledge.core.conversation_events import (
 
 FAMILY = "copilot"
 ADAPTER_VERSION = "1.2.0"
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "2"
 
 # Round-4 audit fix: tool arguments/results were never stored as event content
 # (name-only summaries), and sessions without session.info/model_change lost
@@ -164,7 +165,7 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
     if suffix not in (".jsonl", ".json"):
         return False
     try:
-        path = artifact_root / artifact.artifact_id
+        path = artifact_bytes_path(artifact_root, artifact)
         if suffix == ".json":
             doc = json.loads(path.read_text(encoding="utf-8"))
             return isinstance(doc, dict) and isinstance(doc.get("requests"), list)
@@ -337,7 +338,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         )
     artifact = artifact_set.artifacts[0]
     records, malformed = _load_records(
-        artifact_root / artifact.artifact_id, artifact.relative_path
+        artifact_root / artifact.content_hash[:32], artifact.relative_path
     )
 
     session_id = make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION,
