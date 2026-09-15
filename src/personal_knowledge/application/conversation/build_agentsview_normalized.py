@@ -532,10 +532,12 @@ def build_normalized(
             )
 
         # --- usage_events ---
+        usage_cols = {col[1] for col in src.execute("PRAGMA table_info(usage_events)").fetchall()}
+        cost_expr = "cost_usd" if "cost_usd" in usage_cols else "0.0 AS cost_usd"
         usage_rows: list[tuple] = []
         for urow in src.execute(
-            "SELECT id, session_id, model, occurred_at, input_tokens, "
-            "output_tokens, cost_usd FROM usage_events ORDER BY session_id, id"
+            f"SELECT id, session_id, model, occurred_at, input_tokens, "
+            f"output_tokens, {cost_expr} FROM usage_events ORDER BY session_id, id"
         ):
             src_sid = urow["session_id"]
             norm_sid = sid_map.get(src_sid, src_sid)

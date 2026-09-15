@@ -85,10 +85,10 @@ ALL_TOOLS = [
     types.Tool(
         name="search_semantic",
         description=(
-            "语义检索(knowledge-first + raw fallback)。"
-            "先查 active 知识单元索引(结构化 Q&A),再回落 personal_events 原始事件。"
+            "语义检索(wiki-first + layered fallback)。"
+            "先查主题 Wiki 页与会话卡,再查 active 知识单元,再回落对话与 raw 事件。"
             "适合'我大概记得做过类似的事'这类模糊查询。"
-            "返回 route、versions 与结果列表;结果可能是 knowledge_unit 或 event。"
+            "返回 route、versions 与结果列表;结果可能是 wiki_page、semantic_card、knowledge_unit 或 event。"
         ),
         inputSchema={
             "type": "object",

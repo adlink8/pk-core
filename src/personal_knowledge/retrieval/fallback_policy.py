@@ -15,6 +15,7 @@ import os
 from typing import Any
 
 from personal_knowledge.retrieval._constants import (
+    COMPRESSED_LAYER_NAMES,
     DEFAULT_FALLBACK_POLICY,
     FALLBACK_POLICIES,
     LAYERED_FALLBACK_ORDER,
@@ -30,9 +31,12 @@ LAYER_ROLES: dict[str, str] = {
     "non_dialogue_raw": "google_normalized",
 }
 
-# Layered mode fallback chain (knowledge_unit is the primary layer, handled by
-# the assembler before the chain runs).
-LAYERED_CHAIN: tuple[str, ...] = tuple(LAYERED_FALLBACK_ORDER[1:])
+# Post-primary fallback chain. wiki_page / semantic_card / knowledge_unit are
+# run by the assembler before this chain.
+_PRIMARY_LAYERS = frozenset((*COMPRESSED_LAYER_NAMES, "knowledge_unit"))
+LAYERED_CHAIN: tuple[str, ...] = tuple(
+    name for name in LAYERED_FALLBACK_ORDER if name not in _PRIMARY_LAYERS
+)
 
 # Legacy mode fallback chain: full personal_events raw fallback (old behavior).
 LEGACY_CHAIN: tuple[str, ...] = ("legacy_personal_events",)

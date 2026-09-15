@@ -63,7 +63,7 @@ def adapt_pathless_observation(
             f"{family} pathless adapter requires exactly one AgentsView snapshot"
         )
     artifact = artifact_set.artifacts[0]
-    blob = artifact_root / artifact.artifact_id
+    blob = artifact_root / artifact.content_hash[:32]
     if artifact.source_kind != "sqlite" or not blob.is_file():
         raise EventContractError(
             f"{family} compatibility artifact is not resolvable SQLite"

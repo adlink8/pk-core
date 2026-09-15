@@ -196,6 +196,11 @@ OPERATIONS: dict[str, dict[str, Any]] = {
         },
         "privacy": "R2",
     },
+    "candidate.list": {
+        "kind": "read",
+        "allowed": {"task_id", "idempotency_key", "binding", "scope", "limit", "cursor"},
+        "privacy": "R2",
+    },
     PROJECTION_GET_OPERATION: {
         "kind": "read",
         "allowed": {"task_id", "idempotency_key", "binding", "scope"},
@@ -271,7 +276,8 @@ class PiDomainGateway:
                  snapshot_tools: SnapshotReleaseTools | None = None,
                  evidence_tool: EvidenceSqliteTool | None = None,
                  reflection_adapter=None, reflection_db: Path | str | None = None,
-                 review_adapter=None, review_db: Path | str | None = None) -> None:
+                 review_adapter=None, review_db: Path | str | None = None,
+                 conversation_db: Path | str | None = None) -> None:
         self.service = service
         self.capability = capability or os.environ.get("PI_DOMAIN_CAPABILITY", DEFAULT_CAPABILITY)
         self.read_handler = read_handler
@@ -285,6 +291,33 @@ class PiDomainGateway:
         self.reflection_db = reflection_db
         self.review_adapter = review_adapter
         self.review_db = review_db
+        self.conversation_db = conversation_db
+
+    def _load_review_candidates(self, reflection_db):
+        from personal_knowledge.application.conversation.harness_reflection import HarnessReflectionAdapter
+        from personal_knowledge.application.conversation.extracted_candidate_store import ExtractedCandidateStore
+        from personal_knowledge.core.project_paths import AGENT_CONVERSATIONS_DB
+
+        candidates = HarnessReflectionAdapter.load_candidates(reflection_db)
+        candidates.update(ExtractedCandidateStore(reflection_db).load_candidates(
+            self.conversation_db or AGENT_CONVERSATIONS_DB))
+        return candidates
+
+    def _bound_review_adapter(self, *, read_only: bool = False):
+        """Resolve persisted candidates on each request, including after restart."""
+        if self.review_adapter is not None:
+            return self.review_adapter
+        from personal_knowledge.application.conversation.harness_candidate_review import (
+            DEFAULT_CANDIDATE_REVIEW_DB, HarnessCandidateReviewAdapter,
+        )
+        from personal_knowledge.application.conversation.harness_reflection import HarnessReflectionAdapter
+
+        review_db = self.review_db or DEFAULT_CANDIDATE_REVIEW_DB
+        if read_only and not Path(review_db).exists():
+            return None
+        reflection_db = getattr(self.reflection_adapter, "db_path", None) or self.reflection_db or DEFAULT_REFLECTION_DB
+        candidates = self._load_review_candidates(reflection_db)
+        return HarnessCandidateReviewAdapter(db_path=review_db, candidates=candidates, read_only=read_only)
 
     def _check(self, operation: str, params: Mapping[str, Any], capability: str | None) -> None:
         canonical = canonical_project_operation(operation)
@@ -367,20 +400,27 @@ class PiDomainGateway:
                 if isinstance(data, dict):
                     data["capability_checksum"] = spec.get("checksum")
                 return _ok(canonical, data)
+            if canonical == "candidate.list":
+                from personal_knowledge.application.conversation.harness_reflection import HarnessReflectionAdapter
+                from personal_knowledge.application.conversation.candidate_review_store import CandidateReviewReadStore
+                from personal_knowledge.application.conversation.harness_candidate_review import DEFAULT_CANDIDATE_REVIEW_DB
+                scope = params.get("scope")
+                limit = params.get("limit", 20)
+                cursor = params.get("cursor", "")
+                if not isinstance(scope, str) or not scope or len(scope) > 2048:
+                    return _error(canonical, "scope_denied")
+                if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100 or not isinstance(cursor, str) or len(cursor) > 256:
+                    return _error(canonical, "parameter_invalid")
+                candidates = self._load_review_candidates(self.reflection_db or DEFAULT_REFLECTION_DB)
+                store = CandidateReviewReadStore(self.review_db or DEFAULT_CANDIDATE_REVIEW_DB, candidates)
+                return _ok(canonical, store.list_candidates(scope=scope, limit=limit, cursor=cursor))
             if canonical == CANDIDATE_REVIEW_OPERATION:
                 # Explicit guarded review provider only: the adapter validates
                 # candidate/version/action/edit-checksum/confirmation/token/
                 # conflict-disposition/idempotency and returns one safe no-store
                 # review state. Never a promotion/rollback/canonical route and
                 # never a dynamic callable name.
-                from personal_knowledge.application.conversation.harness_candidate_review import (
-                    DEFAULT_CANDIDATE_REVIEW_DB,
-                    HarnessCandidateReviewAdapter,
-                )
-                adapter = self.review_adapter
-                if adapter is None:
-                    db = self.review_db or DEFAULT_CANDIDATE_REVIEW_DB
-                    adapter = HarnessCandidateReviewAdapter(db_path=db)
+                adapter = self._bound_review_adapter()
                 data = adapter.review(**dict(params))
                 if isinstance(data, dict):
                     data["capability_checksum"] = spec.get("checksum")
@@ -396,7 +436,7 @@ class PiDomainGateway:
                     HarnessModelProjectionProvider,
                 )
                 provider = HarnessModelProjectionProvider(
-                    review_adapter=self.review_adapter,
+                    review_adapter=self._bound_review_adapter(read_only=True),
                     review_db=self.review_db,
                 )
                 try:

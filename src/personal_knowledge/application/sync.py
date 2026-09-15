@@ -139,11 +139,6 @@ def publish_conversation_delta_committed(
         return _delta_fail_closed("mismatched_watermark")
     if not source_checksum:
         return _delta_fail_closed("missing_source_checksum")
-    if not endpoint:
-        return _delta_fail_closed("endpoint_missing")
-    if not internal_capability:
-        return _delta_fail_closed("internal_capability_missing")
-
     body = {
         "producer": source,
         "scope": scope,
@@ -155,22 +150,54 @@ def publish_conversation_delta_committed(
         "idempotency_key": idempotency_key,
         "committed": True,
     }
-    status, payload = _post_conversation_delta(endpoint, body, internal_capability)
-    if status in (200, 201) and isinstance(payload, dict) and payload.get("ok") is True:
+    from personal_knowledge.application.conversation.delta_outbox import (
+        drain_conversation_delta_outbox,
+        enqueue_conversation_delta,
+    )
+
+    try:
+        queued = enqueue_conversation_delta(body, delivery_target=endpoint)
+    except ValueError as exc:
+        return _delta_fail_closed(f"outbox_rejected:{exc}")
+    if queued["status"] == "sent":
         return {
             "published": True,
-            "status": payload.get("status", "appended"),
-            "replay": bool(payload.get("replay")),
-            "duplicate": bool(payload.get("duplicate")),
+            "status": "replay",
+            "replay": True,
+            "duplicate": True,
             "event_type": CONVERSATION_DELTA_TYPE,
-            "event_id": payload.get("event_id"),
-            "sequence": payload.get("sequence"),
+            "event_id": queued.get("event_id"),
+            "sequence": queued.get("sequence"),
         }
-    code = ""
-    if isinstance(payload, dict):
-        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
-        code = error.get("code") or ""
-    return _delta_fail_closed(f"rejected:{code or status or 'transport_error'}")
+    if not endpoint:
+        return _delta_fail_closed("pending:endpoint_missing")
+    if not internal_capability:
+        return _delta_fail_closed("pending:internal_capability_missing")
+
+    delivery: dict[str, object] = {}
+
+    def send(metadata: dict) -> dict:
+        status, payload = _post_conversation_delta(endpoint, metadata, internal_capability)
+        code = ""
+        if isinstance(payload, dict):
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            code = error.get("code") or ""
+        if status in (200, 201) and isinstance(payload, dict) and payload.get("ok") is True:
+            if metadata.get("idempotency_key") == body["idempotency_key"]:
+                delivery.update(
+                    status=payload.get("status", "appended"),
+                    replay=bool(payload.get("replay")),
+                    duplicate=bool(payload.get("duplicate")),
+                    event_id=payload.get("event_id"),
+                    sequence=payload.get("sequence"),
+                )
+            return {"published": True, **delivery}
+        return {"published": False, "reason": f"rejected:{code or status or 'transport_error'}"}
+
+    drained = drain_conversation_delta_outbox(sender=send, limit=100)
+    if delivery:
+        return {"published": True, "event_type": CONVERSATION_DELTA_TYPE, **delivery}
+    return _delta_fail_closed(f"pending:{drained.get('failed') and 'delivery_failed' or 'not_sent'}")
 
 
 def _cmd_conversations(write: bool, args) -> int:
@@ -189,7 +216,6 @@ def _cmd_conversations(write: bool, args) -> int:
     if live_flags:
         if (args.v2_dry_run or args.v2_shadow or args.v2_activate or
                 args.v2_native or args.v2_native_dry_run):
-
             print(
                 "[error] --live-* / --watch cannot be combined with a --v2-* mode",
                 file=sys.stderr,
@@ -244,12 +270,31 @@ def _cmd_conversations(write: bool, args) -> int:
     mode = "write" if write else "dry-run"
     print(f"\n[done] pk-sync conversations ({mode}) finished.")
     print("  SSOT: data/canonical/agent/structured/db/agent_conversations.sqlite")
-    print("  Next (optional): pk-ku inspect → prepare → extract — not part of this command.")
+    print("  Next (optional): python tools/semantic/mvp_semantic_compress.py scale")
+    print("    or pk-sync conversations --write --compress-new  (cost-capped; not dry-run)")
     if publications:
         print(f"  Versions: {sum(int(x['created']) for x in publications)} new / {len(publications)} recorded")
     if delta and delta.get("published"):
         print(f"  Delta: conversation.delta.committed ({delta.get('status')}, event {delta.get('event_id')})")
+    if write and getattr(args, "compress_new", False):
+        return _run_compress_new()
     return 0
+
+
+def _run_compress_new() -> int:
+    """Opt-in incremental compress of uncarded sessions. Honors PK_MVP_COST_CAP."""
+    import subprocess
+
+    from personal_knowledge.core.project_paths import ROOT
+
+    script = ROOT / "tools" / "semantic" / "mvp_semantic_compress.py"
+    print(f"\n[compress-new] {script} scale")
+    completed = subprocess.run(
+        [sys.executable, str(script), "scale"],
+        cwd=str(ROOT),
+        check=False,
+    )
+    return int(completed.returncode or 0)
 
 
 def _cmd_turns(write: bool) -> int:
@@ -420,6 +465,17 @@ def _cmd_status(json_output: bool) -> int:
     return 0 if report.get("ok") else 1
 
 
+def _cmd_delta_outbox_status(json_output: bool) -> int:
+    from personal_knowledge.application.conversation.delta_outbox import outbox_status
+
+    report = outbox_status()
+    if json_output:
+        print(json.dumps(report, ensure_ascii=False))
+    else:
+        print(f"conversation delta outbox: {report['pending']} pending, {report['sent']} sent")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="pk-sync",
@@ -438,6 +494,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--write",
         action="store_true",
         help="Publish normalized + canonical DBs (default is dry-run)",
+    )
+    conv.add_argument(
+        "--compress-new",
+        action="store_true",
+        help=(
+            "After a successful --write, run mvp_semantic_compress scale "
+            "for uncarded sessions (PK_MVP_COST_CAP). Never runs on dry-run."
+        ),
     )
     # Phase 62-04: additive v2 orchestration flags. The default command
     # behavior is unchanged; these flags are explicit and opt-in only.
@@ -465,6 +529,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="Read-only publication version/watermark status")
     status.add_argument("--json", action="store_true", help="Emit JSON")
+    delta_status = sub.add_parser("delta-outbox", help="Read-only committed conversation delta delivery status")
+    delta_status.add_argument("--json", action="store_true", help="Emit JSON")
     conv.add_argument(
         "--dry-run",
         action="store_true",
@@ -503,6 +569,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "status":
         return _cmd_status(json_output=bool(args.json))
+
+    if args.command == "delta-outbox":
+        return _cmd_delta_outbox_status(json_output=bool(args.json))
 
     print(f"unknown command: {args.command}", file=sys.stderr)
     return 2

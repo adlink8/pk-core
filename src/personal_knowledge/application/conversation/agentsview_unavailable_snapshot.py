@@ -92,6 +92,8 @@ def _build_and_publish(
             relative_path=f"sqlite:{source.name}",
             byte_limit=byte_limit,
             count_limit=1,
+            family=family,
+            mirror_path=f"sqlite:{source.name}",
         )
         return replace(
             artifact,

@@ -42,7 +42,7 @@ class EvidenceResolver:
 
     def resolve(self, ref: str, *, artifact_type: str | None = None, include_content: bool = False, source_version: str | None = None) -> dict[str, Any]:
         if artifact_type is None:
-            if ref.startswith("cm|"):
+            if ref.startswith("cm|") or ref.startswith("v2|cm|"):
                 artifact_type = "canonical_message"
             elif ref.startswith("g|"):
                 artifact_type = "google_signal"

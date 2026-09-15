@@ -12,7 +12,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
 _THIS_DIR = _SCRIPTS_DIR
 
 from personal_knowledge.core.project_paths import (  # noqa: E402
-    ROOT, UNIFIED_DB, GOOGLE_DB, AGENT_CONVERSATIONS_DB, DB_DIR,
+    ROOT, UNIFIED_DB, GOOGLE_DB, AGENT_CONVERSATIONS_DB, DB_DIR, VAR_DB,
+    WIKI_PROJECTION_DB,
 )
 
 DEFAULT_MEMORY_GRAPH_LIMIT = 100
@@ -46,7 +47,9 @@ AGGREGATE_GROUP_SQL = {
     "day": "substr(ue.event_time, 1, 10)",
     "year": "substr(ue.event_time, 1, 4)",
 }
-_KU_SLOTS = 1
+_KU_SLOTS = 3
+_WIKI_SLOTS = 2
+_CARD_SLOTS = 2
 _RAW_SLOTS_DEFAULT = 4
 _KU_PORT = 8001
 FALLBACK_POLICIES = ("legacy", "layered")
@@ -55,13 +58,19 @@ CONVERSATION_TURNS_COLLECTION = "conversation_turns"
 CANONICAL_MESSAGES_COLLECTION = "canonical_messages"
 _NON_DIALOGUE_PREFERRED_SOURCE = "Google"
 
-# Layered hybrid order (Phase 15 / 22 contract).
-# KU retrieval surface is lifecycle=current only; growth line is pk-ku history.
-# Order: knowledge → dialogue (message then turns) → Google non-dialogue → optional pad.
+# Disposable projection stores (read-only in retrieval; not fact SSOT).
+CARDS_DB = VAR_DB / "semantic_mvp_v3.sqlite"
+
+# Layered hybrid order (Phase 15 / 22 contract, wiki-first 2026-09).
+# Retrieval surface is lifecycle=current only; growth line is pk-ku history.
+# Order: wiki projection → session cards → KU → dialogue → Google → optional pad.
 LAYERED_FALLBACK_ORDER = (
+    "wiki_page",
+    "semantic_card",
     "knowledge_unit",
     "canonical_messages",
     "conversation_turns",
     "non_dialogue_raw",
     "legacy_pad",
 )
+COMPRESSED_LAYER_NAMES = ("wiki_page", "semantic_card")

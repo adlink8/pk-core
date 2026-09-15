@@ -67,7 +67,7 @@ def _cli() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 语义检索(knowledge-first + layered/legacy fallback；读 active knowledge index)
+  # 语义检索(wiki-first + layered/legacy fallback；读 wiki/cards 再 active knowledge index)
   python unified_search.py semantic "PPT 排版怎么做" --top-k 3
   python unified_search.py semantic "数据库调试" --source Agent
 
@@ -110,7 +110,7 @@ def _cli() -> None:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    ps = sub.add_parser("semantic", help="语义检索(knowledge-first + layered/legacy fallback)")
+    ps = sub.add_parser("semantic", help="语义检索(wiki-first + layered/legacy fallback)")
     ps.add_argument("query")
     ps.add_argument("--top-k", type=int, default=5)
     ps.add_argument("--source", default=None)

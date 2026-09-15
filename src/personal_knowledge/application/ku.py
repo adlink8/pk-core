@@ -475,10 +475,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     view_st = sub.add_parser(
         "view-status",
-        help="Ledger status for a view-policy run (or legacy superseded audit).",
+        help="Read-only delta backlog, or ledger status with --run (including legacy audit).",
     )
-    view_st.add_argument("--run", required=True, metavar="RUN_ID")
+    view_st.add_argument("--run", metavar="RUN_ID")
     view_st.add_argument("--conversation-db", type=Path, default=None)
+
+    consume = sub.add_parser("view-consume", help="Prepare one committed event-delta page; persist progress, never call a provider.")
+    consume.add_argument("--conversation-db", type=Path, default=None)
+    consume.add_argument("--max-events", type=int, default=100)
+    consume.add_argument("--max-context-events", type=int, default=2000)
+
+    baseline = sub.add_parser("view-baseline", help="Preview first event baseline; initialize only with exact preview approval.")
+    baseline.add_argument("--conversation-db", type=Path, default=None)
+    baseline.add_argument("--write", action="store_true")
+    baseline.add_argument("--approval", default=None)
 
     return p
 
@@ -1130,6 +1140,11 @@ def _cmd_view_status(args: argparse.Namespace) -> int:
     from personal_knowledge.core.project_paths import AGENT_CONVERSATIONS_DB
 
     conversation_db = args.conversation_db or AGENT_CONVERSATIONS_DB
+    if not args.run:
+        from personal_knowledge.application.knowledge.delta_backlog_status import inspect_delta_backlog
+        status = inspect_delta_backlog(conversation_db)
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 2 if status["status"] in {"degraded", "uninitialized"} else 0
     status = view_run_status(conversation_db, args.run)
     print(json.dumps(status, ensure_ascii=False, indent=2))
     return 0
@@ -1137,6 +1152,24 @@ def _cmd_view_status(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.command == "view-baseline":
+        from personal_knowledge.application.conversation.delta_baseline import baseline_command
+        return baseline_command(args)
+
+    if args.command == "view-consume":
+        import sqlite3
+        from personal_knowledge.application.knowledge.delta_candidate_consumer import consume_delta_candidates
+        from personal_knowledge.application.knowledge.view_candidate_prepare import CandidatePrepareError
+        from personal_knowledge.core.project_paths import AGENT_CONVERSATIONS_DB
+        try:
+            result = consume_delta_candidates(args.conversation_db or AGENT_CONVERSATIONS_DB,
+                                              max_events=args.max_events, max_context_events=args.max_context_events)
+        except (ValueError, CandidatePrepareError, sqlite3.Error) as exc:
+            print(json.dumps({"ok": False, "error": str(exc), "cursor_advanced": False}), file=sys.stderr)
+            return 2
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
 
     if args.command == "workflow":
         return _cmd_workflow()

@@ -31,115 +31,38 @@ successful review advances the candidate review version by one.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from personal_knowledge.core.project_paths import ROOT
 
-REVIEW_ACTIONS = frozenset({"accept", "edit", "ignore", "undo"})
-REVIEW_OUTCOMES = frozenset({
-    "reviewed",
-    "duplicate",
-    "confirmation_required",
-    "stale_version",
-    "conflict_disposition_required",
-    "rejected",
-    "outcome_unknown",
-})
-CONFLICT_DISPOSITIONS = frozenset({
-    "keep_existing",
-    "replace_existing",
-    "coexist_by_context",
-    "defer_judgment",
-})
-CONFLICT_DISPOSITION_LABELS = {
-    "keep_existing": "保留旧结论",
-    "replace_existing": "用新结论取代",
-    "coexist_by_context": "按情境共存",
-    "defer_judgment": "暂不判断",
-}
-CONFLICT_DISPOSITION_CONSEQUENCES = {
-    "keep_existing": "保留旧结论：新候选仅记录为未采纳的参考，不改变当前认知。",
-    "replace_existing": "用新结论取代：旧结论转入历史版本，后续投影基于新结论生成。",
-    "coexist_by_context": "按情境共存：新旧结论按适用情境并存，投影时按情境选择。",
-    "defer_judgment": "暂不判断：候选保持待评审状态，不进入任何投影。",
-}
-
-# A fixed default ledger location for the gateway-provider path. The adapter
-# itself never discovers or writes canonical/promotion/watermark/permission/
-# value state; the ledger holds only stable review identities and receipts.
-DEFAULT_CANDIDATE_REVIEW_DB = ROOT / "var" / "db" / "candidate_review.sqlite"
-
-
-class CandidateReviewError(Exception):
-    """Fail-closed validation error with a stable machine code."""
-
-    def __init__(self, code: str, detail: str = "") -> None:
-        super().__init__(code)
-        self.code, self.detail = code, detail
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            str(key): _jsonable(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
-    if isinstance(value, (tuple, list)):
-        return [_jsonable(item) for item in value]
-    return value
-
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(
-        _jsonable(value), ensure_ascii=False, sort_keys=True,
-        separators=(",", ":"), allow_nan=False,
-    )
-
-
-def _checksum(value: Any) -> str:
-    """Exact Task 1 fixture formula: canonical JSON -> sha256 hex."""
-    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def _now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-
-def _idempotency_identity(candidate_id: str, action: str, idempotency_key: Any, feedback_id: Any) -> str:
-    """Stable idempotency identity, deliberately excluding expected_version.
-
-    Idempotency must dedupe before version validation: an exact replay with a
-    stale ``expected_version`` still returns ``duplicate``.
-    """
-    return hashlib.sha256(json.dumps(
-        {
-            "candidate_id": candidate_id,
-            "action": action,
-            "idempotency_key": "" if idempotency_key is None else str(idempotency_key),
-            "feedback_id": None if feedback_id is None else str(feedback_id),
-        },
-        sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
+from personal_knowledge.application.conversation.candidate_review_contract import (
+    REVIEW_ACTIONS, REVIEW_OUTCOMES, CONFLICT_DISPOSITIONS,
+    CONFLICT_DISPOSITION_LABELS, CONFLICT_DISPOSITION_CONSEQUENCES,
+    DEFAULT_CANDIDATE_REVIEW_DB, EDITABLE_CANDIDATE_FIELDS, CandidateReviewError,
+    _jsonable, _canonical_json, _checksum, _now_utc, _idempotency_identity, _request_checksum,
+    validate_edit_fields,
+)
+from personal_knowledge.application.conversation.candidate_review_store import CandidateReviewReadStore
 
 
 class HarnessCandidateReviewAdapter:
-    """Metadata-only append-only review ledger guarded by validation gates.
+    """Append-only review ledger with separately stored, validated user edits.
 
     ``candidates`` is a mapping of candidate_id -> Candidate metadata supplied
     by the calling layer (for example the Plan 61-07 reflection ledger). The
-    ledger stores only review identities, versions, checksums and receipt IDs;
-    it never holds a candidate/evidence body, prompt, credential, SQL statement
-    or any canonical/promotion/permission/value state.
+    feedback rows store review identities, versions, checksums and receipt IDs.
+    The edit table retains explicitly confirmed editable fields for restart-safe
+    reconstruction; neither table stores raw evidence or grants canonical authority.
     """
 
-    def __init__(self, *, db_path: Path | str, candidates: Mapping[str, Any] | None = None) -> None:
+    def __init__(self, *, db_path: Path | str, candidates: Mapping[str, Any] | None = None, read_only: bool = False) -> None:
         self.db_path = Path(db_path)
         self.candidates = dict(candidates or {})
+        self.read_only = bool(read_only)
+        if self.read_only:
+            return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(self.db_path)
         try:
@@ -162,6 +85,19 @@ class HarnessCandidateReviewAdapter:
                 "disposition TEXT,"
                 "recorded_at TEXT NOT NULL)"
             )
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS candidate_review_edits ("
+                "edit_id INTEGER PRIMARY KEY AUTOINCREMENT, candidate_id TEXT NOT NULL, feedback_id TEXT, "
+                "version INTEGER NOT NULL, fields_json TEXT NOT NULL, fields_checksum TEXT NOT NULL, "
+                "recorded_at TEXT NOT NULL)"
+            )
+            # Existing ledgers predate divergent replay protection.
+            columns = {row[1] for row in con.execute("PRAGMA table_info(candidate_review_feedback)")}
+            if "request_checksum" not in columns:
+                con.execute("ALTER TABLE candidate_review_feedback ADD COLUMN request_checksum TEXT")
+            edit_columns = {row[1] for row in con.execute("PRAGMA table_info(candidate_review_edits)")}
+            if "feedback_id" not in edit_columns:
+                con.execute("ALTER TABLE candidate_review_edits ADD COLUMN feedback_id TEXT")
             con.commit()
         finally:
             con.close()
@@ -170,80 +106,24 @@ class HarnessCandidateReviewAdapter:
     # Ledger reads
     # ------------------------------------------------------------------
 
-    def _current_version(self, candidate_id: str) -> int:
-        con = sqlite3.connect(self.db_path)
-        try:
-            row = con.execute(
-                "SELECT current_version FROM candidate_review_state WHERE candidate_id=?",
-                (candidate_id,),
-            ).fetchone()
-            return int(row[0]) if row is not None else 1
-        finally:
-            con.close()
+    @property
+    def _reader(self):
+        return CandidateReviewReadStore(self.db_path, self.candidates)
 
-    def _lookup_idempotency(self, identity: str) -> dict[str, Any] | None:
-        con = sqlite3.connect(self.db_path)
-        try:
-            row = con.execute(
-                "SELECT feedback_id, action, version, receipt_id, receipt_checksum "
-                "FROM candidate_review_feedback WHERE idempotency_identity=?",
-                (identity,),
-            ).fetchone()
-            if row is None:
-                return None
-            return {
-                "feedback_id": str(row[0]),
-                "action": str(row[1]),
-                "version": int(row[2]),
-                "receipt_id": str(row[3]),
-                "receipt_checksum": str(row[4]),
-            }
-        finally:
-            con.close()
+    def _current_version(self, candidate_id):
+        return self._reader._current_version(candidate_id)
 
-    def _feedback_exists(self, candidate_id: str, feedback_id: str) -> bool:
-        con = sqlite3.connect(self.db_path)
-        try:
-            row = con.execute(
-                "SELECT 1 FROM candidate_review_feedback WHERE candidate_id=? AND feedback_id=?",
-                (candidate_id, feedback_id),
-            ).fetchone()
-            return row is not None
-        finally:
-            con.close()
+    def _lookup_idempotency(self, identity):
+        return self._reader._lookup_idempotency(identity)
 
-    def feedback_history(self, candidate_id: str) -> tuple[dict[str, Any], ...]:
-        """Append-only immutable reversible calibration history in review order.
+    def _feedback_exists(self, candidate_id, feedback_id):
+        return self._reader._feedback_exists(candidate_id, feedback_id)
 
-        Only the reversible review gestures (``ignore``/``undo``) surface here:
-        they are the entries an ``undo`` can reference and the calibration
-        feedback the loop records (D-25). Confirmed accept/edit receipts are
-        still bound to metadata-only ledger rows so an exact replay deduplicates
-        with the same feedback id/receipt, but a confirmed accept/edit is not a
-        reversible gesture and never appears in this reversible-history view.
-        """
-        con = sqlite3.connect(self.db_path)
-        try:
-            rows = con.execute(
-                "SELECT feedback_id, candidate_id, action, version, receipt_id, "
-                "receipt_checksum, referenced_feedback_id, disposition, recorded_at "
-                "FROM candidate_review_feedback WHERE candidate_id=? "
-                "AND action IN ('ignore', 'undo') ORDER BY rowid",
-                (candidate_id,),
-            ).fetchall()
-            return tuple({
-                "feedback_id": str(row[0]),
-                "candidate_id": str(row[1]),
-                "action": str(row[2]),
-                "version": int(row[3]),
-                "receipt_id": str(row[4]),
-                "receipt_checksum": str(row[5]),
-                "referenced_feedback_id": row[6],
-                "disposition": row[7],
-                "recorded_at": str(row[8]),
-            } for row in rows)
-        finally:
-            con.close()
+    def feedback_history(self, candidate_id):
+        return self._reader.feedback_history(candidate_id)
+
+    def resolved_candidates(self):
+        return self._reader.resolved_candidates()
 
     # ------------------------------------------------------------------
     # Public review entry
@@ -255,6 +135,8 @@ class HarnessCandidateReviewAdapter:
         Never raises for a rejected/duplicate/required/stale review and never
         writes canonical/promotion/watermark/pointer/permission/value state.
         """
+        if self.read_only:
+            return {"status": "rejected", "candidate_id": request.get("candidate_id"), "reason": "read_only"}
         try:
             return self._review(dict(request))
         except CandidateReviewError as exc:
@@ -290,8 +172,11 @@ class HarnessCandidateReviewAdapter:
         identity = _idempotency_identity(
             candidate_id, action, request.get("idempotency_key"), request.get("feedback_id")
         )
+        request_checksum = _request_checksum(request)
         recorded = self._lookup_idempotency(identity)
         if recorded is not None:
+            if recorded.get("request_checksum") and recorded["request_checksum"] != request_checksum:
+                raise CandidateReviewError("idempotency_divergent", "same idempotency key carries different review payload")
             return self._duplicate(candidate, recorded)
 
         current_version = self._current_version(candidate_id)
@@ -324,6 +209,7 @@ class HarnessCandidateReviewAdapter:
                     raise CandidateReviewError("edited_payload_checksum_required", "edit requires its SHA-256 checksum")
                 if _checksum(payload) != checksum:
                     raise CandidateReviewError("edited_payload_checksum_mismatch", "edited payload checksum mismatch")
+                validate_edit_fields(payload)
             elif request.get("edited_payload") is not None or request.get("edited_payload_checksum") is not None:
                 raise CandidateReviewError("edited_payload_only_for_edit", "edited_payload applies only to the edit action")
 
@@ -362,6 +248,9 @@ class HarnessCandidateReviewAdapter:
             idempotency_key=request.get("idempotency_key"),
             referenced_feedback_id=request.get("feedback_id") if action == "undo" else None,
             disposition=disposition,
+            expected_version=expected_version,
+            request_checksum=request_checksum,
+            edited_payload=request.get("edited_payload") if action == "edit" else None,
         )
 
     def _duplicate(self, candidate: Mapping[str, Any], recorded: Mapping[str, Any]) -> dict[str, Any]:
@@ -393,7 +282,8 @@ class HarnessCandidateReviewAdapter:
         ]
 
     def _commit(self, *, candidate: Mapping[str, Any], action: str, current_version: int,
-                idempotency_key: Any, referenced_feedback_id: Any, disposition: Any) -> dict[str, Any]:
+                idempotency_key: Any, referenced_feedback_id: Any, disposition: Any,
+                expected_version: int, request_checksum: str, edited_payload: Any = None) -> dict[str, Any]:
         candidate_id = candidate["candidate_id"]
         new_version = current_version + 1
         recorded_at = _now_utc()
@@ -424,6 +314,13 @@ class HarnessCandidateReviewAdapter:
 
         con = sqlite3.connect(self.db_path)
         try:
+            con.execute("BEGIN IMMEDIATE")
+            live = con.execute("SELECT current_version FROM candidate_review_state WHERE candidate_id=?", (candidate_id,)).fetchone()
+            live_version = int(live[0]) if live is not None else 1
+            if live_version != expected_version:
+                con.rollback()
+                return {"status": "stale_version", "candidate_id": candidate_id, "action": action,
+                        "expected_version": expected_version, "current_version": live_version}
             con.execute(
                 "INSERT INTO candidate_review_state (candidate_id, current_version, created_at) "
                 "VALUES (?,?,?) "
@@ -433,7 +330,7 @@ class HarnessCandidateReviewAdapter:
             con.execute(
                 "INSERT INTO candidate_review_feedback (feedback_id, candidate_id, action, version, "
                 "receipt_id, receipt_checksum, idempotency_identity, referenced_feedback_id, "
-                "disposition, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "disposition, recorded_at, request_checksum) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     feedback_id,
                     candidate_id,
@@ -445,8 +342,19 @@ class HarnessCandidateReviewAdapter:
                     referenced_feedback_id,
                     disposition,
                     recorded_at,
+                    request_checksum,
                 ),
             )
+            if action == "edit":
+                if not isinstance(edited_payload, Mapping) or set(edited_payload) - EDITABLE_CANDIDATE_FIELDS:
+                    con.rollback()
+                    return {"status": "rejected", "candidate_id": candidate_id,
+                            "reason": "edited_payload_fields_invalid:only safe candidate metadata is editable"}
+                fields = {str(key): value for key, value in edited_payload.items()}
+                con.execute(
+                    "INSERT INTO candidate_review_edits (candidate_id,feedback_id,version,fields_json,fields_checksum,recorded_at) VALUES (?,?,?,?,?,?)",
+                    (candidate_id, feedback_id, new_version, _canonical_json(fields), _checksum(fields), recorded_at),
+                )
             con.commit()
         except sqlite3.Error as exc:  # transport-safe: ledger failure is not a reviewed outcome
             return {"status": "outcome_unknown", "reason": f"review_store_unavailable:{type(exc).__name__}"}
@@ -480,6 +388,7 @@ __all__ = [
     "CONFLICT_DISPOSITIONS",
     "CandidateReviewError",
     "DEFAULT_CANDIDATE_REVIEW_DB",
+    "EDITABLE_CANDIDATE_FIELDS",
     "HarnessCandidateReviewAdapter",
     "REVIEW_ACTIONS",
     "REVIEW_OUTCOMES",

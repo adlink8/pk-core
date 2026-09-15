@@ -48,14 +48,20 @@ class SearchState:
         # Shared mutable results / signals.
         self.route: str = "knowledge"
         self.versions: dict[str, Any] = {}
+        self.compressed_results: list[dict[str, Any]] = []
         self.ku_results: list[dict[str, Any]] = []
         self.fallback_results: list[dict[str, Any]] = []
         self.seen_ids: set[str] = set()
         self.ku_abstained: int = 0
 
     def remaining(self) -> int:
-        """Slots still to fill across knowledge + fallback results."""
-        return self.top_k - len(self.ku_results) - len(self.fallback_results)
+        """Slots still to fill across compressed + knowledge + fallback results."""
+        return (
+            self.top_k
+            - len(self.compressed_results)
+            - len(self.ku_results)
+            - len(self.fallback_results)
+        )
 
     def role_allowed(self, role: str) -> bool:
         """Whether a serving-snapshot member role may be queried."""

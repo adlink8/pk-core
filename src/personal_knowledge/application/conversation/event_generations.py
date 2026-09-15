@@ -391,8 +391,14 @@ class GenerationLifecycle:
 
         con = sqlite3.connect(str(self.db))
         try:
-            con.execute("BEGIN")
+            con.execute("BEGIN IMMEDIATE")
+            prior_row = con.execute(
+                "SELECT generation_id FROM ce_generation_authority WHERE active=1"
+            ).fetchone()
+            prior = prior_row[0] if prior_row else None
             self._run_commit(con, generation_id, report, hooks)
+            from personal_knowledge.application.conversation.generation_delta import record_generation_delta
+            delta_id = record_generation_delta(con, generation_id, prior)
             con.commit()
         except GenerationActivationError:
             con.rollback()
@@ -418,6 +424,7 @@ class GenerationLifecycle:
             "generation_id": generation_id,
             "prior_generation_id": prior,
             "projection_digest": report.fingerprint.digest,
+            "delta_id": delta_id,
         }
 
     def _build_projection(

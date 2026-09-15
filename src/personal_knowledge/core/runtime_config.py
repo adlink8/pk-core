@@ -106,10 +106,13 @@ def embedding_model_path() -> Path:
     cache = _env_path("SENTENCE_TRANSFORMERS_HOME")
     if cache:
         candidate = cache / "bge-small-zh-v1.5"
-        if candidate.exists():
+        if (candidate / "config.json").is_file():
             return candidate
     for candidate in _candidate_embedding_paths():
-        if candidate.is_dir():
+        # HF/modelscope 缓存壳目录（models--BAAI--*）也是目录但没有根级
+        # config.json，sentence-transformers 无法加载；历史上它先于真实模型
+        # 目录命中，导致每次 embed 抛错、向量检索被静默降级成关键词。
+        if candidate.is_dir() and (candidate / "config.json").is_file():
             return candidate.resolve()
     raise RuntimeError(
         "Local embedding model not configured. Set PERSONAL_DATA_EMBED_MODEL_PATH "

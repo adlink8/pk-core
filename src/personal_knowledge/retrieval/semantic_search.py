@@ -125,7 +125,7 @@ def search_semantic(
 #   layered — KU → canonical message 片段/词检索(dialogue) → conversation_turns
 #             → personal_events(Google) → 可选 legacy_pad
 # Phase 15 W4: message 级 dialogue 补洞（frozen gold snippet R@8=1.0 on canonical）。
-_KU_SLOTS = 1
+_KU_SLOTS = 3
 _RAW_SLOTS_DEFAULT = 4
 _KU_PORT = 8001
 
@@ -244,7 +244,7 @@ def _like_escape(s: str) -> str:
 
 def _query_tokens(query: str, max_toks: int = 4) -> list[str]:
     """Extract distinctive CJK/latin tokens for AND-style LIKE search."""
-    toks = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z_][A-Za-z0-9_\-]{3,}", query or "")
+    toks = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z_][A-Za-z0-9_\-]{2,}", query or "")
     # longer first (more distinctive for code / paths)
     ordered = sorted(set(toks), key=len, reverse=True)
     return ordered[:max_toks]
@@ -390,7 +390,7 @@ def get_knowledge_status(*, probe_chroma: bool = True) -> dict:
     serving = ServingSnapshotResolver(_C.UNIFIED_DB, pointer).resolve()
     policy = _resolve_fallback_policy(None)
     if policy == "layered":
-        route_policy = "knowledge-first + layered fallback (dialogue→non_dialogue_raw)"
+        route_policy = "wiki-first + layered fallback (cards→KU→dialogue→non_dialogue_raw)"
     else:
         route_policy = "knowledge-first + raw fallback"
     out: dict[str, Any] = {
@@ -404,7 +404,7 @@ def get_knowledge_status(*, probe_chroma: bool = True) -> dict:
         "search_backend": "search_knowledge_units",
         "route_policy": route_policy,
         # Phase 15: 三层 SSOT 与 fallback 策略（见 docs/architecture/retrieval-ssot.md）
-        # fallback_policy: legacy = 全量 personal_events 补洞；layered = KU→dialogue→non_dialogue
+        # fallback_policy: legacy = 全量 personal_events 补洞；layered = wiki→cards→KU→dialogue→non_dialogue
         "ssot": {
             "dialogue": "agentsview_canonical",
             "knowledge": "canonical_knowledge_units",
@@ -478,9 +478,11 @@ def get_knowledge_status(*, probe_chroma: bool = True) -> dict:
 
 
 # --- Fallback layer orchestration (OC-4 split) --------------------------------
-# Layer names in response-telemetry order. knowledge_unit is the primary layer;
-# the rest form the fallback chain built by fallback_policy (legacy vs layered).
+# Layer names in response-telemetry order. wiki_page / semantic_card /
+# knowledge_unit are primary; the rest form the fallback chain.
 _LAYER_NAMES = (
+    "wiki_page",
+    "semantic_card",
     "knowledge_unit",
     "canonical_messages",
     "conversation_turns",
@@ -514,6 +516,41 @@ def _append_unique(query: str, item: dict, state: SearchState) -> bool:
         state.seen_ids.add(uid)
     state.fallback_results.append(item)
     return True
+
+
+def _run_compressed_chain(query: str, state: SearchState, layers: list[dict[str, Any]]) -> None:
+    """Run wiki_page then semantic_card before KU. SQLite-only; never writes."""
+    from personal_knowledge.retrieval.layers.semantic_card import SemanticCardLayer  # noqa: E402
+    from personal_knowledge.retrieval.layers.wiki_page import WikiPageLayer  # noqa: E402
+
+    factories = {"wiki_page": WikiPageLayer, "semantic_card": SemanticCardLayer}
+    layer_by_name = {item["name"]: item for item in layers}
+    for name in _C.COMPRESSED_LAYER_NAMES:
+        telemetry = layer_by_name[name]
+        if state.remaining() <= 0:
+            break
+        telemetry["attempted"] = True
+        t_layer = time.perf_counter()
+        n_before = len(state.compressed_results)
+        try:
+            hits = factories[name](telemetry).retrieve(query, state)
+            for item in hits:
+                decision = annotate_candidate_support(query, item, resolve=None)
+                if decision.state == "unsupported":
+                    continue
+                uid = str(item.get("unit_id") or "")
+                if uid and uid in state.seen_ids:
+                    continue
+                if uid:
+                    state.seen_ids.add(uid)
+                state.compressed_results.append(item)
+                if state.remaining() <= 0:
+                    break
+        except Exception:
+            pass
+        finally:
+            telemetry["hits"] = max(0, len(state.compressed_results) - n_before)
+            telemetry["latency_ms"] = round((time.perf_counter() - t_layer) * 1000, 2)
 
 
 def _run_fallback_chain(query: str, state: SearchState, layers: list[dict[str, Any]]) -> None:
@@ -573,7 +610,9 @@ def _apply_evidence_resolution(merged: list[dict], serving: Any) -> None:
         ref = str(item.get("source_message_ref") or item.get("unit_id") or item.get("event_id") or "")
         if not ref:
             continue
-        if item.get("retrieval_unit") == "dialogue" and ref.startswith("cm|"):
+        if ref.startswith("cm|") or ref.startswith("v2|cm|"):
+            # v2|cm| 是 v2 兼容投影的 canonical_message_id（与旧 cm| 并存），
+            # 无论来自卡片/KU/dialogue 都按 canonical_message 解析。
             artifact_type = "canonical_message"
             role = "canonical_message"
         elif str(item.get("source") or "").lower() == "google" or ref.startswith("g|"):
@@ -605,10 +644,10 @@ def search_knowledge_units(
 ) -> dict:
     """知识单元混合检索 backend。
 
-    knowledge-first + fallback：先查 active knowledge unit collection（结构化 Q&A），
-    再按 fallback_policy 补洞:
-      - legacy:  全量 personal_events（旧行为）
-      - layered: conversation_turns(dialogue) → personal_events(Google) → 可选 legacy_pad
+    knowledge-first + fallback：layered 先查 wiki 主题页与会话卡，再查 active
+    knowledge unit collection，再按 fallback_policy 补洞:
+      - legacy:  全量 personal_events（旧行为，不含 wiki/cards 前缀）
+      - layered: wiki → cards → KU → dialogue → personal_events(Google) → 可选 legacy_pad
 
     返回 route/versions/results/telemetry，CLI/REST/MCP 共用此唯一 backend。
 
@@ -695,16 +734,16 @@ def search_knowledge_units(
     if not query or not query.strip():
         return _pack(route="abstain", results=[], reason="empty query")
 
-    # 延迟 import 避免影响无向量库的环境
+    # Optional vector stack. Wiki/cards are SQLite and must still run when
+    # Chroma/embedding are missing (offline tests and empty active KU index).
+    ChromaClient = None
+    ChromaError = Exception
+    local_embed = None
     try:
         from personal_knowledge.core.chroma_client import ChromaClient, ChromaError  # noqa: E402
         import personal_knowledge.core.local_embed as local_embed  # noqa: E402
-    except Exception as e:
-        return _pack(
-            route="fallback_raw",
-            results=[],
-            reason=f"vector infra unavailable: {e}",
-        )
+    except Exception:
+        pass
 
     # 解析 knowledge collection
     if collection_override:
@@ -715,23 +754,31 @@ def search_knowledge_units(
         # Compatibility hook retained for tests and pre-snapshot installations.
         ku_collection = resolved_active
 
-    client = ChromaClient(port=_KU_PORT)
-    # Probe the optional vector service before loading the optional local
-    # embedding stack. Offline/CI environments must still reach the layered
-    # SQLite fallback instead of failing on a missing model or port 8001.
+    client = None
     embedding = None
-    if ku_collection:
-        try:
-            collections = client.list_collections()
-            names = {item if isinstance(item, str) else item.get("name", "") for item in collections}
-            if ku_collection in names:
-                embedding = local_embed.embed(query)
-            else:
+    if ChromaClient is not None:
+        client = ChromaClient(port=_KU_PORT)
+        # Probe the optional vector service before loading the optional local
+        # embedding stack. Offline/CI environments must still reach the layered
+        # SQLite fallback instead of failing on a missing model or port 8001.
+        if ku_collection:
+            try:
+                collections = client.list_collections()
+                names = {item if isinstance(item, str) else item.get("name", "") for item in collections}
+                if ku_collection in names:
+                    embedding = local_embed.embed(query)
+                else:
+                    ku_collection = ""
+            except Exception as exc:
+                # 向量路径失效必须留痕（embedding 模型缺失/Chroma 不可达等），
+                # 静默降级会让检索质量塌方且无从排查。
+                print(f"[search_semantic] KU vector path unavailable, keyword fallback: {exc}", file=sys.stderr)
                 ku_collection = ""
-        except Exception:
-            ku_collection = ""
-        if ku_collection and embedding is None:
-            ku_collection = ""
+            if ku_collection and embedding is None:
+                print("[search_semantic] query embedding unavailable, keyword fallback", file=sys.stderr)
+                ku_collection = ""
+    else:
+        ku_collection = ""
 
     from personal_knowledge.retrieval.evidence import EvidenceResolver  # noqa: E402
     support_resolver = EvidenceResolver(
@@ -743,7 +790,7 @@ def search_knowledge_units(
     def _resolve_support_ref(item: dict, ref: str) -> dict:
         unit = str(item.get("retrieval_unit") or "")
         source_name = str(item.get("source") or "").lower()
-        if ref.startswith("cm|"):
+        if ref.startswith("cm|") or ref.startswith("v2|cm|"):
             artifact_type = "canonical_message"
         elif source_name == "google" or ref.startswith("g|"):
             artifact_type = "google_signal"
@@ -768,8 +815,13 @@ def search_knowledge_units(
     state.vector_available = bool(ku_collection and embedding is not None)
     state.resolve_support_ref = _resolve_support_ref
 
-    # --- Phase 1: 知识层检索（top-KU_SLOTS） ---
-    if ku_collection:
+    # --- Phase 0: wiki + session cards (layered only; SQLite projections) ---
+    if policy == "layered":
+        _run_compressed_chain(query, state, layers)
+
+    # --- Phase 1: 知识层检索（Chroma active，空代则 sqlite current） ---
+    route = "knowledge" if state.compressed_results else "fallback_raw"
+    if state.remaining() > 0:
         layer = layer_by_name["knowledge_unit"]
         layer["attempted"] = True
         t_layer = time.perf_counter()
@@ -781,20 +833,19 @@ def search_knowledge_units(
                 uid = str(item.get("unit_id") or "")
                 if uid:
                     state.seen_ids.add(uid)
-            route = state.route
+            if state.ku_results:
+                route = "knowledge"
         except ChromaError:
-            route = "fallback_raw"
+            pass
         finally:
             layer["hits"] = len(state.ku_results)
             layer["latency_ms"] = round((time.perf_counter() - t_layer) * 1000, 2)
-    else:
-        route = "fallback_raw"
 
     # --- Phase 2: fallback 补洞（层顺序/配额/跳过条件集中在 fallback_policy） ---
     _run_fallback_chain(query, state, layers)
 
     # --- 合并 + 排名 ---
-    merged = state.ku_results + state.fallback_results
+    merged = state.compressed_results + state.ku_results + state.fallback_results
     versions = state.versions
     if not merged:
         return _pack(
@@ -805,8 +856,8 @@ def search_knowledge_units(
             ku_collection=ku_collection or "personal_events",
         )
 
-    # 去 raw fallback 的 reason（有结果就标 knowledge route）
-    if route == "fallback_raw" and state.ku_results:
+    # Compressed wiki/card hits are knowledge-route results, not raw fallback.
+    if route == "fallback_raw" and (state.compressed_results or state.ku_results):
         route = "knowledge"
 
     # 编号

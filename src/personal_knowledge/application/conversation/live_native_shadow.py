@@ -269,7 +269,7 @@ def _capture_adapt(family: str, source: Path, store: Path) -> AdaptationResult:
             byte_limit=max(source.stat().st_size + 1, 1_000_000), count_limit=1,
         )
     # Consolidate blobs into the root store expected by fidelity replay.
-    root_blob = store / "artifacts" / artifact.artifact_id
+    root_blob = store / "artifacts" / artifact.content_hash[:32]
     root_blob.parent.mkdir(parents=True, exist_ok=True)
     if not root_blob.exists():
         shutil.copy2(blob, root_blob)
@@ -290,7 +290,7 @@ def _pathless_observation(
         agentsview_db, store / family, family=family,
         session_ids=session_ids,
     )
-    root_blob = store / "artifacts" / artifact.artifact_id
+    root_blob = store / "artifacts" / artifact.content_hash[:32]
     root_blob.parent.mkdir(parents=True, exist_ok=True)
     if not root_blob.exists():
         shutil.copy2(blob, root_blob)

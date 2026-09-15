@@ -262,8 +262,53 @@ def list_events_contract(
     }
 
 
+# v2 兼容投影 id 前缀 → canonical 表与主键列。ku_facts/会话卡的证据 ref
+# （v2|cm|<sha>）指向投影行而非 personal_events；不认前缀时证据链下钻
+# （data_get_event_by_id）恒 found=false。
+_PROJECTION_REF_TABLES = {
+    "v2|cm|": ("canonical_messages", "canonical_message_id"),
+    "v2|cs|": ("canonical_sessions", "canonical_session_id"),
+    "v2|cte|": ("canonical_tool_events", "canonical_tool_id"),
+}
+
+
+def _get_projection_ref(event_id: str) -> dict | None:
+    """按 v2 投影前缀直查 canonical 三表（只读）；非投影前缀返回 None。"""
+    target = next(
+        ((t, c) for p, (t, c) in _PROJECTION_REF_TABLES.items() if event_id.startswith(p)),
+        None,
+    )
+    if target is None:
+        return None
+    table, col = target
+    db = _C.AGENT_CONVERSATIONS_DB
+    if not db.exists():
+        return {"ok": False, "found": False, "event_id": event_id, "fields": [],
+                "item": None, "kind": table, "note": "canonical db not found"}
+    con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        row = con.execute(f"SELECT * FROM {table} WHERE {col} = ?", (event_id,)).fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        con.close()
+    item = dict(row) if row else None
+    return {
+        "ok": row is not None,
+        "found": row is not None,
+        "event_id": event_id,
+        "fields": list(item) if item else [],
+        "item": item,
+        "kind": table,
+    }
+
+
 def get_event_by_id_contract(event_id: str, fields: str | list[str] | None = None) -> dict:
     """Return one event by id using the same field policy as list_events_contract."""
+    projection = _get_projection_ref(event_id)
+    if projection is not None:
+        return projection
     selected_fields = _normalize_event_fields(fields)
     select_sql = ", ".join(
         f"{EVENT_FIELD_SQL[field]} AS {field}" for field in selected_fields

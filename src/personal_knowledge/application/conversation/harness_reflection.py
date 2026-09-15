@@ -299,6 +299,14 @@ class HarnessReflectionAdapter:
                 "candidate_checksum TEXT NOT NULL,"
                 "staged_at TEXT NOT NULL)"
             )
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS reflection_candidate_binding ("
+                "reflection_key TEXT PRIMARY KEY, candidate_id TEXT NOT NULL UNIQUE, event_id TEXT NOT NULL, "
+                "canonical_checksum TEXT NOT NULL, watermark TEXT NOT NULL, rule_version TEXT NOT NULL, "
+                "source TEXT NOT NULL, snapshot TEXT NOT NULL, scope TEXT NOT NULL, "
+                "publication_version TEXT NOT NULL, occurred_at TEXT NOT NULL, freshness_json TEXT NOT NULL, "
+                "binding_json TEXT NOT NULL, task_id TEXT NOT NULL)"
+            )
             con.commit()
         finally:
             con.close()
@@ -351,6 +359,13 @@ class HarnessReflectionAdapter:
                     candidate["candidate_checksum"], _now_utc(),
                 ),
             )
+            con.execute(
+                "INSERT INTO reflection_candidate_binding VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (reflection_key, candidate["candidate_id"], valid["event_id"], valid["canonical_checksum"],
+                 valid["watermark"], valid["rule_version"], valid["source"], valid["snapshot"],
+                 valid["scope"], valid["publication_version"], valid["occurred_at"],
+                 _canonical_json(valid["freshness"]), _canonical_json(valid["binding"]), valid["task_id"]),
+            )
             con.commit()
             return {
                 "status": "staged",
@@ -366,6 +381,45 @@ class HarnessReflectionAdapter:
             return {"status": "failed", "reflection_key": reflection_key, "reason": f"unexpected:{type(exc).__name__}"}
         finally:
             con.close()
+
+    @classmethod
+    def load_candidates(cls, db_path: Path | str) -> dict[str, dict[str, Any]]:
+        """Read only verified candidates persisted by :meth:`stage`."""
+        path = Path(db_path)
+        if not path.exists():
+            return {}
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            try:
+                rows = con.execute(
+                    "SELECT b.reflection_key,b.candidate_id,b.event_id,b.canonical_checksum,b.watermark,"
+                    "b.rule_version,b.source,b.snapshot,b.scope,b.publication_version,b.occurred_at,"
+                    "b.freshness_json,b.binding_json,b.task_id,s.candidate_checksum "
+                    "FROM reflection_candidate_binding b JOIN reflection_stage s ON s.reflection_key=b.reflection_key"
+                ).fetchall()
+            except sqlite3.Error:
+                return {}
+        finally:
+            con.close()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                (key, candidate_id, event_id, checksum, watermark, rule_version, source, snapshot,
+                 scope, publication, occurred, freshness_json, binding_json, task_id, stored_checksum) = row
+                valid = _validate_dispatcher_binding({
+                    "event_id": event_id, "canonical_checksum": checksum, "watermark": watermark,
+                    "rule_version": rule_version, "source": source, "snapshot": snapshot, "scope": scope,
+                    "publication_version": publication, "occurred_at": occurred,
+                    "freshness": json.loads(freshness_json), "task_id": task_id,
+                    "idempotency_key": "recovered", "binding": json.loads(binding_json),
+                })
+                candidate = _build_candidate(valid, str(key))
+                if candidate["candidate_id"] != str(candidate_id) or candidate["candidate_checksum"] != str(stored_checksum):
+                    continue
+                result[str(candidate_id)] = candidate
+            except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError, ReflectionStageError):
+                continue
+        return result
 
 
 __all__ = [

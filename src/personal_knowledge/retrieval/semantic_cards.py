@@ -55,8 +55,9 @@ SEMANTIC_INDEX_REGISTRY = VAR_DB / "semantic_index_registry.json"
 # 向量检索每条查询取回的邻居数 = limit * 该倍数（同会话聚合后仍够填满 limit）。
 VECTOR_TOP_MULTIPLIER = 4
 
-# 与 tools/semantic/mvp_semantic_compress.py 的 TOKEN_RE 同款（ASCII 标识符，最短 4 字符）
-_ASCII_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_\-.\\/]{3,}")
+# ASCII 标识符最短 3 字符（{2,}）：3 字符短 id（hy3、gpu、api）是高频查询词，
+# {3,} 会把它们整体丢弃导致关键词/向量回退双双零召回。
+_ASCII_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_\-.\\/]{2,}")
 _CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 
 FIELD_WEIGHTS = {"purpose": 3.0, "summary_md": 2.0, "card_json": 1.0, "fact": 4.0}
@@ -150,7 +151,10 @@ def _vector_search(query: str, limit: int, con: sqlite3.Connection | None = None
         distances = res["distances"][0]
         metadatas = res["metadatas"][0]
         documents = res["documents"][0]
-    except Exception:
+    except Exception as exc:
+        # 向量路径失效必须留痕：此处静默吞错过曾把 embedding 模型路径缺陷
+        # 掩盖成"全库关键词降级"，检索质量塌方且无从排查。
+        print(f"[semantic_cards] vector search unavailable, keyword fallback: {exc}", file=sys.stderr)
         return None
 
     entries: dict[str, dict] = {}

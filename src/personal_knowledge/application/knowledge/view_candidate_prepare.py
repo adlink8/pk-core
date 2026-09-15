@@ -46,6 +46,17 @@ from personal_knowledge.application.conversation.extraction_views import (
     ViewType,
 )
 from personal_knowledge.core.sqlite import connect_rw
+from personal_knowledge.application.knowledge.candidate_manifest import (
+    MANIFEST_DDL,
+    MANIFEST_TABLES,
+    ManifestIntegrityError,
+    ManifestMissingError,
+    ManifestSchemaError,
+    build_manifest,
+    list_candidate_rows,
+    manifest_payload,
+    save_manifest,
+)
 
 LEGACY_MESSAGE_RUN_PREFIX = "ir_"
 VIEW_POLICY_RUN_PREFIX = "vc_"
@@ -71,6 +82,7 @@ CANDIDATE_TABLES: tuple[str, ...] = (
     "ce_candidate_runs",
     "ce_candidate_estimates",
     "ce_candidate_audit",
+    *MANIFEST_TABLES,
 )
 
 _CANDIDATE_DDL: tuple[str, ...] = (
@@ -294,6 +306,8 @@ class CandidateRunRepository:
             con.execute("PRAGMA foreign_keys=ON")
             for statement in _CANDIDATE_DDL:
                 con.execute(statement)
+            for statement in MANIFEST_DDL:
+                con.execute(statement)
             con.commit()
         finally:
             con.close()
@@ -365,6 +379,10 @@ class CandidateRunRepository:
     ) -> CandidateRun:
         """Write the estimates/ledger for one view-policy run (never paid)."""
         _assert_key_matches(run_key, scheduled, view_result)
+        try:
+            manifest = build_manifest(scheduled, view_result)
+        except ValueError as exc:
+            raise VersionMismatchError(str(exc)) from exc
 
         refs = tuple(
             sorted(
@@ -384,11 +402,13 @@ class CandidateRunRepository:
         run_id = make_candidate_run_id(run_key)
         now = _now()
 
-        _write_candidate_ledger(
+        existing = _write_candidate_ledger(
             self, run_id, run_key, refs, resolved_family,
             len(view_result.views), len(scheduled.candidates),
-            estimates, total_calls, total_tokens, total_cost, now,
+            estimates, total_calls, total_tokens, total_cost, now, manifest,
         )
+        if existing is not None:
+            return existing
 
         return CandidateRun(
             run_id=run_id,
@@ -421,6 +441,22 @@ class CandidateRunRepository:
             )
 
     # ------------------------------------------------------- reads
+
+    def has_ledger(self) -> bool:
+        """Probe existing schema without initializing or creating a database."""
+        if not self.db.exists():
+            return False
+        con = self._connect(readonly=True)
+        try:
+            tables = {row[0] for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('ce_candidate_runs', 'ce_candidate_estimates', 'ce_candidate_audit')"
+            )}
+            if tables and len(tables) != 3:
+                raise CandidatePrepareError("candidate ledger schema is incomplete")
+            return len(tables) == 3
+        finally:
+            con.close()
 
     def get_run(self, run_id: str) -> CandidateRun | None:
         con = self._connect(readonly=True)
@@ -554,6 +590,25 @@ class CandidateRunRepository:
         finally:
             con.close()
 
+    def list_candidates(self, run_id: str, *, limit: int = 20, offset: int = 0) -> list[dict]:
+        """Return a bounded, body-free candidate mapping for a prepared run."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise CandidatePrepareError("limit must be between 1 and 100")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise CandidatePrepareError("offset must be >= 0")
+        run = self.get_run(run_id)
+        if run is None:
+            raise CandidatePrepareError(f"candidate run not found: {run_id}")
+        con = self._connect(readonly=True)
+        try:
+            try:
+                rows = list_candidate_rows(con, run_id, limit=limit, offset=offset)
+            except (ManifestMissingError, ManifestSchemaError) as exc:
+                raise CandidatePrepareError(str(exc)) from exc
+            return rows
+        finally:
+            con.close()
+
     def _run_rows(self) -> list[sqlite3.Row]:
         con = self._connect(readonly=True)
         try:
@@ -593,13 +648,35 @@ def _write_candidate_ledger(
     total_tokens: int,
     total_cost: float,
     now: str,
-) -> None:
+    manifest: dict,
+) -> CandidateRun | None:
     """Atomically persist one view-policy run row, its estimates and audit."""
     con = repo._connect()
     try:
-        con.execute("BEGIN")
+        con.execute("BEGIN IMMEDIATE")
+        existing_row = con.execute(
+            "SELECT * FROM ce_candidate_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if existing_row is not None:
+            try:
+                stored = manifest_payload(con, run_id)
+            except (ManifestIntegrityError, ManifestSchemaError) as exc:
+                con.rollback()
+                raise CandidatePrepareError(str(exc)) from exc
+            if stored is None:
+                con.rollback()
+                raise CandidatePrepareError(
+                    f"candidate run {run_id} has no candidate manifest; refusing overwrite"
+                )
+            if stored != manifest:
+                con.rollback()
+                raise VersionMismatchError(
+                    f"candidate manifest mismatch for existing run {run_id}"
+                )
+            con.commit()
+            return _hydrate_run(existing_row)
         con.execute(
-            "INSERT OR REPLACE INTO ce_candidate_runs "
+            "INSERT INTO ce_candidate_runs "
             "(run_id, kind, status, active_generation_id, view_builder_version, "
             " policy_digest, semantic_prompt_version, semantic_schema_version, "
             " evidence_event_digest, evidence_refs_json, family, view_count, "
@@ -626,10 +703,6 @@ def _write_candidate_ledger(
                 now,
             ),
         )
-        con.execute(
-            "DELETE FROM ce_candidate_estimates WHERE run_id=?",
-            (run_id,),
-        )
         for estimate in estimates:
             con.execute(
                 "INSERT INTO ce_candidate_estimates "
@@ -644,9 +717,11 @@ def _write_candidate_ledger(
                     estimate.estimated_tokens,
                     estimate.estimated_cost_usd,
                 ),
-            )
+                )
+        save_manifest(con, run_id, manifest, now)
         _record_view_audit(con, run_id, now)
         con.commit()
+        return None
     except sqlite3.IntegrityError as exc:
         con.rollback()
         raise CandidatePrepareError(
@@ -1039,9 +1114,7 @@ def inspect_candidate_state(conversation_db: Path) -> dict:
     )
     state["deterministic_exclusions"] = _deterministic_exclusions(graph, result)
     repository = CandidateRunRepository(conversation_db)
-    try:
-        repository.create_schema()
-    except sqlite3.Error:
+    if not repository.has_ledger():
         return state
     state["pending_estimates"] = [
         repository.status(row["run_id"]) for row in repository._run_rows()
@@ -1088,12 +1161,9 @@ def _legacy_audit_count(repository: CandidateRunRepository) -> int:
 def view_run_status(conversation_db: Path, run_id: str) -> dict:
     """Ledger status for one view-policy run (read-only, never pays)."""
     repository = CandidateRunRepository(conversation_db)
-    try:
-        repository.create_schema()
-    except sqlite3.Error:
-        pass
+    has_ledger = repository.has_ledger()
     if is_legacy_run_id(run_id):
-        status = repository.legacy_status(run_id)
+        status = repository.legacy_status(run_id) if has_ledger else None
         return {
             "run_id": run_id,
             "kind": "legacy_message",
@@ -1102,7 +1172,7 @@ def view_run_status(conversation_db: Path, run_id: str) -> dict:
             "note": "message-level prepare queue semantics superseded (D-30); "
                     "audit history preserved",
         }
-    run = repository.get_run(run_id)
+    run = repository.get_run(run_id) if has_ledger else None
     if run is None:
         return {
             "run_id": run_id,
