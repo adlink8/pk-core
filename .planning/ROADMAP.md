@@ -546,3 +546,16 @@ Plans:
 
 ---
 *Updated 2026-08-05 after consolidating the Capability OS on the Pi SDK Kernel and removing the Local Pi Agent; real activation remains explicitly gated*
+
+### Phase 62.1: Reliable longitudinal memory closure (INSERTED)
+
+**Goal:** Make the existing personal knowledge and conversation system retain, update, retrieve and apply evidence-bound memory across sessions, recover interrupted work, honor scope/corrections/revocation, and demonstrate useful behavior through actual product entrypoints.
+**Depends on:** Phase 61, Phase 62
+**Requirements:** MEM-01..08 in `phases/PDA-62.1-reliable-longitudinal-memory/62.1-CONTEXT.md`
+**Status:** In progress; user authorized autonomous optimization on 2026-09-05. Historical phase acceptance does not prove this goal.
+**Plans:** Incremental vertical slices, independently verified; original objective remains open until all requirements have current evidence.
+
+- [ ] 62.1-01: Reliable committed-delta delivery and evidence-correct projection retrieval
+- [ ] 62.1-02: Persistent candidate/review bindings and useful next-conversation context
+- [ ] 62.1-03: Temporal correction, scoped defaults and user revocation across consumers
+- [ ] 62.1-04: Live freshness reconciliation, longitudinal product acceptance and usefulness baseline

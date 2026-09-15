@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Pi Personal Intelligence Kernel
 status: executing
-last_updated: "2026-08-23T10:15:00.000Z"
+last_updated: "2026-09-05T04:56:14.361Z"
 last_activity: 2026-08-23
 progress:
-  total_phases: 72
+  total_phases: 73
   completed_phases: 48
-  total_plans: 194
+  total_plans: 195
   completed_plans: 169
   percent: 66
 ---
@@ -66,9 +66,9 @@ progress:
 
 ## Current Position
 
-Phase: 62 — Multi-format conversation adapters, unified event authority, and replaceable extraction views
+Phase: 62.1 — Reliable longitudinal memory closure
 Plan: 8 of 8 executed
-Status: Verified 2026-08-15; live-state reconciliation and repository cleanup active
+Status: Executing user-authorized memory closure; MEM-01..08 remain open
 Last activity: 2026-08-23
 
 ### Quick Tasks Completed
@@ -168,12 +168,15 @@ python -m personal_knowledge.governance.preflight
 - Phase 27 added: Target D proactive multi-domain acceptance
 - Phase 36-40 added: v1.4 Decision Cockpit UI: secure projection baseline, authority-aware state/evidence, guarded project decision workspace, truthful feedback/runtime, and browser UAT; Wiki deferred to v1.5.
 - Phase 61 added: Conversation-first Desktop Harness and Evidence-bound Reflection Loop
+- Phase 62.1 inserted after Phase 62: Reliable longitudinal memory closure; user-authorized autonomous optimization (URGENT)
 
 ## Operator Next Steps
 
 - Wiki P0 read routes remain available under `/ui/topics` and `/ui/topic*`.
   Decision Cockpit `/app` and Cockpit-specific `/ui/*` routes are frozen and
   return 404; do not use `/app/knowledge` as an operator readiness check.
+
 - Restore Chroma collection visibility and reconcile the 34,941-source delta
   before claiming `pk-ku doctor` healthy or advancing a watermark.
+
 - v2.0 next step is the separately authorized paired legacy/personal-cohort baseline and signed browser UAT; until those checkpoints pass, keep the runtime in `legacy`.
