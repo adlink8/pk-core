@@ -238,6 +238,7 @@ def _claim_from_unit(unit: Mapping[str, Any], evidence_refs: list[str]) -> dict[
     return {
         "claim_type": "knowledge_unit",
         "unit_id": unit.get("unit_id"),
+        "version": unit.get("version"),
         "unit_type": unit.get("unit_type"),
         "subject": unit.get("subject"),
         "question": unit.get("question") or "",
@@ -343,7 +344,7 @@ def write_topic_page(store_path: Path | str, topic: str, body: dict[str, Any]) -
         )
     ]
     version = WikiMaterializer(store).materialize(
-        TopicKey("subject", (topic,)),
+        TopicKey("subject", (topic.strip().lower(),)),
         snapshot_bindings={"knowledge_unit": topic},
         dependencies=deps,
         source_refs={
