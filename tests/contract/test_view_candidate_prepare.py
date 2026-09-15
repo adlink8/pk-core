@@ -35,6 +35,7 @@ from personal_knowledge.core.conversation_events import (
 )
 from personal_knowledge.application.conversation.extraction_policy import (
     DEFAULT_POLICY,
+    BlockedView,
     SchedulingOutput,
     schedule_candidates,
 )
@@ -229,6 +230,128 @@ def test_prepare_is_idempotent_by_key(
     second = repo.prepare_view_run(run_key, scheduled, _synthetic_result())
     assert first.run_id == second.run_id
     assert len(repo._run_rows()) == 1
+
+
+def test_candidate_mapping_survives_restart_and_read_is_bounded(repo, run_key, scheduled):
+    run = repo.prepare_view_run(run_key, scheduled, _synthetic_result())
+    before = repo.db.read_bytes()
+    restarted = CandidateRunRepository(repo.db)
+    first = restarted.list_candidates(run.run_id, limit=1)
+    second = restarted.list_candidates(run.run_id, limit=1, offset=1)
+    assert len(first) == len(second) == 1
+    assert first[0]["candidate_id"] != second[0]["candidate_id"]
+    by_view = {item["derived_from_view"]: item for item in first + second}
+    assert set(by_view["view:turn-1"]["evidence_event_refs"]) == {"ev:u1", "ev:a1"}
+    assert set(by_view["view:comp-1"]["evidence_event_refs"]) == {"ev:sum", "ev:c1"}
+    assert restarted.list_candidates(run.run_id, offset=2) == []
+    assert repo.db.read_bytes() == before
+
+
+def test_exact_prepare_replay_does_not_rewrite_database(repo, run_key, scheduled):
+    first = repo.prepare_view_run(run_key, scheduled, _synthetic_result())
+    before = repo.db.read_bytes()
+    second = CandidateRunRepository(repo.db).prepare_view_run(run_key, scheduled, _synthetic_result())
+    assert first == second
+    assert repo.db.read_bytes() == before
+
+
+@pytest.mark.parametrize("change", ["rank", "view_digest", "mapping", "blocked", "order"])
+def test_same_union_queue_drift_is_rejected_without_overwrite(repo, run_key, scheduled, change):
+    result = _synthetic_result()
+    run = repo.prepare_view_run(run_key, scheduled, result)
+    before = repo.db.read_bytes()
+    if change == "rank":
+        changed = replace(scheduled.candidates[0], rank=999)
+        scheduled = replace(scheduled, candidates=(changed,) + scheduled.candidates[1:])
+    elif change == "view_digest":
+        result = replace(result, digest="changed-view-layout")
+    elif change == "blocked":
+        scheduled = replace(scheduled, blocked=(BlockedView("view:extra", ViewType.TURN, "insufficient"),))
+    elif change == "order":
+        scheduled = replace(scheduled, candidates=tuple(reversed(scheduled.candidates)))
+    else:
+        a, b = scheduled.candidates
+        scheduled = replace(scheduled, candidates=(
+            replace(a, evidence_event_refs=b.evidence_event_refs),
+            replace(b, evidence_event_refs=a.evidence_event_refs),
+        ))
+    with pytest.raises(VersionMismatchError):
+        repo.prepare_view_run(run_key, scheduled, result)
+    assert repo.db.read_bytes() == before
+    assert repo.get_run(run.run_id) == run
+
+
+@pytest.mark.parametrize("limit,offset", [(0, 0), (101, 0), (1, -1), (True, 0), (1, 0.5)])
+def test_candidate_listing_rejects_unbounded_or_invalid_page(repo, run_key, scheduled, limit, offset):
+    run = repo.prepare_view_run(run_key, scheduled, _synthetic_result())
+    before = repo.db.read_bytes()
+    with pytest.raises((CandidatePrepareError, ValueError)):
+        repo.list_candidates(run.run_id, limit=limit, offset=offset)
+    assert repo.db.read_bytes() == before
+
+
+def test_first_prepare_rejects_cross_view_evidence_and_writes_nothing(repo, run_key, scheduled):
+    a, b = scheduled.candidates
+    swapped = replace(scheduled, candidates=(
+        replace(a, evidence_event_refs=b.evidence_event_refs),
+        replace(b, evidence_event_refs=a.evidence_event_refs),
+    ))
+    before = repo.db.read_bytes()
+    with pytest.raises(VersionMismatchError):
+        repo.prepare_view_run(run_key, swapped, _synthetic_result())
+    assert repo.db.read_bytes() == before
+
+
+def test_concurrent_identical_prepare_has_one_result(repo, run_key, scheduled):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    ready = Barrier(4)
+    def prepare():
+        ready.wait(timeout=10)
+        return CandidateRunRepository(repo.db).prepare_view_run(run_key, scheduled, _synthetic_result())
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: prepare(), range(4)))
+    assert all(result == results[0] for result in results)
+    assert len(repo.list_candidates(results[0].run_id)) == 2
+
+
+def test_manifest_write_failure_rolls_back_whole_run(repo, run_key, scheduled):
+    import sqlite3
+
+    with sqlite3.connect(repo.db) as con:
+        con.execute("CREATE TRIGGER fail_manifest BEFORE INSERT ON ce_candidate_manifest_candidates "
+                    "BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END")
+    before = repo.db.read_bytes()
+    with pytest.raises(CandidatePrepareError):
+        repo.prepare_view_run(run_key, scheduled, _synthetic_result())
+    assert repo.get_run(make_candidate_run_id(run_key)) is None
+    assert repo.db.read_bytes() == before
+
+
+def test_replay_rejects_corrupt_manifest_digest(repo, run_key, scheduled):
+    import sqlite3
+
+    run = repo.prepare_view_run(run_key, scheduled, _synthetic_result())
+    with sqlite3.connect(repo.db) as con:
+        con.execute("UPDATE ce_candidate_manifests SET manifest_digest='corrupt' WHERE run_id=?", (run.run_id,))
+    before = repo.db.read_bytes()
+    with pytest.raises(CandidatePrepareError):
+        repo.prepare_view_run(run_key, scheduled, _synthetic_result())
+    assert repo.db.read_bytes() == before
+
+
+def test_candidate_list_reports_partial_manifest_schema(repo, run_key, scheduled):
+    import sqlite3
+
+    run = repo.prepare_view_run(run_key, scheduled, _synthetic_result())
+    with sqlite3.connect(repo.db) as con:
+        con.execute("DROP TABLE ce_candidate_manifest_candidates")
+    before = repo.db.read_bytes()
+    with pytest.raises(CandidatePrepareError, match="schema.*incomplete"):
+        repo.list_candidates(run.run_id)
+    assert repo.db.read_bytes() == before
 
 
 def test_estimates_are_deterministic(

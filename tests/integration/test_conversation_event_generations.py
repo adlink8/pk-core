@@ -26,19 +26,10 @@ from pathlib import Path
 
 import pytest
 
-from personal_knowledge.core.conversation_events import (
-    AdaptedSession,
-    EventKind,
-    FidelityProfile,
-    Provenance,
-    TypedEvent,
-    make_event_id,
-)
 from personal_knowledge.core.conversation_repository import (
     ConversationRepository,
     SOURCE_CANONICAL,
 )
-from personal_knowledge.adapters.conversation_sources.contracts import SourceArtifact
 from personal_knowledge.application.conversation.event_repository import (
     EventRepository,
     GenerationInput,
@@ -50,84 +41,201 @@ from personal_knowledge.application.conversation.event_generations import (
 )
 
 
-def _prov(native_event_id: str, locator: str) -> Provenance:
-    return Provenance(
-        artifact_id="art-a", artifact_hash="h" * 8, native_locator=locator,
-        native_session_id="s-1", native_event_id=native_event_id,
-        contract_version="1",
-    )
+def test_activation_persists_exact_changed_event_refs_for_restart(tmp_path, _activate, _generation):
+    from personal_knowledge.application.conversation.generation_delta import GenerationDeltaRepository
 
-
-def _artifact() -> SourceArtifact:
-    return SourceArtifact(
-        artifact_id="art-a", family="codex", source_kind="file",
-        content_hash="h" * 8, capture_method="sha256",
-        relative_path="rollout.jsonl", byte_size=10,
-    )
-
-
-def _session() -> AdaptedSession:
-    return AdaptedSession(
-        session_id="s-1",
-        provenance=_prov("s-1", "jsonl:s-1"),
-        fidelity=FidelityProfile.complete(),
-        native_session_id="s-1",
-        started_at="2026-08-12T00:00:00Z",
-        ended_at="2026-08-12T00:05:00Z",
-    )
-
-
-def _event(session_id: str, kind: EventKind, locator: str, *,
-           native_id: str, ordinal: int, summary: str) -> TypedEvent:
-    return TypedEvent(
-        event_id=make_event_id(
-            "codex", "art-a", "1", native_id,
-            kind=kind, session_id=session_id, native_locator=locator,
-        ),
-        session_id=session_id,
-        kind=kind,
-        provenance=_prov(native_id, locator),
-        fidelity=FidelityProfile.complete(),
-        ordinal=ordinal,
-        occurred_at=f"2026-08-12T00:0{ordinal}:00Z",
-        summary=summary,
-    )
-
-
-def _generation(dataset_digest: str, user_text: str) -> GenerationInput:
-    events = [
-        _event("s-1", EventKind.USER_MESSAGE, "jsonl:1", native_id="msg-1",
-               ordinal=1, summary=user_text),
-        _event("s-1", EventKind.ASSISTANT_MESSAGE, "jsonl:2", native_id="msg-2",
-               ordinal=2, summary="assistant reply"),
-        _event("s-1", EventKind.COMPACTION_SUMMARY, "jsonl:3", native_id="cmp-1",
-               ordinal=3, summary="Compacted earlier turns."),
+    db = tmp_path / "delta.sqlite"
+    life = GenerationLifecycle(db)
+    first = _generation("d-1", "Use PowerShell")
+    second = _generation("d-2", "Use Bash")
+    life.prepare(first, generation_id="g-1")
+    _activate(life, "g-1", digest="d-1")
+    life.prepare(second, generation_id="g-2")
+    _activate(life, "g-2", digest="d-2")
+    before = db.read_bytes()
+    delta = GenerationDeltaRepository(db).latest()
+    assert delta["generation_id"] == "g-2"
+    assert delta["prior_generation_id"] == "g-1"
+    assert delta["source_manifest_id"] == "manifest-1"
+    assert delta["dataset_digest"] == "d-2"
+    assert delta["event_count"] == 1
+    assert GenerationDeltaRepository(db).events(delta["delta_id"]) == [
+        {"event_id": second.events[0].event_id, "change": "changed"}
     ]
-    return GenerationInput(
-        family="codex",
-        adapter_version="1",
-        contract_version="1",
-        capability_digest="cap-1",
-        source_manifest_id="manifest-1",
-        dataset_digest=dataset_digest,
-        artifacts=(_artifact(),),
-        sessions=(_session(),),
-        events=tuple(events),
-        relations=(),
-        dispositions=(),
-        warnings=(),
-    )
+    assert db.read_bytes() == before
 
 
-def _activate(life: GenerationLifecycle, generation_id: str, *, digest: str,
-              hooks: ActivationHooks | None = None) -> None:
-    life.activate(
-        generation_id,
-        source_manifest_id="manifest-1",
-        expected_dataset_digest=digest,
-        expected_adapter_families=("codex",),
-        hooks=hooks,
-    )
+def test_delta_failure_restores_authority_and_last_delta(tmp_path, _activate, _generation):
+    from personal_knowledge.application.conversation.generation_delta import GenerationDeltaRepository
+
+    db = tmp_path / "failure.sqlite"
+    life = GenerationLifecycle(db)
+    life.prepare(_generation("d-1", "first"), generation_id="g-1")
+    _activate(life, "g-1", digest="d-1")
+    previous = GenerationDeltaRepository(db).latest()
+    life.prepare(_generation("d-2", "second"), generation_id="g-2")
+    with sqlite3.connect(db) as con:
+        con.execute("CREATE TRIGGER delta_abort BEFORE INSERT ON ce_generation_delta_events "
+                    "BEGIN SELECT RAISE(ABORT, 'storage failed'); END")
+    with pytest.raises(GenerationActivationError):
+        _activate(life, "g-2", digest="d-2")
+    assert life.authority_generation_id() == "g-1"
+    assert GenerationDeltaRepository(db).latest() == previous
+
+
+def test_delta_tracks_removed_events_and_rollback(tmp_path, _activate, _generation):
+    from dataclasses import replace
+    from personal_knowledge.application.conversation.generation_delta import GenerationDeltaRepository
+
+    db = tmp_path / "removed.sqlite"
+    life = GenerationLifecycle(db)
+    first = _generation("d-1", "first")
+    life.prepare(first, generation_id="g-1")
+    _activate(life, "g-1", digest="d-1")
+    life.prepare(replace(first, dataset_digest="d-2", events=first.events[:2]), generation_id="g-2")
+    _activate(life, "g-2", digest="d-2")
+    repo = GenerationDeltaRepository(db)
+    assert repo.events(repo.latest()["delta_id"]) == [
+        {"event_id": first.events[2].event_id, "change": "removed"}
+    ]
+    life.rollback_to("g-1")
+    assert repo.events(repo.latest()["delta_id"]) == [
+        {"event_id": first.events[2].event_id, "change": "changed"}
+    ]
+    history = repo.pending(after_delta=0, limit=2)
+    assert [item["generation_id"] for item in history] == ["g-1", "g-2"]
+    assert [item["generation_id"] for item in repo.pending(after_delta=history[-1]["delta_id"])] == ["g-1"]
+
+
+@pytest.mark.parametrize("change", ["session", "relation"])
+def test_context_changes_requeue_affected_events(tmp_path, change, _activate, _generation):
+    from dataclasses import replace
+    from personal_knowledge.core.conversation_events import EventRelation, RelationKind
+    from personal_knowledge.application.conversation.generation_delta import GenerationDeltaRepository
+
+    db = tmp_path / "context.sqlite"
+    life = GenerationLifecycle(db)
+    first = _generation("d-1", "first")
+    life.prepare(first, generation_id="g-1")
+    _activate(life, "g-1", digest="d-1")
+    if change == "session":
+        second = replace(first, dataset_digest="d-2", sessions=(replace(first.sessions[0], cwd="/project-b"),))
+        expected = {event.event_id for event in first.events}
+    else:
+        second = replace(first, dataset_digest="d-2", relations=(EventRelation(
+            "relation-new", first.events[2].event_id, first.events[0].event_id, RelationKind.COMPACTED_RANGE),))
+        expected = {first.events[2].event_id, first.events[0].event_id}
+    life.prepare(second, generation_id="g-2")
+    _activate(life, "g-2", digest="d-2")
+    repo = GenerationDeltaRepository(db)
+    assert {row["event_id"] for row in repo.events(repo.latest()["delta_id"])} == expected
+
+
+def test_delta_read_rejects_partial_authority_schema(tmp_path):
+    from personal_knowledge.application.conversation.generation_delta import GenerationDeltaRepository
+
+    db = tmp_path / "partial.sqlite"
+    with sqlite3.connect(db) as con:
+        con.execute("CREATE TABLE ce_generation_deltas(delta_id INTEGER)")
+    before = db.read_bytes()
+    with pytest.raises(ValueError, match="schema is incomplete"):
+        GenerationDeltaRepository(db).latest()
+    assert db.read_bytes() == before
+
+
+def test_delta_consumer_prepares_candidates_and_resumes_without_duplicate(tmp_path, capsys, _activate, _generation):
+    import json
+    from personal_knowledge.application.ku import main
+    from personal_knowledge.application.knowledge.delta_candidate_consumer import consume_delta_candidates
+    from personal_knowledge.application.knowledge.view_candidate_prepare import CandidateRunRepository
+
+    db = tmp_path / "consumer.sqlite"
+    life = GenerationLifecycle(db)
+    life.prepare(_generation("d-1", "I prefer PowerShell for future commands."), generation_id="g-1")
+    _activate(life, "g-1", digest="d-1")
+    assert main(["view-consume", "--conversation-db", str(db)]) == 0
+    batch = json.loads(capsys.readouterr().out)
+    assert batch["status"] == "prepared"
+    assert batch["run_id"].startswith("vc_")
+    assert CandidateRunRepository(db).list_candidates(batch["run_id"])
+    before = db.read_bytes()
+    assert consume_delta_candidates(db)["status"] == "idle"
+    assert db.read_bytes() == before
+
+
+def test_consumer_failure_after_prepare_retries_without_losing_progress(tmp_path, _activate, _generation):
+    from personal_knowledge.application.knowledge.delta_candidate_consumer import consume_delta_candidates
+
+    db = tmp_path / "consumer-retry.sqlite"
+    life = GenerationLifecycle(db)
+    life.prepare(_generation("d-1", "I prefer PowerShell."), generation_id="g-1")
+    _activate(life, "g-1", digest="d-1")
+    consume_delta_candidates(db)
+    life.prepare(_generation("d-2", "Use Bash in this project."), generation_id="g-2")
+    _activate(life, "g-2", digest="d-2")
+    with sqlite3.connect(db) as con:
+        con.execute("CREATE TRIGGER batch_abort BEFORE INSERT ON ce_delta_prepare_batches "
+                    "BEGIN SELECT RAISE(ABORT, 'checkpoint failure'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        consume_delta_candidates(db)
+    with sqlite3.connect(db) as con:
+        con.execute("DROP TRIGGER batch_abort")
+    resumed = consume_delta_candidates(db)
+    assert resumed["status"] == "prepared"
+    assert resumed["generation_id"] == "g-2"
+    assert consume_delta_candidates(db)["status"] == "idle"
+
+
+def test_consumer_context_limit_does_not_advance_or_write(tmp_path, _activate, _generation):
+    from personal_knowledge.application.knowledge.delta_candidate_consumer import consume_delta_candidates
+
+    db = tmp_path / "consumer-limit.sqlite"
+    life = GenerationLifecycle(db)
+    life.prepare(_generation("d-1", "I prefer PowerShell."), generation_id="g-1")
+    _activate(life, "g-1", digest="d-1")
+    before = db.read_bytes()
+    with pytest.raises(ValueError, match="max_events"):
+        consume_delta_candidates(db, max_context_events=1)
+    assert db.read_bytes() == before
+    assert consume_delta_candidates(db)["status"] == "prepared"
+
+
+def test_consumer_legacy_active_generation_without_delta_is_not_caught_up(tmp_path, _generation):
+    from personal_knowledge.application.knowledge.delta_candidate_consumer import consume_delta_candidates
+
+    db = tmp_path / "legacy-active.sqlite"
+    life = GenerationLifecycle(db)
+    life.prepare(_generation("d-1", "I prefer PowerShell."), generation_id="g-1")
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO ce_generation_authority VALUES ('g-1',1,'2026-09-06')")
+    before = db.read_bytes()
+    with pytest.raises(ValueError, match="generation delta history unavailable"):
+        consume_delta_candidates(db)
+    assert db.read_bytes() == before
+
+
+def test_consumer_reconciles_offline_history_against_current_generation(tmp_path, _activate, _generation):
+    from personal_knowledge.application.knowledge.delta_candidate_consumer import consume_delta_candidates
+    from personal_knowledge.application.knowledge.view_candidate_prepare import CandidateRunRepository
+    from personal_knowledge.application.conversation.bounded_event_context import load_affected_context
+
+    db = tmp_path / "offline.sqlite"
+    life = GenerationLifecycle(db)
+    life.prepare(_generation("d-1", "Old shell preference"), generation_id="g-1")
+    _activate(life, "g-1", digest="d-1")
+    current = _generation("d-2", "New shell preference")
+    life.prepare(current, generation_id="g-2")
+    _activate(life, "g-2", digest="d-2")
+    batch = consume_delta_candidates(db)
+    assert batch["reconciled"] is True
+    assert batch["source_generation_id"] == "g-1"
+    assert batch["generation_id"] == "g-2"
+    assert CandidateRunRepository(db).get_run(batch["run_id"]).key.active_generation_id == "g-2"
+    context = load_affected_context(db, "g-2", [current.events[0].event_id])
+    assert context.events[0].summary == "New shell preference"
+    assert consume_delta_candidates(db)["source_generation_id"] == "g-2"
+    assert consume_delta_candidates(db)["status"] == "idle"
+
 
 
 def _snapshot(db: Path) -> dict:
@@ -162,7 +270,7 @@ def _snapshot(db: Path) -> dict:
 
 
 @pytest.fixture()
-def live(tmp_path: Path) -> tuple[Path, GenerationLifecycle, GenerationInput, GenerationInput]:
+def live(tmp_path: Path, _generation, _activate) -> tuple[Path, GenerationLifecycle, GenerationInput, GenerationInput]:
     """Baseline: gen-1 active; gen-2 staged and ready to attempt activation."""
     db = tmp_path / "conversations.sqlite"
     life = GenerationLifecycle(db)
@@ -183,7 +291,7 @@ def _failing_hook(message: str):
 
 # ---------------------------------------------------------------- lifecycle
 
-def test_prepare_stages_generation(tmp_path: Path) -> None:
+def test_prepare_stages_generation(tmp_path: Path, _generation) -> None:
     db = tmp_path / "conversations.sqlite"
     life = GenerationLifecycle(db)
     gen = _generation("ds-a", "staged text")
@@ -251,7 +359,7 @@ def test_validate_passes_healthy_generation(live) -> None:
 
 # ----------------------------------------------------------- successful flow
 
-def test_activate_success_binds_authority_projection_version(live) -> None:
+def test_activate_success_binds_authority_projection_version(live, _activate) -> None:
     db, life, gen_a, gen_b = live
     _activate(life, "gen-2", digest=gen_b.dataset_digest)
     assert life.authority_generation_id() == "gen-2"
@@ -280,7 +388,7 @@ def test_activate_success_binds_authority_projection_version(live) -> None:
 
 # ------------------------------------------------- fault injection: pre-commit
 
-def test_checksum_mismatch_restores_exact_state(live) -> None:
+def test_checksum_mismatch_restores_exact_state(live, _activate) -> None:
     db, life, gen_a, gen_b = live
     before = _snapshot(db)
     with pytest.raises(GenerationActivationError):
@@ -313,7 +421,7 @@ def test_unknown_adapter_restores_exact_state(live) -> None:
     assert _snapshot(db) == before
 
 
-def test_consumer_parity_failure_blocks_activation(live) -> None:
+def test_consumer_parity_failure_blocks_activation(live, _activate) -> None:
     db, life, gen_a, gen_b = live
     before = _snapshot(db)
     hooks = ActivationHooks(
@@ -327,7 +435,7 @@ def test_consumer_parity_failure_blocks_activation(live) -> None:
 
 # ------------------------------------------- fault injection: post-authority
 
-def test_projection_write_failure_restores_exact_state(live) -> None:
+def test_projection_write_failure_restores_exact_state(live, _activate) -> None:
     db, life, gen_a, gen_b = live
     before = _snapshot(db)
     hooks = ActivationHooks(projection_writer=_failing_hook("projection write boom"))
@@ -337,7 +445,7 @@ def test_projection_write_failure_restores_exact_state(live) -> None:
     assert life.authority_generation_id() == "gen-1"
 
 
-def test_authority_pointer_failure_restores_exact_state(live) -> None:
+def test_authority_pointer_failure_restores_exact_state(live, _activate) -> None:
     db, life, gen_a, gen_b = live
     before = _snapshot(db)
     hooks = ActivationHooks(authority_writer=_failing_hook("pointer write boom"))
@@ -346,7 +454,7 @@ def test_authority_pointer_failure_restores_exact_state(live) -> None:
     assert _snapshot(db) == before
 
 
-def test_version_binding_failure_restores_exact_state(live) -> None:
+def test_version_binding_failure_restores_exact_state(live, _activate) -> None:
     db, life, gen_a, gen_b = live
     before = _snapshot(db)
     hooks = ActivationHooks(version_binder=_failing_hook("version bind boom"))
@@ -366,7 +474,7 @@ def test_version_binding_failure_restores_exact_state(live) -> None:
 
 # ------------------------------------------------------ preservation + rollback
 
-def test_old_generation_rows_and_audit_preserved_after_failure(live) -> None:
+def test_old_generation_rows_and_audit_preserved_after_failure(live, _activate) -> None:
     db, life, gen_a, gen_b = live
     with pytest.raises(GenerationActivationError):
         _activate(life, "gen-2", digest="wrong-digest")
@@ -386,7 +494,7 @@ def test_old_generation_rows_and_audit_preserved_after_failure(live) -> None:
     assert "failure" in outcomes
 
 
-def test_rollback_to_previous_generation(live) -> None:
+def test_rollback_to_previous_generation(live, _activate) -> None:
     db, life, gen_a, gen_b = live
     _activate(life, "gen-2", digest=gen_b.dataset_digest)
     assert life.authority_generation_id() == "gen-2"
@@ -413,7 +521,7 @@ def test_repository_has_no_activation_surface(live) -> None:
     assert not any("activate" in n.lower() for n in public)
 
 
-def test_activation_preserves_legacy_rows(tmp_path: Path) -> None:
+def test_activation_preserves_legacy_rows(tmp_path: Path, _activate, _generation) -> None:
     """Activation must never discard pre-existing legacy-era canonical rows
     (D-18/D-19): only v2 projection rows are replaced. Regression for the
     62-08 incident where activation cleared the live legacy tables."""

@@ -65,6 +65,47 @@ from personal_knowledge.application.knowledge.view_candidate_prepare import (
 LEGACY_ITEM_COUNT = 24_487  # the two old message-level prepare runs (D-30)
 
 
+@pytest.mark.parametrize("run_id", ["vc_missing", "ir_missing"])
+def test_status_without_candidate_schema_preserves_database(db: Path, run_id: str) -> None:
+    from personal_knowledge.application.knowledge.view_candidate_prepare import view_run_status
+
+    before = db.read_bytes()
+    status = view_run_status(db, run_id)
+    assert status["status"] == ("legacy_unclassified" if run_id.startswith("ir_") else "not_found")
+    assert db.read_bytes() == before
+
+
+def test_status_missing_database_does_not_create_file(tmp_path: Path) -> None:
+    from personal_knowledge.application.knowledge.view_candidate_prepare import view_run_status
+
+    db = tmp_path / "missing.sqlite"
+    assert view_run_status(db, "vc_missing")["status"] == "not_found"
+    assert not db.exists()
+
+
+def test_inspect_active_generation_without_ledger_is_readonly(db: Path) -> None:
+    from personal_knowledge.application.knowledge.view_candidate_prepare import inspect_candidate_state
+
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO ce_generation_authority VALUES ('gen-1', 1, '2026-09-06')")
+    before = db.read_bytes()
+    state = inspect_candidate_state(db)
+    assert state["active_generation_id"] == "gen-1"
+    assert state["policy_view_count"] > 0
+    assert state["pending_estimates"] == []
+    assert db.read_bytes() == before
+
+
+def test_existing_run_status_remains_readonly(db: Path, prepared: CandidateRunKey) -> None:
+    from personal_knowledge.application.knowledge.view_candidate_prepare import make_candidate_run_id, view_run_status
+
+    before = db.read_bytes()
+    status = view_run_status(db, make_candidate_run_id(prepared))
+    assert status["status"] == "blocked_pending_user_cost_approval"
+    assert status["candidate_count"] > 0
+    assert db.read_bytes() == before
+
+
 # ------------------------------------------------------------------ fixtures
 
 def _prov(nid: str, session: str) -> Provenance:

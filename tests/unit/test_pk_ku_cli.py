@@ -34,6 +34,15 @@ def test_workflow_prints_and_exits_0(capsys):
     assert "full inventory" in out.lower() or "build_knowledge_inventory" in out
 
 
+def test_view_consume_idle_does_not_create_database(tmp_path, capsys):
+    import json
+
+    db = tmp_path / "absent.sqlite"
+    assert main(["view-consume", "--conversation-db", str(db)]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "idle"
+    assert not db.exists()
+
+
 def test_prepare_requires_model():
     p = build_parser()
     with pytest.raises(SystemExit):

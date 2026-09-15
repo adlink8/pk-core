@@ -1,12 +1,20 @@
-# Antigravity live-store protobuf decoding contract (P0-3 fix).
-# Covers the two payload classes the live steps.step_payload column can hold:
+# Antigravity live-store step_payload contract.
+# Covers the payload classes the live steps.step_payload column can hold:
 #   a) a UTF-8 JSON payload -> mapped to typed events (user/assistant/tool/usage);
-#   b) real binary protobuf bytes (no .proto schema) -> preserved by reference as
-#      UNKNOWN_NATIVE with an explicit step_payload -> preserved_by_reference
+#   b) well-formed binary protobuf (no .proto schema) -> decoded from the
+#      protobuf wire format, which is self-describing. The full field mapping
+#      recovered from real stores is covered by
+#      test_antigravity_protobuf_decode.py;
+#   c) binary bytes that are NOT well-formed protobuf -> preserved by reference
+#      as UNKNOWN_NATIVE with an explicit step_payload -> preserved_by_reference
 #      field disposition and content_availability = unavailable -- never invented.
 # Real-artifact recon (C:/Users/li/.gemini/antigravity/conversations/*.db) shows
 # every step carries step_format = 0 with binary protobuf payloads beginning in
 # protobuf varint framing (0x08 field 1 / 0x2a field 5), never JSON text.
+#
+# _PROTOBUF_PAYLOAD below is deliberately *truncated* -- it declares a
+# length-delimited field longer than the buffer -- so it exercises path (c) and
+# stands in for a payload whose wire format cannot be trusted.
 
 from __future__ import annotations
 
@@ -128,9 +136,13 @@ class TestProtobufPayloadPreservedByReference:
         assert "protobuf" in joined
         assert "schema" in joined
 
-    def test_capability_declares_content_unavailable(self):
+    def test_capability_declares_wire_format_decoding(self):
+        # Adapter 1.2.x replaced "unavailable_when_protobuf_without_schema"
+        # with real wire-format decoding; only malformed payloads still fall
+        # back to preserve-by-reference.
         caps = antigravity.capability().capabilities
-        assert "unavailable" in caps["content_availability"]
+        assert "wire_format" in caps["content_availability"]
+        assert antigravity.ADAPTER_VERSION == "1.2.1"
 
 
 # ------------------------------------------------------------------ JSON path

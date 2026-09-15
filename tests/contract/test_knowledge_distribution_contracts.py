@@ -68,7 +68,7 @@ def test_get_knowledge_status_no_pointer(tmp_path: Path, monkeypatch: pytest.Mon
     assert status["available"] is False
     assert status["active_collection"] is None
     assert "fallback" in status["route_policy"]
-    assert status["route_policy"].startswith("knowledge-first")
+    assert status["route_policy"].startswith(("wiki-first", "knowledge-first"))
     _assert_ssot_fields(status)
     assert "cli" in status["semantic_routes"]
     assert "rest" in status["semantic_routes"]

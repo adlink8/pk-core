@@ -19,6 +19,14 @@ from personal_knowledge.application.knowledge.migrate_add_knowledge_unit_tables 
 from personal_knowledge.evaluation.knowledge.evaluate_knowledge_canary import (  # noqa: E402
     read_active_collection, search_knowledge_units, generate_canary_queries,
 )
+import personal_knowledge.retrieval._constants as _retrieval_constants  # noqa: E402
+
+
+def _disable_compressed_layers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep dialogue/event contract tests off the live wiki/card stores."""
+    missing = tmp_path / "absent-compressed.sqlite"
+    monkeypatch.setattr(_retrieval_constants, "WIKI_PROJECTION_DB", missing)
+    monkeypatch.setattr(_retrieval_constants, "CARDS_DB", missing)
 
 
 def test_read_active_collection_none(tmp_path: Path) -> None:
@@ -312,13 +320,16 @@ def test_search_dialogue_uses_only_active_v2_projection_when_legacy_coexists(
     assert [hit["unit_id"] for hit in hits] == ["v2|gen|message"]
 
 
-def test_layered_tags_dialogue_vs_event(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_layered_tags_dialogue_vs_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """layered path: conversation_turns -> retrieval_unit=dialogue; Google PE -> event."""
     import types
     import personal_knowledge.retrieval.unified_search as us
     import personal_knowledge.retrieval.semantic_search as ss
     from personal_knowledge.retrieval.evidence import EvidenceResolver
 
+    _disable_compressed_layers(monkeypatch, tmp_path)
     monkeypatch.setattr(ss, "_read_knowledge_active_collection", lambda: "test_collection")
     monkeypatch.setattr(
         EvidenceResolver,
@@ -486,12 +497,15 @@ def test_legacy_policy_uses_raw_event_reason(monkeypatch: pytest.MonkeyPatch) ->
     assert result["results"][0]["rank_reason"] == "raw event semantic match"
 
 
-def test_layered_legacy_pad_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_layered_legacy_pad_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """When dialogue+Google insufficient, pad non-Google with rank_reason=legacy_pad."""
     import types
     import personal_knowledge.retrieval.unified_search as us
     import personal_knowledge.retrieval.semantic_search as ss
 
+    _disable_compressed_layers(monkeypatch, tmp_path)
     monkeypatch.setattr(ss, "_read_knowledge_active_collection", lambda: "test_collection")
 
     class _FakeClient:
@@ -564,7 +578,11 @@ def test_layered_legacy_pad_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ss, "_semantic_search", fake_search)
 
     result = us.search_knowledge_units(
-        "pad me", top_k=3, fallback_policy="layered", allow_legacy_pad=True
+        # 探针串不得分词成会在真库（knowledge_units/canonical_messages）命中的
+        # 短 token（ASCII token 最短 3 字符）；否则 KU sqlite 回退吃光预算，
+        # pad 层遥测断言失去确定性。
+        "qqzz",
+        top_k=3, fallback_policy="layered", allow_legacy_pad=True
     )
     reasons = {r["rank_reason"] for r in result["results"]}
     assert "legacy_pad" in reasons
@@ -579,12 +597,15 @@ def test_layered_legacy_pad_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     assert pad_layer["latency_ms"] >= 0
 
 
-def test_layered_telemetry_skips_pad_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_layered_telemetry_skips_pad_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """allow_legacy_pad=False → pad layer not attempted; telemetry pad_used false."""
     import types
     import personal_knowledge.retrieval.unified_search as us
     import personal_knowledge.retrieval.semantic_search as ss
 
+    _disable_compressed_layers(monkeypatch, tmp_path)
     monkeypatch.setattr(ss, "_read_knowledge_active_collection", lambda: "")
     monkeypatch.setattr(ss, "_search_dialogue_canonical_messages", lambda *a, **k: [])
 
@@ -633,7 +654,8 @@ def test_layered_telemetry_skips_pad_when_disabled(monkeypatch: pytest.MonkeyPat
     )
 
     result = us.search_knowledge_units(
-        "no pad", top_k=3, fallback_policy="layered", allow_legacy_pad=False
+        "qqzz",  # 哑探针：不得命中真库（同 test_layered_legacy_pad_reason 注释）
+        top_k=3, fallback_policy="layered", allow_legacy_pad=False
     )
     assert result["allow_legacy_pad"] is False
     tel = result["telemetry"]

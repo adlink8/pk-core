@@ -433,6 +433,168 @@ class TestGrok:
         assert result.fidelity.has_loss()
 
 
+def _make_typed_grok_dir(base: Path) -> None:
+    """Native transcript shape: records tagged ``type``, content as typed parts.
+
+    A real ``chat_history.jsonl`` opens with a multi-kilobyte system prompt and
+    tags every record with ``type`` — never ``role``. The adapter once read this
+    file through a ``role`` envelope and a 512-byte probe window, so the whole
+    transcript was excluded at discovery time and the session degraded to a
+    content-free summary shell.
+    """
+    (base / "summary.json").write_text(
+        json.dumps({
+            "info": {"id": "01a05b59-typed-0000-0000-000000000000", "cwd": "D:\\proj"},
+            "session_summary": "typed transcript",
+            "created_at": "2026-07-01T10:00:00Z",
+            "updated_at": "2026-07-01T10:00:09Z",
+            "num_messages": 5,
+            "num_chat_messages": 4,
+            "current_model_id": "grok-4.6-build",
+        }),
+        encoding="utf-8",
+    )
+    (base / "chat_history.jsonl").write_text(
+        json.dumps({"type": "system", "content": "system preamble " * 200}) + "\n"
+        + json.dumps({"type": "user", "content": [{"type": "text", "text": "typed prompt"}]}) + "\n"
+        + json.dumps({
+            "type": "assistant",
+            "content": "typed answer",
+            "tool_calls": [{
+                "id": "call-1", "name": "read_file",
+                "arguments": json.dumps({"target_file": "a.md"}),
+            }],
+            "model_id": "grok-4.6-build",
+        }) + "\n"
+        + json.dumps({"type": "tool_result", "tool_call_id": "call-1", "content": "file body"}) + "\n"
+        + json.dumps({
+            "type": "reasoning", "id": "rs-1",
+            "summary": [{"type": "summary_text", "text": "why"}],
+            "encrypted_content": "CIPHERTEXT",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+
+class TestGrokTypedTranscript:
+    """Regression: a native ``type``-tagged transcript must not be dropped."""
+
+    INCLUDE = ("summary.json", "chat_history.jsonl")
+
+    @pytest.fixture(scope="class")
+    def captured(self, tmp_path_factory):
+        tmp = tmp_path_factory.mktemp("grok-typed")
+        src = tmp / "src"
+        src.mkdir()
+        _make_typed_grok_dir(src)
+        _manifest, artifacts = capture_directory(
+            src, tmp, include_relative=self.INCLUDE, byte_limit=1_000_000, count_limit=8,
+        )
+        return tmp, artifacts
+
+    def test_detect_accepts_type_tagged_transcript(self, captured):
+        tmp, artifacts = captured
+        chat = next(a for a in artifacts if a.relative_path == "chat_history.jsonl")
+        assert grok.detect(chat, artifact_root=tmp / "artifacts") is True
+
+    def test_transcript_kinds_are_typed(self, captured):
+        tmp, artifacts = captured
+        result = grok.adapt(SourceArtifactSet(artifacts=artifacts), artifact_root=tmp / "artifacts")
+        kinds = {e.kind for e in result.events}
+        assert EventKind.USER_MESSAGE in kinds
+        assert EventKind.ASSISTANT_MESSAGE in kinds
+        assert EventKind.TOOL_CALL in kinds
+        assert EventKind.TOOL_RESULT in kinds
+        assert EventKind.REASONING in kinds
+
+    def test_parts_content_is_text_not_repr(self, captured):
+        tmp, artifacts = captured
+        result = grok.adapt(SourceArtifactSet(artifacts=artifacts), artifact_root=tmp / "artifacts")
+        prompt = next(e for e in result.events if e.kind is EventKind.USER_MESSAGE)
+        assert prompt.content == "typed prompt"
+
+    def test_tool_call_and_result_are_linked(self, captured):
+        tmp, artifacts = captured
+        result = grok.adapt(SourceArtifactSet(artifacts=artifacts), artifact_root=tmp / "artifacts")
+        linked = [r for r in result.relations if r.relation_kind is RelationKind.CALL_RESULT]
+        assert len(linked) == 1
+
+    def test_encrypted_reasoning_keeps_summary_and_flags_ciphertext(self, captured):
+        tmp, artifacts = captured
+        result = grok.adapt(SourceArtifactSet(artifacts=artifacts), artifact_root=tmp / "artifacts")
+        reasoning = next(e for e in result.events if e.kind is EventKind.REASONING)
+        assert reasoning.content == "why"
+        fields = {d.field_name for d in reasoning.field_dispositions}
+        assert "encrypted_content" in fields
+
+    def test_full_transcript_is_complete_fidelity(self, captured):
+        tmp, artifacts = captured
+        result = grok.adapt(SourceArtifactSet(artifacts=artifacts), artifact_root=tmp / "artifacts")
+        assert result.sessions[0].fidelity.level(
+            FidelityDimension.CONTENT_AVAILABILITY
+        ) is FidelityLevel.COMPLETE
+
+
+class TestGrokPerFileAdaptation:
+    """The v2 pipeline stages and adapts one file at a time, not the directory.
+
+    ``_adapt_source_file`` hands the adapter a single-artifact set, so a lone
+    ``chat_history.jsonl`` must still yield a self-consistent result: the
+    generation writer enforces ``ce_events -> ce_sessions`` by foreign key, and
+    a dangling session id aborts the whole cohort write.
+    """
+
+    def _adapt_lone_chat(self, tmp: Path):
+        src = tmp / "src"
+        src.mkdir()
+        _make_typed_grok_dir(src)
+        _manifest, artifacts = capture_directory(
+            src, tmp, include_relative=("chat_history.jsonl",),
+            byte_limit=1_000_000, count_limit=8,
+        )
+        return grok.adapt(
+            SourceArtifactSet(artifacts=artifacts), artifact_root=tmp / "artifacts"
+        )
+
+    def test_transcript_only_set_still_has_a_session_record(self, tmp_path: Path):
+        result = self._adapt_lone_chat(tmp_path)
+
+        assert result.events, "isolated transcript should still emit events"
+        assert result.sessions, "a transcript-only set still needs a session row"
+
+    def test_every_event_session_is_backed_by_a_session_record(self, tmp_path: Path):
+        result = self._adapt_lone_chat(tmp_path)
+
+        known = {s.session_id for s in result.sessions}
+        assert {e.session_id for e in result.events} <= known
+
+    def test_backfilled_session_is_anchored_to_a_present_artifact(self, tmp_path: Path):
+        result = self._adapt_lone_chat(tmp_path)
+
+        artifact_ids = {a.artifact_id for a in result.artifacts}
+        assert all(s.provenance.artifact_id in artifact_ids for s in result.sessions)
+
+    def test_reused_reasoning_native_id_yields_unique_event_ids(self, tmp_path: Path):
+        """Grok reuses one ``rs_...`` id across several reasoning rows."""
+        src = tmp_path / "src"
+        src.mkdir()
+        row = {"type": "reasoning", "id": "rs-dup",
+               "summary": [{"type": "summary_text", "text": "why"}]}
+        (src / "chat_history.jsonl").write_text(
+            json.dumps(row) + "\n" + json.dumps(row) + "\n", encoding="utf-8",
+        )
+        _manifest, artifacts = capture_directory(
+            src, tmp_path, include_relative=("chat_history.jsonl",),
+            byte_limit=1_000_000, count_limit=8,
+        )
+        result = grok.adapt(
+            SourceArtifactSet(artifacts=artifacts), artifact_root=tmp_path / "artifacts"
+        )
+
+        assert len(result.events) == 2
+        assert len({e.event_id for e in result.events}) == 2
+
+
 # -------------------------------------------------------------------------- ChatGPT
 
 class TestChatGPT:

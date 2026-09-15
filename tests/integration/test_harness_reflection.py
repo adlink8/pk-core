@@ -64,6 +64,12 @@ def _require_publisher() -> None:
 DELTA_TYPE = "conversation.delta.committed"
 INTERNAL_CAPABILITY = "test-conversation-delta-capability"
 
+
+@pytest.fixture(autouse=True)
+def _isolate_delta_outbox(tmp_path, monkeypatch):
+    """Publisher integration tests must never write the live operational ledger."""
+    monkeypatch.setenv("PK_CONVERSATION_DELTA_OUTBOX", str(tmp_path / "conversation_delta_outbox.sqlite"))
+
 # Sentinel private values. If any reaches the published event, the Journal, a
 # checkpoint or a callback payload the test fails closed, exactly like the
 # Kernel-side privacy walker.

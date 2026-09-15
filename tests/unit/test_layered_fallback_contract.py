@@ -1,7 +1,7 @@
 """Phase 22-02: layered retrieval contract (no live Chroma required).
 
 Documents and asserts hybrid fallback order:
-  KU (current-only) → dialogue → Google non-dialogue → optional legacy pad.
+  wiki → session cards → KU (current-only) → dialogue → Google → optional pad.
 
 Growth-line multi-version history is a separate read surface (pk-ku history),
 not part of default retrieval.
@@ -24,8 +24,9 @@ def test_default_policy_is_layered() -> None:
 
 
 def test_layered_order_ku_then_dialogue_then_google() -> None:
-    """Contract: knowledge-first, then dialogue layers, then non-dialogue raw."""
-    assert LAYERED_FALLBACK_ORDER[0] == "knowledge_unit"
+    """Contract: wiki-first, then cards, KU, dialogue, then non-dialogue raw."""
+    assert LAYERED_FALLBACK_ORDER[0] == "wiki_page"
+    assert LAYERED_FALLBACK_ORDER[1] == "semantic_card"
     # Dialogue layers immediately after KU (message-level then turns)
     dialogue = [
         x
@@ -33,11 +34,13 @@ def test_layered_order_ku_then_dialogue_then_google() -> None:
         if x in ("canonical_messages", "conversation_turns")
     ]
     assert dialogue == ["canonical_messages", "conversation_turns"]
+    wiki_i = LAYERED_FALLBACK_ORDER.index("wiki_page")
+    card_i = LAYERED_FALLBACK_ORDER.index("semantic_card")
     ku_i = LAYERED_FALLBACK_ORDER.index("knowledge_unit")
     msg_i = LAYERED_FALLBACK_ORDER.index("canonical_messages")
     turns_i = LAYERED_FALLBACK_ORDER.index("conversation_turns")
     raw_i = LAYERED_FALLBACK_ORDER.index("non_dialogue_raw")
-    assert ku_i < msg_i < turns_i < raw_i
+    assert wiki_i < card_i < ku_i < msg_i < turns_i < raw_i
     # Optional pad last among growth-relevant layers
     if "legacy_pad" in LAYERED_FALLBACK_ORDER:
         assert LAYERED_FALLBACK_ORDER.index("legacy_pad") > raw_i
@@ -64,8 +67,9 @@ def test_layered_telemetry_layer_names_cover_contract() -> None:
     # Names used when packing empty result path — must stay aligned with constant
     expected = set(LAYERED_FALLBACK_ORDER) | {"legacy_personal_events"}
     # Source of truth for empty-layer init lives in semantic_search; re-check
-    # the documented order is a non-empty sequence starting at knowledge_unit.
-    assert len(LAYERED_FALLBACK_ORDER) >= 4
+    # the documented order is a non-empty sequence starting at wiki_page.
+    assert len(LAYERED_FALLBACK_ORDER) >= 6
+    assert LAYERED_FALLBACK_ORDER[0] == "wiki_page"
     assert "knowledge_unit" in expected
     assert "canonical_messages" in expected
     assert "non_dialogue_raw" in expected

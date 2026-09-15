@@ -153,3 +153,7 @@ def test_stage_sqlite_uses_wal_safe_snapshot(tmp_path: Path) -> None:
     finally:
         check.close()
     assert isinstance(digest, str) and len(digest) == 64
+    # capture intermediates must not land in the stage tree: the tree is
+    # re-scanned on the next run, so a leaked temp would be re-adapted as a
+    # second copy of the same trajectory and collide on event ids.
+    assert [p.name for p in target.parent.iterdir() if p.name.startswith(".")] == []
