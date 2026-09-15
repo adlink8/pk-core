@@ -1,6 +1,6 @@
 # 检索三层 SSOT 与 hybrid 路由
 
-> Phase 15 治理文档。与 `get_knowledge_status()` 返回的 `ssot` / `fallback_policy` 字段对齐。  
+> Phase 15 治理文档。与 `get_knowledge_status()` 返回的 `ssot` / `fallback_policy` 字段对齐。
 > 实现主路径：`src/personal_knowledge/retrieval/unified_search.py`（CLI / REST / MCP 共用）。
 
 ## 1. 三层 SSOT
@@ -47,12 +47,16 @@
 
 ```text
 search_knowledge_units (layered 默认):
-  1) active KU collection              # knowledge-first
+  0a) wiki_page                         # subject 主题投影（可再生，非事实 SSOT）
+  0b) semantic_card                     # 会话卡 + active ku_facts
+  1)  active KU collection              # 正式 KU 向量（current-only）
   2a) canonical_messages 片段/词检索    # message 级 dialogue（W4；code-literal 主力）
   2b) conversation_turns 向量           # 叙述级 dialogue（辅）
-  3) personal_events source=Google      # 非对话 raw
-  4) optional legacy_pad                # 非 Google PE 填充（可关）
+  3)  personal_events source=Google     # 非对话 raw
+  4)  optional legacy_pad               # 非 Google PE 填充（可关）
 ```
+
+Wiki 与会话卡只读；命中不写回 KU / Chroma。`legacy` 政策不含 0a/0b，保持 KU 后全量 raw 补洞。
 
 Wave 4 frozen 评测（gold evidence）：**layered R@5 = 1.00**（legacy 约 0.65；dialogue_only 1.00）。
 
@@ -60,10 +64,10 @@ Wave 4 frozen 评测（gold evidence）：**layered R@5 = 1.00**（legacy 约 0.
 
 | 值 | 行为 | 何时 |
 |---|---|---|
-| **`layered`**（**当前默认**） | KU → `canonical_messages` → `conversation_turns` dialogue → `non_dialogue_raw`（含 Google）→ 可选 legacy_pad | 当前分层检索链路 |
+| **`layered`**（**当前默认**） | wiki → cards → KU → `canonical_messages` → `conversation_turns` dialogue → `non_dialogue_raw`（含 Google）→ 可选 legacy_pad | 当前分层检索链路 |
 | **`legacy`** | KU 后全量 `personal_events` 补洞 | 回滚 / 对比评测：`--fallback-policy legacy` 或 env `PERSONAL_DATA_FALLBACK_POLICY=legacy` |
 
-`route_policy` 字符串是人类可读摘要：默认分层策略返回 `knowledge-first + layered fallback (dialogue->non_dialogue_raw)`；仅 legacy 策略返回 `knowledge-first + raw fallback`。它与 `fallback_policy` 机器枚举并存。
+`route_policy` 字符串是人类可读摘要：默认分层策略返回 `wiki-first + layered fallback (cards→KU→dialogue→non_dialogue_raw)`；仅 legacy 策略返回 `knowledge-first + raw fallback`。它与 `fallback_policy` 机器枚举并存。
 
 ### 2.2 `allow_legacy_pad` 默认与滚动（Phase 15-02）
 
@@ -98,7 +102,7 @@ Wave 4 frozen 评测（gold evidence）：**layered R@5 = 1.00**（legacy 约 0.
 }
 ```
 
-Holdout 套件（独立于 frozen 20）：`assets/evals/knowledge_units/holdout_15_02.synthetic.jsonl`  
+Holdout 套件（独立于 frozen 20）：`assets/evals/knowledge_units/holdout_15_02.synthetic.jsonl`
 评测：`python tools/forensics/phase15_02_holdout_eval.py`
 
 ## 2.3 Dual-view: current vs growth line (Phase 22)
@@ -113,7 +117,7 @@ Principles (D-22-01…03):
 1. **Never physical DELETE** of KU/canonical rows for “cleanup”.
 2. Growth line keeps multi-version units by subject + time; `lifecycle` / `supersedes_id` mark succession.
 3. Default retrieval and MCP stay **current-only**; archive/growth is an **explicit** CLI/API (`pk-ku history`).
-4. Layered fallback order remains **KU → dialogue → Google PE → optional legacy pad** (`LAYERED_FALLBACK_ORDER` in `retrieval/_constants.py`); scores sort hits, they are not truth.
+4. Layered fallback order remains **wiki → cards → KU → dialogue → Google PE → optional legacy pad** (`LAYERED_FALLBACK_ORDER` in `retrieval/_constants.py`); scores sort hits, they are not truth. Wiki/cards are projections and never become fact SSOT.
 
 ```powershell
 pk-ku history --subject "Shell" --limit 20
@@ -175,8 +179,8 @@ doctor 返回非零。promote / rollback **不**经分发接口。
 ## 5. 相关代码
 
 - 路径 SSOT：`src/personal_knowledge/core/project_paths.py`
-- 状态与检索 backend：`src/personal_knowledge/retrieval/unified_search.py`  
-  - `get_knowledge_status`  
+- 状态与检索 backend：`src/personal_knowledge/retrieval/unified_search.py`
+  - `get_knowledge_status`
   - `search_knowledge_units`（layered fallback 契约见上文）
 - 契约测试：`tests/contract/test_knowledge_distribution_contracts.py`
 - Phase 上下文：`.planning/phases/15-retrieval-ssot-governance/15-CONTEXT.md`

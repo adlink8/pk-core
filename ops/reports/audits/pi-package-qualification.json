@@ -85,8 +85,8 @@
   },
   "governance": {
     "owner": "Phase 48 security governance",
-    "reviewed_at": "2026-08-04T09:09:39.040Z",
-    "expiry": "2026-09-03T09:09:39.040Z",
+    "reviewed_at": "2026-09-03T11:48:56.418Z",
+    "expiry": "2026-10-03T11:48:56.418Z",
     "requalification_triggers": [
       "package.json or package-lock.json changes",
       "npmjs.org metadata, integrity, license, repository or engine changes",

@@ -284,6 +284,90 @@ pwsh -File tools\register-native-sync.ps1 -Unregister
 
 日志：`var/logs/native-sync.log`。任务只做 discover→stage→shadow；
 激活始终是人工显式步骤，与 Phase 62 D-18/D-31 一致（零付费）。
+## Live incremental sync (single live generation, 2026-09)
+
+替代"每轮全量重写快照"的路径：**稳定槽位身份 + 原地增量更新**。
+`artifact_id = sha256("art|<family>|<mirror_path>")`（槽位与文件内容脱钩，`CONTRACT_VERSION=2`），
+单一 live 代原地增删改；变更检测走 mtime+size 快筛 + 槽位 `content_hash` 水位。
+存储上不可能再出现"15 代 × 全量"式膨胀；审计走 `ce_live_sync_log`。
+
+```powershell
+# 跑一次增量（stage 客户端源 -> 镜像 -> 增量应用）
+pk-sync conversations --live-sync
+
+# 预演：报告将发生什么，零写入（连库文件都不创建）
+pk-sync conversations --live-dry-run --live-db <db> --live-mirror <mirror>
+
+# 常驻后台监听（30s 轮询 + 连续 2 次稳定扫描才触发；Ctrl-C 优雅退出）
+pk-sync conversations --watch [--watch-interval 30]
+
+# 只读运维视图：槽位计数 / 最近一次同步 / 待变更数（零写入）
+pk-sync conversations --live-status
+```
+
+默认目标：`--live-db` = `data/staging/v2/agent_conversations_v2.sqlite`（暂存库），
+`--live-mirror` = `data/staging/v2/native`。**live 模式默认永不指向 canonical 生产库**；
+要用增量直接维护 canonical，必须显式传 `--live-db data/canonical/agent/structured/db/agent_conversations.sqlite`。
+与 `--v2-*` 模式互斥（同时给出则 fail-closed 退出码 2）。
+
+机制要点（改动排查时先看这些）：
+
+| 关注点 | 位置 |
+|---|---|
+| 槽位身份 | `adapters/conversation_sources/snapshots.py::make_slot_artifact_id` |
+| 增量引擎（单事务剪枝+幂等插入） | `application/conversation/live_sync.py::live_sync_once` |
+| 监听循环（防抖/锁/日志/信号） | `application/conversation/watch.py::run_watch` |
+| live 表与索引（additive） | `application/conversation/event_schema.py` |
+| CLI 路由 | `application/sync.py::_cmd_conversations`（live 优先于 v2） |
+
+运维提示：
+
+- 单实例锁：`<mirror 同级>/live-sync.lock`（PID+心跳；死进程锁自动回收，活进程持锁时第二个实例 `status=locked` 退出码 1）
+- 监听日志：`<mirror 同级>/live-sync.log`（1MB 滚动保留一代；每轮心跳，可用心跳时间判断进程死活）
+- 单轮失败记 `status=partial` 并在下个稳定扫描重试，循环不死
+- 幂等保证：源零变化时第二次运行 `status=no-op`、0 行写入、库文件字节不变
+
+## Event-delta preparation status
+
+`pk-ku view-status` (without `--run`) reads the current authority and consumer
+backlog in one read-only snapshot. `--conversation-db <path>` selects an explicit
+database; `view-status --run <run-id>` keeps the existing per-run audit behavior.
+
+- `pending`: committed event pages remain; inspect `pending_delta_count` and
+  `pending_event_count`, then use bounded `pk-ku view-consume` when appropriate.
+- `withdrawal_required`: pages are prepared, but persisted withdrawal references
+  have not been executed. Their count represents queued reference occurrences.
+- `prepared`: no pending prepare pages or withdrawal references were observed.
+  This is not extraction, review, publication or memory-quality completion.
+- `uninitialized` / `degraded` (exit 2): source authority/history is unavailable,
+  or the consumer checkpoint is inconsistent. Unknown counts stay null.
+
+`prepare_caught_up` describes only this prepare cursor. `memory_ready=false` and
+`extraction_status=not_automated` preserve the current delivery boundary. The
+consumer rejects a missing/mismatched committed checkpoint and an active
+generation without its own activation delta history; it never repairs these by
+resetting the cursor, fabricating an empty delta or running a full inventory.
+
+## One-time baseline for an existing active generation
+
+For an active generation created before durable deltas existed, run
+`pk-ku view-baseline` first. This is a read-only, streaming full-source digest
+and metadata preview; its `event_count` is the entire one-time historical scope,
+not today's new evidence. It does not prepare views or call a model.
+
+After reviewing and approving that historical scope, use
+`pk-ku view-baseline --write --approval <confirmation-from-preview>`.
+The confirmation binds source rows and activation binding metadata. Changed
+source/context/bindings require a fresh preview and approval. Initialization
+atomically adds a baseline audit and all current event references as pending;
+it does not activate, rewrite source/projection rows, advance a cursor or publish
+knowledge. Existing history/consumer state blocks first initialization. Exact
+replay verifies the baseline ledger without adding rows. This does not reverify
+the derived projection or authorize a paid semantic pilot/full extraction.
+
+Then `pk-ku view-status` should show the baseline backlog. Subsequent
+`pk-ku view-consume` remains bounded per invocation and never calls a provider.
+
 ## Related docs
 
 - Agent operating manual: [../AGENTS.md](../AGENTS.md)

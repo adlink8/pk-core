@@ -6,8 +6,8 @@
 - Run ID: piq_f7896e839999ed2eac87ebd4
 - Evidence checksum: 6419dfd5979909192a1be8ae23321f72f965da54d5fa332cd21e0ff04858d704
 - Owner: Phase 48 security governance
-- Reviewed at: 2026-08-04T09:09:39.040Z
-- Expiry: 2026-09-03T09:09:39.040Z
+- Reviewed at: 2026-09-03T11:48:56.418Z
+- Expiry: 2026-10-03T11:48:56.418Z
 
 ## Scope
 
