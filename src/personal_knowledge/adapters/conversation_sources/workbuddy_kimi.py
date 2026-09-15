@@ -11,6 +11,7 @@ outcomes; unknown kinds stay ``unknown_native``.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from personal_knowledge.adapters.conversation_sources.contracts import (
@@ -195,6 +196,27 @@ def _record_time(record) -> str | None:
         if value is not None:
             return _timestamp(value)
     return None
+
+
+def _session_time_bounds(records) -> tuple[str | None, str | None]:
+    """会话起止时间：对全部记录取时间 min/max。
+
+    不同记录的时间戳来源不一致（部分用 ``time`` 毫秒纪元、部分用
+    ``created_at`` 字符串），直接取 ``records[0]`` / ``records[-1]`` 会在短会话
+    里出现 ``started_at > ended_at`` 的倒挂（实测约 1.2 秒）。统一取极值可修正。
+    空 records 或全 None 时返回 ``(None, None)``。
+    """
+
+    def _sort_key(stamp: str):
+        try:
+            return (0, datetime.fromisoformat(stamp).timestamp(), stamp)
+        except (ValueError, TypeError):
+            return (1, 0.0, stamp)
+
+    stamps = [t for t in (_record_time(r) for r in records) if t is not None]
+    if not stamps:
+        return None, None
+    return min(stamps, key=_sort_key), max(stamps, key=_sort_key)
 
 
 def _text_blocks(value) -> str | None:
@@ -928,8 +950,8 @@ class _Family:
                     contract_version=CONTRACT_VERSION,
                 ),
                 fidelity=_fidelity(), native_session_id=native_session,
-                started_at=_record_time(records[0]) if records else None,
-                ended_at=_record_time(records[-1]) if records else None,
+                started_at=_session_time_bounds(records)[0] if records else None,
+                ended_at=_session_time_bounds(records)[1] if records else None,
                 cwd=cwd, model=model, title=title,
             ))
 

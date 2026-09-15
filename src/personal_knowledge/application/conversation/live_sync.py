@@ -109,6 +109,7 @@ from personal_knowledge.application.conversation.compatibility_projection import
 )
 from personal_knowledge.application.conversation.event_repository import (
     GenerationInput,
+    _enrich_session_titles,
     _fidelity_json,
     _insert_artifacts,
     _insert_dispositions,
@@ -289,7 +290,7 @@ def _capture_and_adapt(
 
 def _generation_input(result) -> GenerationInput:
     cap = capability_for(result.family)
-    return GenerationInput(
+    gen = GenerationInput(
         family=result.family,
         adapter_version=result.adapter_version,
         contract_version=result.contract_version,
@@ -303,6 +304,8 @@ def _generation_input(result) -> GenerationInput:
         dispositions=result.field_dispositions,
         warnings=result.warnings,
     )
+    # title 回退：空 title 会话用首条 user 消息回填（所有 family 统一生效）。
+    return _enrich_session_titles(gen)
 
 
 def _assert_adaptation_integrity(family: str, result) -> None:

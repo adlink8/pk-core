@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
+    EventKind,
     EventRelation,
     FieldDispositionRecord,
     Provenance,
@@ -135,6 +136,38 @@ class GenerationInput:
 
 def _fidelity_json(profile) -> str:
     return json.dumps(profile.to_dict(), sort_keys=True)
+
+
+def _enrich_session_titles(gen: GenerationInput) -> GenerationInput:
+    """为空 title 的会话用其首条 user 消息内容回填（≤80 字符、去换行）。
+
+    引擎公共层：所有 family 经 ``GenerationInput`` 进入写入路径时统一生效。
+    取该会话首条 ``user_message`` 事件的 ``content``，折叠换行/多余空白后截断到
+    80 字符作 title；无 user 消息的会话（如 claude 的 summary-only 会话）保持
+    空 title。``AdaptedSession`` 可变，故就地回填即可。
+    """
+
+    if not gen.sessions:
+        return gen
+    first_user: dict[str, str] = {}
+    for event in gen.events:
+        if event.kind is EventKind.USER_MESSAGE and event.session_id not in first_user:
+            if event.content:
+                first_user[event.session_id] = event.content
+    if not first_user:
+        return gen
+    new_sessions = []
+    for session in gen.sessions:
+        if session.title or session.session_id not in first_user:
+            new_sessions.append(session)
+            continue
+        title = " ".join(first_user[session.session_id].split())[:80]
+        if title:
+            # AdaptedSession 为 frozen dataclass，需整体替换。
+            new_sessions.append(replace(session, title=title))
+        else:
+            new_sessions.append(session)
+    return replace(gen, sessions=tuple(new_sessions))
 
 
 def _insert_artifacts(

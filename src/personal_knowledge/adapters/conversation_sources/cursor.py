@@ -426,6 +426,18 @@ def _adapt_jsonl(artifact: SourceArtifact, *, artifact_root: Path) -> Adaptation
     warnings = (
         (f"{unknown} unknown native record(s) preserved",) if unknown else ()
     )
+    # 无 message 行的 transcript：不产生幽灵会话（与 _adapt 空 threads 行为对齐）。
+    message_count = sum(
+        1 for e in events
+        if e.kind in (EventKind.USER_MESSAGE, EventKind.ASSISTANT_MESSAGE)
+    )
+    if message_count == 0:
+        return AdaptationResult(
+            family=FAMILY, adapter_version="1.1.0",
+            contract_version=CONTRACT_VERSION, artifacts=(artifact,),
+            sessions=(), events=(), relations=(), fidelity=partial,
+            warnings=warnings + ("empty transcript: no messages, session skipped",),
+        )
     project_cwd = _jsonl_project_cwd(artifact.relative_path)
     row_timestamps = [r.get("timestamp") for r in rows if r.get("timestamp")]
     return AdaptationResult(
