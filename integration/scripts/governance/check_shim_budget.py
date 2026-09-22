@@ -6,9 +6,16 @@ import ast
 import json
 import re
 import importlib.util
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
+# Resolve shim targets against this repository's own source tree. CI runs the
+# checker as a plain subprocess with no installed package, and a developer
+# machine may have an unrelated editable install shadowing it.
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 SCRIPTS = ROOT / "tools" / "compat" / "v1_1"
 MANIFEST = ROOT / "governance" / "manifests" / "entrypoints.yaml"
 TARGET = re.compile(r"Compatibility shim ->\s*([A-Za-z0-9_.]+)")
