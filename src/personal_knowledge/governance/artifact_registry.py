@@ -12,8 +12,7 @@ from typing import Any, Iterable
 
 import yaml
 
-from personal_knowledge.core.project_paths import ROOT
-
+ROOT = Path(__file__).resolve().parents[3]
 
 DEFAULT_REGISTRY = ROOT / "governance" / "policies" / "artifact_layers.yaml"
 LAYERS = frozenset({"D", "S", "R", "A"})

@@ -53,7 +53,15 @@ def main() -> int:
     args = parser.parse_args()
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     shims = discover_shims()
-    tools_manifest = json.loads((ROOT / "governance/manifests/source/tools.json").read_text(encoding="utf-8"))
+    tools_manifest_path = ROOT / "governance/manifests/source/tools.json"
+    # The tool registry snapshot is not tracked in the public repo; an absent
+    # registry is an empty cohort, not a crash. baseline_only_down keeps the
+    # budget monotonic, so the count is still reported for review.
+    tools_manifest = (
+        json.loads(tools_manifest_path.read_text(encoding="utf-8"))
+        if tools_manifest_path.is_file()
+        else {"entries": []}
+    )
     tools = tools_manifest["entries"]
     errors = []
     only_down = bool(manifest.get("baseline_only_down"))

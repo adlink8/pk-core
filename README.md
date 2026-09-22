@@ -279,6 +279,12 @@ personal-data-analysis-system/
 └── .gitignore                   # 严密的隐私与数据隔离规则
 ```
 
+**进一步阅读：**
+
+- [docs/architecture/repository-zones.md](docs/architecture/repository-zones.md) — 仓库分区与数据边界总览
+- [integration/README.md](integration/README.md) — 集成层脚本与 ingestion 入口说明
+- [.planning/ROADMAP.md](.planning/ROADMAP.md) — 阶段路线图与治理基线
+
 ---
 
 ## 📄 开源许可证
