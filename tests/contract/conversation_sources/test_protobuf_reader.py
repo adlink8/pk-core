@@ -1,7 +1,10 @@
-"""protobuf wire-format reader contract.
+"""protobuf wire-format reader 契约（测试对象 = ``protobuf_wire.py``）。
 
-The reader must recover structure and text without any ``.proto`` schema, and
-must refuse to guess when a buffer is not well-formed protobuf.
+这是 antigravity 的**共享原语**，不是某个家族的适配器：live 库不带 ``.proto``
+schema，reader 必须在没有 schema 的情况下恢复结构与文本，遇到非法 buffer 时
+必须拒绝猜。所以这个文件不经过 registry seam，只测 reader 自己。
+
+材料搬运自 ``tests/contract/test_protobuf_wire.py``（23 个用例）。
 """
 
 from __future__ import annotations
@@ -98,7 +101,7 @@ class TestWindowsUtf16Recovery:
     is a safe fallback once plain UTF-8 has failed to be printable."""
 
     def test_nul_padded_utf16le_ascii_is_recovered(self):
-        text = "wsl: wsl2.sparseVhd:C:\\Users\\li\\.wslconfig"
+        text = "wsl: wsl2.sparseVhd:C:\\Users\\synthetic\\.wslconfig"
         chunk = text.encode("utf-16-le")
         assert b"\x00" in chunk
         assert as_text(chunk) == text

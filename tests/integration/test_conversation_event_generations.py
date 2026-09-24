@@ -589,6 +589,17 @@ def test_activation_preserves_legacy_rows(tmp_path: Path, _activate, _generation
 
     con = sqlite3.connect(str(db))
     try:
+        # Origin-derived ids make prefix classification impossible: the
+        # projection's rows and the pre-existing rows share one id shape.
+        # Classify by the id set the projection recorded in ce_projected_ids.
+        owned_msgs = {row[0] for row in con.execute(
+            "SELECT row_id FROM ce_projected_ids "
+            "WHERE table_name='canonical_messages'"
+        )}
+        owned_sessions = {row[0] for row in con.execute(
+            "SELECT row_id FROM ce_projected_ids "
+            "WHERE table_name='canonical_sessions'"
+        )}
         sessions = con.execute(
             "SELECT canonical_session_id, primary_source FROM canonical_sessions"
         ).fetchall()
@@ -598,24 +609,35 @@ def test_activation_preserves_legacy_rows(tmp_path: Path, _activate, _generation
     finally:
         con.close()
 
-    legacy_sessions = [r for r in sessions if not r[0].startswith("v2|")]
-    legacy_msgs = [r for r in messages if not r[0].startswith("v2|")]
-    v2_msgs = [r for r in messages if r[0].startswith("v2|")]
+    legacy_sessions = [r for r in sessions if r[0] not in owned_sessions]
+    legacy_msgs = [r for r in messages if r[0] not in owned_msgs]
+    v2_msgs = [r for r in messages if r[0] in owned_msgs]
     assert legacy_sessions == [("legacy-session-1", "legacy")]
     assert legacy_msgs == [("legacy-msg-1", "pre-existing legacy message")]
-    assert v2_msgs, "v2 projection rows must be written alongside legacy rows"
+    assert v2_msgs, "projection rows must be written alongside legacy rows"
 
     consumer = ConversationRepository(
         source=SOURCE_CANONICAL, canonical_db=db, legacy_db=db,
     )
     visible_sessions = list(consumer.iter_sessions())
-    assert len(visible_sessions) == 1
-    assert visible_sessions[0]["canonical_session_id"].startswith("v2|")
-    assert consumer.session_count() == 1
-    assert consumer.user_turn_count() == 1
-    assert consumer.session_source_refs("legacy-session-1") == []
+    # The store is a merged union: the projection's session and the
+    # pre-existing row are both preserved and both visible (a prefix-based
+    # visibility filter would have hidden one of them — see
+    # canonical_visibility).
+    assert {s["canonical_session_id"] for s in visible_sessions} == {
+        "legacy-session-1", "cs|codex|s-1",
+    }
+    assert consumer.session_count() == 2
+    # both sessions carry one user turn: the projection's and the legacy row's
+    assert consumer.user_turn_count() == 2
+    # the pre-existing row keeps its provenance and is now visible too
+    refs = consumer.session_source_refs("legacy-session-1")
+    assert [r["source"] for r in refs] == ["legacy"]
+    assert refs[0]["source_session_id"] == "source-legacy-1"
+    # the legacy message belongs to the legacy session only — it must never
+    # leak into the projection session's turns
+    projection_turns = list(consumer.iter_turns("cs|codex|s-1"))
     assert all(
-        turn.content != "pre-existing legacy message"
-        for session in visible_sessions
-        for turn in consumer.iter_turns(session["canonical_session_id"])
+        turn.content != "pre-existing legacy message" for turn in projection_turns
     )
+    assert any(turn.content for turn in projection_turns)

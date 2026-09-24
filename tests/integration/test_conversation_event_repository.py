@@ -46,6 +46,7 @@ from personal_knowledge.application.conversation.event_repository import (
     EventRepository,
     EventRepositoryError,
     GenerationInput,
+    _enrich_session_titles,
 )
 
 
@@ -514,3 +515,72 @@ def test_import_generation_maps_missing_optional_content_from_v20_source(
     assert row["summary"] == "legacy source summary"
     assert row["contract_version"] == "1"
     assert row["fidelity_json"] == expected_fidelity
+
+
+# ------------------- 引擎公共层 title 回退（audit 2026-09-15 Fix C）
+#
+# 归属判定：这三条用例观察的是 ``application.conversation.event_repository``
+# 的引擎公共层 title 回退 ``_enrich_session_titles``（写入前统一补 title），
+# 不是某个 family 的适配契约，所以家在 event_repository 的 integration 测试
+# 文件里，而不是 tests/contract/。
+
+
+def _title_prov() -> Provenance:
+    return Provenance(
+        artifact_id="a", artifact_hash="h", native_locator="l",
+        native_session_id="s", native_event_id="s", contract_version="x",
+    )
+
+
+def _title_gen(sessions, events) -> GenerationInput:
+    return GenerationInput(
+        family="claude",
+        adapter_version="x", contract_version="x", capability_digest="x",
+        source_manifest_id="x", dataset_digest="x",
+        sessions=tuple(sessions), events=tuple(events),
+    )
+
+
+def test_enrich_session_titles_from_first_user_message():
+    prov = _title_prov()
+    sess = AdaptedSession(
+        session_id="s1", provenance=prov, fidelity=FidelityProfile.complete(),
+        title=None,
+    )
+    evt = TypedEvent(
+        event_id="e1", session_id="s1", kind=EventKind.USER_MESSAGE,
+        provenance=prov, fidelity=FidelityProfile.complete(),
+        content="请帮我\n修复这个\t很长的 bug 描述内容",
+    )
+    out = _enrich_session_titles(_title_gen([sess], [evt]))
+    assert out.sessions[0].title == "请帮我 修复这个 很长的 bug 描述内容"
+    assert len(out.sessions[0].title) <= 80
+
+
+def test_enrich_session_titles_summary_only_stays_empty():
+    # claude 类无 user 消息的 summary-only 会话保持空 title。
+    prov = _title_prov()
+    sess = AdaptedSession(
+        session_id="s1", provenance=prov, fidelity=FidelityProfile.complete(),
+        title=None,
+    )
+    evt = TypedEvent(
+        event_id="e1", session_id="s1", kind=EventKind.SESSION_LIFECYCLE,
+        provenance=prov, fidelity=FidelityProfile.complete(), summary="summary only",
+    )
+    out = _enrich_session_titles(_title_gen([sess], [evt]))
+    assert out.sessions[0].title is None
+
+
+def test_enrich_session_titles_truncates_to_80():
+    prov = _title_prov()
+    sess = AdaptedSession(
+        session_id="s1", provenance=prov, fidelity=FidelityProfile.complete(),
+        title=None,
+    )
+    evt = TypedEvent(
+        event_id="e1", session_id="s1", kind=EventKind.USER_MESSAGE,
+        provenance=prov, fidelity=FidelityProfile.complete(), content="x" * 200,
+    )
+    out = _enrich_session_titles(_title_gen([sess], [evt]))
+    assert len(out.sessions[0].title) == 80
