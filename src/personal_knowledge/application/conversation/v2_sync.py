@@ -42,6 +42,10 @@ from personal_knowledge.adapters.conversation_sources.snapshots import (
     capture_file,
     capture_sqlite,
 )
+from personal_knowledge.application.conversation.authority_reconcile import (
+    account_from_discovery_ledger,
+    reconcile,
+)
 from personal_knowledge.application.conversation.event_generations import (
     GenerationActivationError,
     GenerationLifecycle,
@@ -264,6 +268,63 @@ def _adapt_source_file(
     return artifact, result
 
 
+def _grok_session_groups(matches: list[Path]) -> list[list[Path]]:
+    """Group detected Grok files by session directory and keep events.jsonl.
+
+    ``events.jsonl`` is not a detector hit (it has no transcript marker), but
+    it lives beside ``summary.json`` / ``chat_history.jsonl``. Leaving it out
+    drops every native type in that file.
+    """
+    grouped: dict[Path, list[Path]] = {}
+    for path in matches:
+        grouped.setdefault(path.parent, []).append(path)
+    groups: list[list[Path]] = []
+    for directory, paths in grouped.items():
+        present = {path.resolve() for path in paths}
+        extra = directory / "events.jsonl"
+        if extra.is_file():
+            try:
+                resolved = extra.resolve()
+            except OSError:
+                resolved = None
+            if resolved is not None and resolved not in present:
+                paths.append(extra)
+        groups.append(paths)
+    return groups
+
+
+def _adapt_grok_session_directory(
+    paths: list[Path],
+    store: Path,
+    *,
+    byte_limit: int,
+    count_limit: int,
+    source_root: Path | None,
+) -> tuple[list[SourceArtifact], AdaptationResult]:
+    """Capture one Grok session directory and adapt it as a single set."""
+    from personal_knowledge.adapters.conversation_sources.discovery import (
+        mirror_path_for,
+    )
+
+    artifacts: list[SourceArtifact] = []
+    blob_parent: Path | None = None
+    for path in paths:
+        mirror_path = mirror_path_for("grok", path, source_root=source_root)
+        artifact, blob = capture_file(
+            path, store, relative_path=path.name,
+            byte_limit=byte_limit, count_limit=count_limit,
+            family="grok", mirror_path=mirror_path,
+        )
+        artifacts.append(artifact)
+        blob_parent = blob.parent
+    if blob_parent is None:
+        raise FileNotFoundError("grok session directory has no capturable file")
+    result = adapt_for(
+        "grok", SourceArtifactSet(tuple(artifacts)), artifact_root=blob_parent,
+    )
+    return artifacts, result
+
+
 def _status_for(result: AdaptationResult, artifact: SourceArtifact) -> str:
     """full | partial | blocked for one adapted family."""
     blocked = any(
@@ -284,12 +345,17 @@ def shadow_conversation_generation(
     report_path: Path,
     byte_limit: int = 1_000_000,
     count_limit: int = 200,
+    discovery_ledger=None,
 ) -> dict:
     """Explicit shadow: capture, adapt, and stage NON-active v2 generations.
 
     One staged generation per detected family. Writes a metadata-only JSON
     report (hashes/fidelity/counts, never bodies). The authority pointer is
     never touched here: activation is a separate explicit step.
+
+    ``discovery_ledger`` is an optional discovery-layer accounting sink; when
+    given, a metadata-only ``discovery`` block (counts + reason histogram,
+    never per-file paths) is added to the report before the digest is taken.
     """
     if not source_root.exists():
         raise FileNotFoundError(f"v2 source root missing: {source_root}")
@@ -330,6 +396,19 @@ def shadow_conversation_generation(
         ),
     }
     report["gates"]["overall"] = all(report["gates"].values())
+    if discovery_ledger is not None:
+        # Counts + reason histogram only: the real machine has tens of
+        # thousands of unclaimed files, so per-file paths must never enter
+        # this metadata-only report.
+        account = account_from_discovery_ledger(discovery_ledger)
+        report["discovery"] = {
+            "scanned_roots": discovery_ledger.scanned_roots,
+            "candidates": discovery_ledger.candidates,
+            "claimed": discovery_ledger.claimed,
+            "unclaimed": len(discovery_ledger.unclaimed),
+            "unclaimed_by_reason": dict(account.dropped),
+            "reconcile_passed": reconcile([account]).passed,
+        }
     report["report_digest"] = _report_digest(report)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
@@ -382,26 +461,34 @@ def _stage_all_families(
             try:
                 results: list[AdaptationResult] = []
                 seen_content: set[str] = set()
-                for path in matches:
-                    mirror_path = mirror_path_for(owner, path, source_root=source_root)
-                    artifact, result = _adapt_source_file(
-                        path, store, byte_limit=byte_limit,
-                        count_limit=count_limit, family=owner,
-                        mirror_path=mirror_path,
-                    )
-                    # Dedup is keyed by ``content_hash`` (product decision, kept):
-                    # since milestone 1 the slot ``artifact_id`` is derived from
-                    # (family, mirror path), so two byte-identical files in
-                    # different directories have DIFFERENT artifact ids but the
-                    # SAME content hash. Two staged copies of one payload must
-                    # still be adapted once, or they emit the same event ids and
-                    # fail the merge contract (observed: three byte-identical
-                    # grok chat_history.jsonl in distinct session dirs).
-                    if artifact.content_hash in seen_content:
-                        continue
-                    seen_content.add(artifact.content_hash)
-                    results.append(result)
-                    all_hashes.append(artifact.content_hash)
+                # Grok's session is the directory, not one file. Adapting
+                # summary.json and chat_history.jsonl separately yields two
+                # sessions and drops the transcript off the summary id.
+                if owner == "grok":
+                    for group in _grok_session_groups(matches):
+                        artifacts, result = _adapt_grok_session_directory(
+                            group, store, byte_limit=byte_limit,
+                            count_limit=count_limit, source_root=source_root,
+                        )
+                        results.append(result)
+                        all_hashes.extend(artifact.content_hash for artifact in artifacts)
+                else:
+                    for path in matches:
+                        mirror_path = mirror_path_for(owner, path, source_root=source_root)
+                        artifact, result = _adapt_source_file(
+                            path, store, byte_limit=byte_limit,
+                            count_limit=count_limit, family=owner,
+                            mirror_path=mirror_path,
+                        )
+                        # Non-Grok families still skip a second file with the same
+                        # content hash. Grok is not in this branch: a session is the
+                        # directory, and slot ids already keep identical transcripts
+                        # in different directories from colliding.
+                        if artifact.content_hash in seen_content:
+                            continue
+                        seen_content.add(artifact.content_hash)
+                        results.append(result)
+                        all_hashes.append(artifact.content_hash)
                 merged = _merge_family_results(owner, results)
                 _assert_referential_integrity(owner, merged)
                 cap = capability_for(owner)
@@ -828,6 +915,36 @@ def add_conversations_v2_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def native_dry_run_report(found, ledger=None) -> dict:
+    """构造 --v2-native-dry-run 的报告。ledger 为 None 时不产出 discovery 段。
+
+    与 shadow 路径的 ``discovery`` 段保持同一形状（见
+    :func:`shadow_conversation_generation`）：只有计数与原因直方图。
+    真机未认领有六万多条，逐条路径会把这份 JSON 撑爆，所以永不落路径。
+    """
+    report = {
+        "mode": "native-dry-run",
+        "detected": {
+            family: sorted(str(p) for p in paths)
+            for family, paths in sorted(found.items()) if paths
+        },
+        "no_source": sorted(
+            family for family, paths in found.items() if not paths
+        ),
+    }
+    if ledger is not None:
+        account = account_from_discovery_ledger(ledger)
+        report["discovery"] = {
+            "scanned_roots": ledger.scanned_roots,
+            "candidates": ledger.candidates,
+            "claimed": ledger.claimed,
+            "unclaimed": len(ledger.unclaimed),
+            "unclaimed_by_reason": dict(account.dropped),
+            "reconcile_passed": reconcile([account]).passed,
+        }
+    return report
+
+
 def cmd_conversations_v2(args) -> int:
     """CLI routing for the explicit v2 modes (dry-run / shadow / activation).
 
@@ -835,30 +952,26 @@ def cmd_conversations_v2(args) -> int:
     (D-15/D-31, zero-paid)."""
     if args.v2_native_dry_run:
         from personal_knowledge.adapters.conversation_sources.discovery import (
+            DiscoveryLedger,
             discover_client_sources,
         )
 
-        found = discover_client_sources()
-        report = {
-            "mode": "native-dry-run",
-            "detected": {
-                family: sorted(str(p) for p in paths)
-                for family, paths in sorted(found.items()) if paths
-            },
-            "no_source": sorted(
-                family for family, paths in found.items() if not paths
-            ),
-        }
+        ledger = DiscoveryLedger()
+        found = discover_client_sources(ledger=ledger)
+        report = native_dry_run_report(found, ledger)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 
     if args.v2_native:
         from personal_knowledge.adapters.conversation_sources.discovery import (
+            DiscoveryLedger,
             stage_client_sources,
         )
 
+        ledger = DiscoveryLedger()
         staged = stage_client_sources(
             stage_root=args.v2_stage, byte_limit=args.v2_byte_limit,
+            ledger=ledger,
         )
         print(json.dumps(staged, ensure_ascii=False, indent=2))
         if staged["staged"] == 0 and staged["skipped"] == 0:
@@ -870,6 +983,7 @@ def cmd_conversations_v2(args) -> int:
             artifact_store=args.v2_artifact_store,
             report_path=args.v2_report,
             byte_limit=args.v2_byte_limit,
+            discovery_ledger=ledger,
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         print(f"\n[native] metadata-only shadow report: {args.v2_report}")
