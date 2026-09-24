@@ -14,7 +14,8 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+_PKG_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_PKG_ROOT / "src"))
 
 from personal_knowledge.application.conversation import uniform_id_migration as u  # noqa: E402
 
@@ -411,13 +412,135 @@ def test_publish_guard_blocks_pre_migration_ids(tmp_path, db):
         build._assert_publish_compatible(work, [
             {"canonical_session_id": "cs|ad0eeb10bebed2eb976dffab99ab83e5"},
         ])
-    # uniform ids pass, and a DB without the map is never blocked
-    build._assert_publish_compatible(work, [
-        {"canonical_session_id": "cs|claude|S-native-1"},
-    ])
-    build._assert_publish_compatible(db, [
+    # 统一 id 不再触发 id 竖线数门；迁移库仍带白名单外的表（id_migration_map），
+    # 故 2026-09 起的 schema 门照样拒绝（用例见下节）。
+    with pytest.raises(RuntimeError, match="outside the published schema"):
+        build._assert_publish_compatible(work, [
+            {"canonical_session_id": "cs|claude|S-native-1"},
+        ])
+    # 白名单内的库（无迁移产物）从不因守卫受阻，与 id 形态无关
+    clean = tmp_path / "clean.sqlite"
+    clean.write_bytes(db.read_bytes())
+    con = sqlite3.connect(clean)
+    for table in ("ce_sessions", "ce_events", "ce_generation_authority"):
+        con.execute(f"DROP TABLE {table}")
+    con.commit()
+    con.close()
+    build._assert_publish_compatible(clean, [
         {"canonical_session_id": "cs|ad0eeb10bebed2eb976dffab99ab83e5"},
     ])
+
+
+# ------------------------------------------------------- 发布守卫（fail-closed）
+
+# 发布产物实测（2026-09-24，tmp 内跑完整发布路径）：staging 对象 = 下列 6 张表
+# + 7 个显式索引 + 6 个 sqlite_autoindex_*；无 sqlite_sequence、无虚拟表影子表。
+# 真实权威库另有 20 张白名单外的表（ce_* 17 张含 112 万行 ce_events、id_migration_map / id_address_policy / canonical_session_origins），整库替换会静默清空它们。
+PUBLISHED_TABLES = [
+    "canonical_messages", "canonical_sessions", "canonical_tool_events",
+    "crosswalk_review", "session_relations", "session_source_links",
+]
+
+_AV_DDL = (
+    "CREATE TABLE sessions (session_id TEXT PRIMARY KEY,"
+    " source_session_id TEXT NOT NULL, agent TEXT, started_at TEXT,"
+    " ended_at TEXT, message_count INTEGER, user_message_count INTEGER,"
+    " file_hash TEXT, parent_session_id TEXT, relationship_type TEXT, cwd TEXT,"
+    " git_branch TEXT, evidence_eligible INTEGER NOT NULL DEFAULT 1, evidence_scope TEXT NOT NULL DEFAULT 'user')",
+    "CREATE TABLE messages (message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,"
+    " source_message_id TEXT, ordinal INTEGER NOT NULL, role TEXT NOT NULL,"
+    " content TEXT, content_length INTEGER, timestamp TEXT, model TEXT,"
+    " is_system INTEGER NOT NULL DEFAULT 0, is_sidechain INTEGER NOT NULL DEFAULT 0,"
+    " content_hash TEXT, evidence_scope TEXT NOT NULL DEFAULT 'user')",
+)
+
+
+def _make_av_source(path: Path) -> Path:
+    """最小可发布 normalized 源（1 会话 1 消息）。"""
+    con = sqlite3.connect(str(path))
+    for stmt in _AV_DDL:
+        con.execute(stmt)
+    con.execute(
+        "INSERT INTO sessions (session_id, source_session_id, agent, started_at,"
+        " ended_at, message_count, user_message_count, evidence_eligible,"
+        " evidence_scope) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("s-1", "chatgpt:guard-probe", "chatgpt", "2026-05-01T10:00:00",
+         "2026-05-01T10:05:00", 1, 1, 1, "user"))
+    con.execute(
+        "INSERT INTO messages (message_id, session_id, source_message_id,"
+        " ordinal, role, content, content_length, evidence_scope)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        ("s-1:m0", "s-1", "m0", 0, "user", "guard probe message", 18, "user"))
+    con.commit()
+    con.close()
+    return path
+
+
+def _tables(path: Path) -> list[str]:
+    con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    con.execute("PRAGMA query_only=ON")
+    try:
+        return sorted(r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"))
+    finally:
+        con.close()
+
+
+def _table_rows(path: Path, table: str) -> list[tuple]:
+    con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    con.execute("PRAGMA query_only=ON")
+    try:
+        return sorted(con.execute(f"SELECT * FROM {table}").fetchall())
+    finally:
+        con.close()
+
+
+def test_publish_guard_refuses_dest_with_foreign_tables(tmp_path, db):
+    """权威库含发布 schema 之外的表 → 拒绝发布，且库一字未动。"""
+    from personal_knowledge.application.conversation import (
+        build_canonical_agent_conversations as build,
+    )
+    dest = tmp_path / "authority.sqlite"
+    dest.write_bytes(db.read_bytes())
+    av = _make_av_source(tmp_path / "av.sqlite")
+    absent = tmp_path / "absent_legacy.sqlite"
+    events_before = _table_rows(dest, "ce_events")
+    sessions_before = _table_rows(dest, "canonical_sessions")
+    tables_before = _tables(dest)
+
+    with pytest.raises(RuntimeError, match="ce_events"):
+        build.run(False, True, av_db=av, legacy_db=absent, dest_db=dest)
+    # 同一入口的 CLI 形态（缺口家族通道 / run_pipeline 走这条）也必须中止
+    with pytest.raises(RuntimeError, match="ce_events"):
+        build.main(["--families", "chatgpt", "--write", "--av-db", str(av),
+                    "--legacy-db", str(absent), "--dest-db", str(dest)])
+
+    # 拒绝 = 权威库一字未动（白名单外的表还在，canonical 行也没被改写）
+    assert _tables(dest) == tables_before
+    assert _table_rows(dest, "ce_events") == events_before
+    assert _table_rows(dest, "canonical_sessions") == sessions_before
+    assert not (tmp_path / "authority.staging.sqlite").exists()
+    assert not (tmp_path / "authority.backup.sqlite").exists()
+
+
+def test_publish_guard_allows_fresh_and_published_dest(tmp_path):
+    """首次发布（目标库不存在）与白名单内核（前次发布产物）照常放行。"""
+    from personal_knowledge.application.conversation import (
+        build_canonical_agent_conversations as build,
+    )
+    av = _make_av_source(tmp_path / "av.sqlite")
+    absent = tmp_path / "absent_legacy.sqlite"
+    dest = tmp_path / "authority.sqlite"
+
+    assert not dest.exists()
+    assert build.run(False, True, av_db=av, legacy_db=absent, dest_db=dest) == 0
+    assert _tables(dest) == PUBLISHED_TABLES  # 发布产物 = 上述 6 张（实测）
+    assert len(_table_rows(dest, "canonical_sessions")) == 1
+
+    # 二次发布走 union 路径：目标库只有白名单内的表，守卫不得误拒
+    assert build.run(False, True, av_db=av, legacy_db=absent, dest_db=dest) == 0
+    assert _tables(dest) == PUBLISHED_TABLES
+    assert len(_table_rows(dest, "canonical_sessions")) == 1
 
 
 def test_content_merge_replaces_shifted_address(tmp_path):

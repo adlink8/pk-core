@@ -186,6 +186,15 @@ CANONICAL_SCHEMA: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
+# 发布产物表 = 发布时在 staging 里建表的表，白名单主体就是 CANONICAL_SCHEMA。
+# 实测（2026-09-24，tmp 内跑完整发布路径）：产物对象 = CANONICAL_SCHEMA 的 6 张
+# 表 + 7 个显式索引 + 6 个 sqlite_autoindex_*，没有 sqlite_sequence（无
+# AUTOINCREMENT）、没有虚拟表影子表。真实权威库另有 sqlite_sequence
+# （ce_live_slots 的 AUTOINCREMENT 记账），SQLite 内部表不构成第二套数据模型，
+# 故按前缀放行；其余任何表都在整库替换时消失，一律拒绝发布。
+PUBLISH_SCHEMA_TABLES: frozenset[str] = frozenset(CANONICAL_SCHEMA)
+_SQLITE_INTERNAL_TABLE_PREFIX = "sqlite_"
+
 CANONICAL_INDEXES = [
     ("idx_cs_agent", "canonical_sessions", "agent"),
     ("idx_cs_evidence", "canonical_sessions", "evidence_eligible"),
@@ -958,37 +967,59 @@ def _write_canonical_store(
 
 
 def _assert_publish_compatible(dest_db: Path, canonical_list: list) -> None:
-    """Fail closed when a migrated authority DB would be re-published with
-    pre-migration ids.
+    """Fail closed before the atomic whole-file replace of the authority DB.
 
-    ``uniform_id_migration`` re-keyed the whole store onto origin-derived ids
-    (``cs|<family>|<native_session_id>``, recorded by the ``id_migration_map``
-    table). This module still derives ids the old way (``cs|<hash>``), so
-    publishing into a migrated DB would recreate the dual-track state the
-    migration removed — the same native session under two ids in one table.
-    Refuse instead, and migrate this module's id derivation first.
+    发布语义是"新建 staging（只建 ``CANONICAL_SCHEMA``）+ ``os.replace`` 顶掉
+    整库"，所以目标库里其它表一律消失。两道门叠加，任一命中即拒绝：
+
+    1. **schema 门（fail-closed）**：目标库存在白名单（``PUBLISH_SCHEMA_TABLES``）
+       之外的表就拒绝。当前真实权威库同时装着 ``ce_*`` 17 张（含 112 万行
+       ``ce_events``、46.7 万行 ``ce_event_relations``）与 id 迁移产物
+       （``id_migration_map`` 61.2 万行、``id_address_policy``、
+       ``canonical_session_origins``）——旧守卫只看 id 竖线数，抓不住这些表被
+       清空。
+    2. **id 门（原守卫）**：``uniform_id_migration`` 已把全库改键为
+       origin-derived id（``cs|<family>|<native>``，记录于 ``id_migration_map``），
+       而本模块仍派生 ``cs|<hash>``；发布进去会重建迁移已消除的双轨 id
+       （同一 native session 两个 id）。迁移库在场且投影含迁移前 id 即拒绝。
+
+    报错只用库名（不打印绝对路径），且不含任何会话内容。
     """
     if not dest_db.exists():
         return
     con = sqlite3.connect(f"file:{dest_db.as_posix()}?mode=ro", uri=True)
+    con.execute("PRAGMA query_only=ON")
     try:
-        migrated = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='id_migration_map'"
-        ).fetchone() is not None
+        tables = [
+            r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        ]
     finally:
         con.close()
-    if not migrated:
-        return
+    foreign = sorted(
+        t for t in tables
+        if t not in PUBLISH_SCHEMA_TABLES
+        and not t.startswith(_SQLITE_INTERNAL_TABLE_PREFIX)
+    )
     stale = [str(c.get("canonical_session_id") or "") for c in canonical_list]
     stale = [s for s in stale if s.count("|") < 2]
-    if stale:
+    reasons: list[str] = []
+    if foreign:
+        reasons.append(
+            f"holds {len(foreign)} table(s) outside the published schema "
+            f"(a publish replaces the whole file and would drop them: "
+            f"{', '.join(foreign)})")
+    if "id_migration_map" in tables and stale:
+        reasons.append(
+            f"uses uniform origin-derived ids (id_migration_map present), but "
+            f"this build derives {len(stale)} pre-migration session ids "
+            f"(e.g. {stale[0]}); publishing would recreate the dual-track id "
+            f"state — migrate this module's id derivation to "
+            f"uniform_id_migration.make_session_id/make_message_id first")
+    if reasons:
         raise RuntimeError(
-            f"authority DB {dest_db} uses uniform origin-derived ids "
-            f"(id_migration_map present), but this build derives "
-            f"{len(stale)} pre-migration session ids (e.g. {stale[0]}). "
-            "Publishing would recreate the dual-track id state. Migrate "
-            "build_canonical_agent_conversations' id derivation to "
-            "uniform_id_migration.make_session_id/make_message_id first."
+            f"refusing to publish into authority DB {dest_db.name}: "
+            + "; ".join(reasons)
         )
 
 
