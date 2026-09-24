@@ -44,7 +44,7 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "zcode"
-ADAPTER_VERSION = "1.5.0"
+ADAPTER_VERSION = "1.6.0"
 CONTRACT_VERSION = "2"
 
 ALLOWED_TABLES: tuple[str, ...] = ("conversation_traces", "conversation_parts")
@@ -83,21 +83,9 @@ _PART_KINDS = {
 }
 
 # Round-4 audit: tool state payloads (input/output) were never extracted and
-# reasoning text was silently capped at 2048 inside ``summary``. Tool input is
-# now event content (cap 50k), tool output becomes a TOOL_RESULT event (cap
-# 100k) linked via CALL_RESULT, and reasoning text moves to content (cap 100k)
-# — truncation is flagged via a field disposition instead of being silent.
-_TOOL_INPUT_CAP = 50_000
-_TOOL_OUTPUT_CAP = 100_000
-_REASONING_CAP = 100_000
-
-
-def _capped(text: str, cap: int) -> tuple[str, bool]:
-    if len(text) <= cap:
-        return text, False
-    return text[:cap], True
-
-
+# reasoning text was silently capped at 2048 inside ``summary``. Tool input,
+# tool output and reasoning text are all event *content* (the body) and are
+# therefore never capped; only navigation summaries stay bounded.
 def _payload_text(value) -> str | None:
     """Serialize a native tool payload (dict or str) as stable text."""
     if value is None:
@@ -108,12 +96,6 @@ def _payload_text(value) -> str | None:
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     except (TypeError, ValueError):
         return str(value) or None
-
-
-def _truncation(field: str, reason: str) -> tuple[FieldDispositionRecord, ...]:
-    return (FieldDispositionRecord(
-        field_name=field, disposition=FieldDisposition.MAPPED, reason=reason,
-    ),)
 
 
 def _fidelity(**overrides) -> FidelityProfile:
@@ -375,28 +357,17 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             state = data["state"]
             tool_name = str(data["tool"]) if data.get("tool") else None
             input_text = _payload_text(state.get("input"))
-            input_disp = ()
-            if input_text is not None:
-                input_text, truncated = _capped(input_text, _TOOL_INPUT_CAP)
-                if truncated:
-                    input_disp = _truncation(
-                        "input", "tool input truncated; full text exceeds content cap")
             call_ev = _event(
                 artifact, session_id=session_id, kind=EventKind.TOOL_CALL,
                 locator=locator, native_id=part_id,
                 occurred_at=normalize_timestamp(part["time_created"]),
                 content=input_text, summary=tool_name,
-                field_dispositions=input_disp, native_session=sid,
+                native_session=sid,
             )
             events.append(call_ev)
             by_part[part_id] = call_ev
             output_text = _payload_text(state.get("output"))
             if output_text is not None:
-                output_disp = ()
-                output_text, truncated = _capped(output_text, _TOOL_OUTPUT_CAP)
-                if truncated:
-                    output_disp = _truncation(
-                        "output", "tool output truncated; full text exceeds content cap")
                 result_ev = _event(
                     artifact, session_id=session_id, kind=EventKind.TOOL_RESULT,
                     locator=f"{locator}#result", native_id=f"{part_id}:result",
@@ -404,7 +375,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                         part["time_updated"] or part["time_created"]
                     ),
                     content=output_text, summary=tool_name,
-                    field_dispositions=output_disp, native_session=sid,
+                    native_session=sid,
                 )
                 events.append(result_ev)
                 relations.append(EventRelation(
@@ -419,6 +390,16 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 role = message_roles.get(str(part["message_id"])) if live else part["role"]
                 kind = EventKind.USER_MESSAGE if role == "user" else (
                     EventKind.ASSISTANT_MESSAGE if role == "assistant" else None)
+            if kind is None and live and ptype == "timeline":
+                unknown += 1
+                ev = _timeline_event(
+                    artifact, session_id=session_id, locator=locator, part_id=part_id,
+                    occurred_at=normalize_timestamp(part["time_created"]),
+                    native_session=sid, data=data,
+                )
+                events.append(ev)
+                by_part[part_id] = ev
+                continue
             if kind is None:
                 unknown += 1
                 ev = _event(artifact, session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
@@ -442,24 +423,15 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             EventKind.SYSTEM_MESSAGE,
         }
         if kind is EventKind.REASONING:
-            # Round-4 fix: reasoning text is full-fidelity content (cap 100k,
-            # truncation dispositioned) instead of a silently capped summary.
-            content = None
-            summary = None
-            reasoning_disp = ()
-            if text is not None:
-                content, truncated = _capped(text, _REASONING_CAP)
-                if truncated:
-                    reasoning_disp = _truncation(
-                        "text", "reasoning truncated; full text exceeds content cap")
+            # Round-4 fix: reasoning text is full-fidelity content (no cap)
+            # instead of a silently capped summary.
             ev = _event(
                 artifact, session_id=session_id, kind=kind, locator=locator,
                 native_id=part["id"] if live else part["part_id"],
                 occurred_at=normalize_timestamp(
                     part["time_created"] if live else part["created_at"]
                 ),
-                content=content, summary=summary,
-                field_dispositions=reasoning_disp, native_session=sid,
+                content=text, summary=None, native_session=sid,
             )
         else:
             ev = _event(
@@ -468,7 +440,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 occurred_at=normalize_timestamp(
                     part["time_created"] if live else part["created_at"]
                 ),
-                content=text if is_message else None,
+                content=text,
                 summary=None if is_message else (text[:2048] or None if text else None),
                 native_session=sid,
             )
@@ -579,3 +551,76 @@ def _json_object(value) -> dict:
     except ValueError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _add_timeline_text(pieces: list[str], value) -> None:
+    """Keep human text. UI sentinels and bare identifiers are not prose."""
+    if not isinstance(value, str):
+        return
+    text = value.strip()
+    if not text or text in {"separator", "completed", "failed", "interrupted"}:
+        return
+    if text not in pieces:
+        pieces.append(text)
+
+
+def _timeline_body(data: dict) -> str | None:
+    """Text carried by a live ``type=timeline`` part, or None when it has none.
+
+    ``display`` is a UI mode (``separator``), and fork/model ids are locators.
+    Prose lives in ``reason`` / ``text`` / verification text; a model change's
+    readable token is the model id or label.
+    """
+    pieces: list[str] = []
+    _add_timeline_text(pieces, data.get("text"))
+    _add_timeline_text(pieces, data.get("reason"))
+    _add_timeline_text(pieces, data.get("summary"))
+    verification = data.get("verification")
+    if isinstance(verification, dict):
+        _add_timeline_text(pieces, verification.get("reason"))
+        _add_timeline_text(pieces, verification.get("nextAction"))
+    for key in ("toModel", "fromModel"):
+        model = data.get(key)
+        if isinstance(model, dict):
+            _add_timeline_text(pieces, model.get("label"))
+            _add_timeline_text(pieces, model.get("modelID"))
+            _add_timeline_text(pieces, model.get("modelId"))
+    for key in ("toModelSelection", "fromModelSelection"):
+        model = data.get(key)
+        if isinstance(model, dict):
+            _add_timeline_text(pieces, model.get("label"))
+            _add_timeline_text(pieces, model.get("modelId"))
+    _add_timeline_text(pieces, data.get("compactReason"))
+    return "\n".join(pieces) if pieces else None
+
+
+def _timeline_event(artifact, *, session_id, locator, part_id, occurred_at, native_session, data):
+    """One timeline part becomes one explained event. Never a bare unknown."""
+    subtype = str(data.get("timelineType") or "")
+    body = _timeline_body(data)
+    reason = f"data.type=timeline subtype={subtype}"
+    if body is None:
+        reason += " has no text"
+    dispositions: tuple[FieldDispositionRecord, ...] = (FieldDispositionRecord(
+        field_name="data.type",
+        disposition=FieldDisposition.MAPPED if body else FieldDisposition.UNAVAILABLE,
+        reason=reason,
+    ),)
+    content = None
+    summary = None
+    if body is not None:
+        content = body
+        summary = body[:2048] or None
+    return _event(
+        artifact, session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
+        locator=locator, native_id=part_id, occurred_at=occurred_at,
+        content=content, summary=summary,
+        fidelity=_fidelity(
+            STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
+            RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
+            CONTENT_AVAILABILITY=(
+                FidelityLevel.COMPLETE if body else FidelityLevel.PARTIAL
+            ),
+        ),
+        field_dispositions=dispositions, native_session=native_session,
+    )

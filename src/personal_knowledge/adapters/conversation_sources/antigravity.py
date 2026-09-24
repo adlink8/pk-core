@@ -50,7 +50,7 @@ FAMILY = "antigravity"
 # 1.2.1 also recovers NUL-padded UTF-16 tool output, reads the ``f140/f1``
 # tool-execution annotations, and keeps annotation-only executions as events
 # rather than dropping them.
-ADAPTER_VERSION = "1.2.1"
+ADAPTER_VERSION = "1.3.0"
 CONTRACT_VERSION = "2"
 
 ALLOWED_TABLES: tuple[str, ...] = ("trajectories", "steps", "subtrajectories")
@@ -139,6 +139,16 @@ def _provenance(artifact: SourceArtifact, locator: str, *, session: str | None, 
     )
 
 
+def _row_value(row: sqlite3.Row, column: str):
+    """Column value, or None when the captured artifact lacks the column.
+
+    A store captured under a drifted schema can miss ``created_at``; indexing
+    ``sqlite3.Row`` blindly would abort the whole adaptation with IndexError,
+    so absence is reported to the caller (which warns) instead.
+    """
+    return row[column] if column in row.keys() else None
+
+
 def _event(artifact, *, session_id, kind, locator, native_id=None, occurred_at=None,
            content=None, summary=None, fidelity=None, native_session=None) -> TypedEvent:
     return TypedEvent(
@@ -184,22 +194,30 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     by_step: dict[str, TypedEvent] = {}
     by_trajectory: dict[str, str] = {}
     unknown = 0
+    steps_missing_created_at = 0
+    subs_missing_created_at = 0
 
     for trajectory in trajectories:
         sid = str(trajectory["id"])
         session_id = make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION,
                                    sid, kind=EventKind.SESSION_LIFECYCLE)
         by_trajectory[sid] = session_id
+        created_at = _row_value(trajectory, "created_at")
+        if created_at is None:
+            warnings.append(
+                f"trajectory {sid!r} carries no created_at column; session "
+                "started_at/ended_at and lifecycle occurred_at left empty"
+            )
         sessions.append(AdaptedSession(
             session_id=session_id,
             provenance=_provenance(artifact, f"{artifact.relative_path}#trajectory:{sid}",
                                    session=sid, native_id=sid),
-            fidelity=_fidelity(), native_session_id=sid, started_at=trajectory["created_at"],
+            fidelity=_fidelity(), native_session_id=sid, started_at=created_at,
             title=str(trajectory["name"])[:256] if trajectory["name"] else None,
         ))
         events.append(_event(artifact, session_id=session_id, kind=EventKind.SESSION_LIFECYCLE,
                              locator=f"{artifact.relative_path}#trajectory:{sid}", native_id=sid,
-                             occurred_at=trajectory["created_at"],
+                             occurred_at=created_at,
                              summary=str(trajectory["name"] or "")[:256] or None, native_session=sid))
 
     for step in steps:
@@ -210,10 +228,13 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             continue
         kind = _STEP_KINDS.get(step["kind"])
         locator = f"{artifact.relative_path}#step:{step['id']}"
+        step_created_at = _row_value(step, "created_at")
+        if step_created_at is None:
+            steps_missing_created_at += 1
         if kind is None:
             unknown += 1
             ev = _event(artifact, session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
-                        locator=locator, native_id=step["id"], occurred_at=step["created_at"],
+                        locator=locator, native_id=step["id"], occurred_at=step_created_at,
                         fidelity=_fidelity(STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
                                            RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
                                            CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
@@ -225,8 +246,8 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         exact_content = None if source_content is None else str(source_content)
         is_message = kind in (EventKind.USER_MESSAGE, EventKind.ASSISTANT_MESSAGE)
         ev = _event(artifact, session_id=session_id, kind=kind, locator=locator,
-                    native_id=step["id"], occurred_at=step["created_at"],
-                    content=exact_content if is_message else None,
+                    native_id=step["id"], occurred_at=step_created_at,
+                    content=exact_content,
                     summary=None if is_message else (exact_content[:2048] or None)
                     if exact_content is not None else None,
                     native_session=sid)
@@ -241,7 +262,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             events.append(_event(
                 artifact, session_id=session_id, kind=EventKind.USAGE,
                 locator=f"{locator}#usage", native_id=f"{step['id']}:usage",
-                occurred_at=step["created_at"], summary=usage_summary,
+                occurred_at=step_created_at, summary=usage_summary,
                 native_session=sid,
             ))
 
@@ -251,10 +272,15 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         if parent is None:
             warnings.append(f"subtrajectory {sub['id']!r} references unknown step {sub['step_id']!r}")
             continue
+        sub_created_at = _row_value(sub, "created_at")
+        if sub_created_at is None:
+            subs_missing_created_at += 1
+        sub_body = str(sub["content"] or "") or None
         ev = _event(artifact, session_id=parent.session_id, kind=EventKind.SUBAGENT_BOUNDARY,
                     locator=f"{artifact.relative_path}#subtrajectory:{sub['id']}",
-                    native_id=sub["id"], occurred_at=sub["created_at"],
-                    summary=str(sub["content"] or "")[:2048] or None,
+                    native_id=sub["id"], occurred_at=sub_created_at,
+                    content=sub_body,
+                    summary=sub_body[:2048] if sub_body else None,
                     native_session=parent.provenance.native_session_id)
         events.append(ev)
         relations.append(EventRelation(
@@ -282,6 +308,16 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
 
     if unknown:
         warnings.append(f"{unknown} unknown step kind(s) preserved")
+    if steps_missing_created_at:
+        warnings.append(
+            f"{steps_missing_created_at} step(s) carry no created_at column; "
+            "their event timestamps were left empty"
+        )
+    if subs_missing_created_at:
+        warnings.append(
+            f"{subs_missing_created_at} subtrajectory step(s) carry no "
+            "created_at column; their event timestamps were left empty"
+        )
 
     return AdaptationResult(
         family=FAMILY, adapter_version=ADAPTER_VERSION, contract_version=CONTRACT_VERSION,
@@ -389,6 +425,31 @@ def _adapt_live_store(
                 protobuf_steps += 1
                 if not step_decode.parts:
                     empty_steps += 1
+                    native = f"{anchor_native}:step:{idx}"
+                    events.append(TypedEvent(
+                        event_id=make_event_id(
+                            FAMILY, artifact.artifact_id, CONTRACT_VERSION,
+                            native, kind=EventKind.UNKNOWN_NATIVE,
+                            session_id=anchor_session,
+                        ),
+                        session_id=anchor_session, kind=EventKind.UNKNOWN_NATIVE,
+                        provenance=_provenance(
+                            artifact, step_locator, session=anchor_native,
+                            native_id=native,
+                        ),
+                        fidelity=partial,
+                        field_dispositions=(
+                            FieldDispositionRecord(
+                                "step_payload",
+                                FieldDisposition.UNAVAILABLE,
+                                f"step_type={int(step['step_type'])} 空 part "
+                                "未静默丢弃；protobuf step 没有可恢复正文",
+                            ),
+                        ),
+                        ordinal=idx,
+                        native_payload_ref=f"{artifact.artifact_id}:{step_locator}",
+                        summary=f"{origin};empty parts",
+                    ))
                     continue
                 decoded_steps += 1
                 seen_keys: dict[str, int] = {}
@@ -421,7 +482,9 @@ def _adapt_live_store(
                         fidelity=_decoded_fidelity(),
                         occurred_at=_iso_utc(step_decode.epoch),
                         ordinal=idx,
-                        content=part.text,
+                        content=(
+                            part.text if part.text is not None else part.fallback_text
+                        ),
                         summary=part.summary,
                         field_dispositions=part.dispositions,
                         native_payload_ref=f"{artifact.artifact_id}:{step_locator}",
@@ -494,7 +557,7 @@ def _adapt_live_store(
     if empty_steps:
         warnings.append(
             f"{empty_steps} protobuf step payload(s) carried no recoverable "
-            "transcript content and produced no event"
+            "transcript content; kept as events with step_type in the reason"
         )
     if annotation_only_results:
         warnings.append(
@@ -545,18 +608,38 @@ def _adapt_live_store(
         ),
         COMPACTION_VISIBILITY=FidelityLevel.COMPLETE,
     )
-    sessions = tuple(
-        AdaptedSession(
+    # Session time bounds: the live trajectory_meta table carries no time
+    # column, and the step protobuf payload is the only time source, so each
+    # session's span is the min/max occurred_at of its own decoded events.
+    # Events are collected before sessions are built, hence the per-session
+    # aggregation here. Sessions without any timed event keep None.
+    timed_by_session: dict[str, list[str]] = {}
+    for event in events:
+        if event.occurred_at:
+            timed_by_session.setdefault(event.session_id, []).append(event.occurred_at)
+    sessions: list[AdaptedSession] = []
+    for session_id, provenance, native_session in session_specs:
+        stamps = timed_by_session.get(session_id)
+        sessions.append(AdaptedSession(
             session_id=session_id, provenance=provenance,
             fidelity=session_fidelity, native_session_id=native_session,
+            started_at=min(stamps) if stamps else None,
+            ended_at=max(stamps) if stamps else None,
+        ))
+    untimed = [
+        native for sid, _, native in session_specs if not timed_by_session.get(sid)
+    ]
+    if untimed:
+        warnings.append(
+            f"{len(untimed)} session(s) have no event carrying a timestamp; "
+            "started_at/ended_at left empty (live trajectory_meta has no time "
+            "column and no step payload decoded a time)"
         )
-        for session_id, provenance, native_session in session_specs
-    )
 
     return AdaptationResult(
         family=FAMILY, adapter_version=ADAPTER_VERSION,
         contract_version=CONTRACT_VERSION, artifacts=(artifact,),
-        sessions=sessions, events=tuple(events),
+        sessions=tuple(sessions), events=tuple(events),
         relations=tuple(relations),
         fidelity=session_fidelity,
         warnings=tuple(warnings),
@@ -576,6 +659,9 @@ class _Part(NamedTuple):
     Kept separate from ``native`` because the native id must stay unique per
     event while the call id is deliberately shared across the call and result.
     """
+    fallback_text: str | None = None
+    """Body to use as event content when ``text`` is absent (annotation-only
+    tool results, whose rendered annotations are the surviving native body)."""
 
 
 class _StepDecode(NamedTuple):
@@ -650,8 +736,14 @@ def _annotations(node: PbMessage) -> list[tuple[str, str]]:
 
 def _render_annotations(
     pairs: list[tuple[str, str]], *, keys: tuple[str, ...] | None = None,
+    bounded: bool = True,
 ) -> str | None:
-    """Render annotation pairs as ``key=value`` text, bounded in length."""
+    """Render annotation pairs as ``key=value`` text.
+
+    Bounded by default: these are narrative labels when the tool result text
+    itself is present. With ``bounded=False`` the values are rendered verbatim
+    (the annotations are then the only surviving body and are event content).
+    """
     chosen = [
         (key, value) for key, value in pairs
         if keys is None or key in keys
@@ -663,11 +755,11 @@ def _render_annotations(
         if not value:
             rendered.append(key)
             continue
-        if len(value) > _ANNOTATION_VALUE_LIMIT:
+        if bounded and len(value) > _ANNOTATION_VALUE_LIMIT:
             value = value[:_ANNOTATION_VALUE_LIMIT] + "…"
         rendered.append(f"{key}={value}")
     summary = " | ".join(rendered)
-    if len(summary) > _ANNOTATION_SUMMARY_LIMIT:
+    if bounded and len(summary) > _ANNOTATION_SUMMARY_LIMIT:
         summary = summary[:_ANNOTATION_SUMMARY_LIMIT] + "…"
     return summary
 
@@ -833,7 +925,11 @@ def _decode_live_step(step_type: int, payload: bytes) -> _StepDecode | None:
                     annotations, keys=_ANNOTATION_LABEL_KEYS,
                 )
                 dispositions: tuple = ()
+                annotations_body = None
             else:
+                # The annotations are the only surviving native body: carry
+                # them verbatim in content, with a bounded rendering as label.
+                annotations_body = _render_annotations(annotations, bounded=False)
                 summary = _render_annotations(annotations)
                 dispositions = _ANNOTATIONS_REFERENCE_ONLY
                 if summary is None and result_node is not None:
@@ -846,6 +942,7 @@ def _decode_live_step(step_type: int, payload: bytes) -> _StepDecode | None:
                 role="tool_result", text=text, summary=summary,
                 native=f"call:{call_id}:result" if call_id else None,
                 link=call_id, dispositions=dispositions,
+                fallback_text=annotations_body,
             ))
             break
 
@@ -860,7 +957,15 @@ def _decode_live_step(step_type: int, payload: bytes) -> _StepDecode | None:
             code = error.integer(7)
             if code:
                 summary += f" (http {code})"
-            parts.append(_Part(role="error", summary=summary))
+            parts.append(_Part(
+                role="error",
+                summary=summary,
+                dispositions=(FieldDispositionRecord(
+                    "step_payload.f24.f3",
+                    FieldDisposition.MAPPED,
+                    "step_type=17 执行错误",
+                ),),
+            ))
             break
 
     elif step_type == 23:
@@ -984,7 +1089,7 @@ def _emit_json_step(
                 ),
             ),
             ordinal=idx,
-            content=text if (is_message and text is not None) else None,
+            content=text,
             summary=(
                 None if (is_message and text is not None)
                 else (text[:2048] or None if text is not None else origin)

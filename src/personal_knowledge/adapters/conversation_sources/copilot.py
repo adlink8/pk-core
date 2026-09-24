@@ -40,22 +40,14 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "copilot"
-ADAPTER_VERSION = "1.2.0"
+ADAPTER_VERSION = "1.3.0"
 CONTRACT_VERSION = "2"
 
 # Round-4 audit fix: tool arguments/results were never stored as event content
 # (name-only summaries), and sessions without session.info/model_change lost
 # the model that tool.execution_complete records still carry.
-_TOOL_INPUT_CAP = 50_000
-_TOOL_OUTPUT_CAP = 100_000
-
-
-def _capped(text: str, cap: int, field: str, reason: str) -> tuple[str, tuple]:
-    if len(text) <= cap:
-        return text, ()
-    return text[:cap], (FieldDispositionRecord(
-        field_name=field, disposition=FieldDisposition.MAPPED, reason=reason,
-    ),)
+# Tool input/output are event *content* (the body), so they are never capped;
+# only navigation summaries stay bounded.
 
 
 def _payload_str(value) -> str | None:
@@ -71,16 +63,12 @@ def _payload_str(value) -> str | None:
 
 
 def _tool_content(data: dict, kind) -> tuple[str | None, tuple]:
-    """Full tool arguments (TOOL_CALL) or result text (TOOL_RESULT), capped."""
+    """Full tool arguments (TOOL_CALL) or result text (TOOL_RESULT), uncapped."""
     if kind is EventKind.TOOL_CALL:
         raw = data.get("arguments")
         if raw is None:
             raw = data.get("args")
-        text = _payload_str(raw)
-        if text is None:
-            return None, ()
-        return _capped(text, _TOOL_INPUT_CAP, "arguments",
-                       "tool input truncated; full text exceeds content cap")
+        return _payload_str(raw), ()
     if kind is EventKind.TOOL_RESULT:
         raw = data.get("result")
         if isinstance(raw, dict):
@@ -88,11 +76,7 @@ def _tool_content(data: dict, kind) -> tuple[str | None, tuple]:
                      else raw.get("content"))
             if inner is not None:
                 raw = inner
-        text = _payload_str(raw)
-        if text is None:
-            return None, ()
-        return _capped(text, _TOOL_OUTPUT_CAP, "result",
-                       "tool output truncated; full text exceeds content cap")
+        return _payload_str(raw), ()
     return None, ()
 
 _COMPLETE = {
@@ -117,6 +101,7 @@ _KINDS = {
     "session.shutdown": EventKind.SESSION_LIFECYCLE,
     "session.info": EventKind.SESSION_LIFECYCLE,
     "session.model_change": EventKind.SESSION_LIFECYCLE,
+    "session.compaction": EventKind.COMPACTION_SUMMARY,
     "session.compaction_start": EventKind.COMPACTION_SUMMARY,
     "session.compaction_complete": EventKind.COMPACTION_SUMMARY,
     "user.message": EventKind.USER_MESSAGE,
@@ -146,6 +131,7 @@ def capability() -> CapabilityDescriptor:
         supported_event_kinds=(
             EventKind.SESSION_LIFECYCLE, EventKind.TURN_BOUNDARY,
             EventKind.ASSISTANT_MESSAGE, EventKind.USER_MESSAGE,
+            EventKind.SYSTEM_MESSAGE, EventKind.REASONING,
             EventKind.TOOL_CALL, EventKind.TOOL_RESULT,
             EventKind.COMPACTION_SUMMARY, EventKind.SUBAGENT_BOUNDARY,
             EventKind.USAGE, EventKind.UNKNOWN_NATIVE,
@@ -239,6 +225,82 @@ def _usage_summary(data: dict) -> str | None:
     )
 
 
+# Control records that used to land as bare unknown_native. Text lives in
+# content, message, or reason; a body-less record still names its type.
+_CONTROL_KINDS = {
+    "abort": EventKind.TURN_BOUNDARY,
+    "system.notification": EventKind.SYSTEM_MESSAGE,
+    "system.message": EventKind.SYSTEM_MESSAGE,
+    "session.error": EventKind.SESSION_LIFECYCLE,
+    "session.truncation": EventKind.SESSION_LIFECYCLE,
+}
+
+
+def _named_body(data: dict) -> str | None:
+    """First non-empty content, message, or reason string on a native record."""
+    for key in ("content", "message", "reason"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _explained_unmapped(record: dict, data: dict, artifact, *, session_id, locator,
+                        occurred_at, native_session) -> TypedEvent:
+    """Keep an unmapped record, but never as an unexplained unknown_native."""
+    rtype = str(record.get("type") or "record")
+    text = _named_body(data)
+    kind = _CONTROL_KINDS.get(rtype, EventKind.UNKNOWN_NATIVE)
+    if text:
+        disposition = FieldDisposition.MAPPED
+        reason = f"native record type {rtype}"
+        fidelity = _fidelity()
+    else:
+        disposition = FieldDisposition.UNAVAILABLE
+        reason = f"native record type {rtype} has no content, message, or reason"
+        fidelity = _fidelity(CONTENT_AVAILABILITY=FidelityLevel.UNAVAILABLE)
+    if kind is EventKind.UNKNOWN_NATIVE:
+        fidelity = _fidelity(
+            STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
+            RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
+            CONTENT_AVAILABILITY=(
+                FidelityLevel.PARTIAL if text else FidelityLevel.UNAVAILABLE
+            ),
+        )
+    return _event(
+        artifact, session_id=session_id, kind=kind, locator=locator,
+        native_id=record.get("id"), occurred_at=occurred_at,
+        content=text, summary=text[:2048] if text else None,
+        fidelity=fidelity, native_session=native_session,
+        field_dispositions=(FieldDispositionRecord(
+            "type", disposition, reason,
+        ),),
+    )
+
+
+def _reasoning_event(record: dict, artifact, *, session_id, locator) -> TypedEvent | None:
+    """assistant.message reasoningText is its own event so it is not dropped."""
+    if record.get("type") != "assistant.message":
+        return None
+    data = record.get("data") if isinstance(record.get("data"), dict) else {}
+    text = data.get("reasoningText")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    sid = record.get("session_id") or data.get("sessionId")
+    native_id = record.get("id") or data.get("messageId")
+    return _event(
+        artifact, session_id=session_id, kind=EventKind.REASONING,
+        locator=f"{locator}#reasoning",
+        native_id=f"{native_id}#reasoning" if native_id else None,
+        occurred_at=record.get("timestamp"), content=text, summary=text[:2048],
+        native_session=sid,
+        field_dispositions=(FieldDispositionRecord(
+            "reasoningText", FieldDisposition.MAPPED,
+            "assistant.message reasoningText mapped to reasoning content",
+        ),),
+    )
+
+
 def _adapt_record(record: dict, artifact, *, session_id, locator) -> TypedEvent | None:
     kind = _KINDS.get(record.get("type"))
     ts = record.get("timestamp")
@@ -251,13 +313,11 @@ def _adapt_record(record: dict, artifact, *, session_id, locator) -> TypedEvent 
         or record.get("turn_id") or data.get("interactionId")
         or data.get("agentName")
     )
-    if kind is None:
-        return _event(artifact, session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
-                      locator=locator, native_id=record.get("id"), occurred_at=ts,
-                      fidelity=_fidelity(STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
-                                         RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
-                                         CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
-                      native_session=sid)
+    if kind is None or record.get("type") in _CONTROL_KINDS:
+        return _explained_unmapped(
+            record, data, artifact, session_id=session_id, locator=locator,
+            occurred_at=ts, native_session=sid,
+        )
     tool_id = (
         record.get("tool_id")
         or data.get("toolId")
@@ -299,12 +359,16 @@ def _adapt_record(record: dict, artifact, *, session_id, locator) -> TypedEvent 
             native_session=sid,
         )
     if kind is EventKind.COMPACTION_SUMMARY:
-        # carry any compaction summary text; a bare start/end marker uses the
-        # native event id as a stable, name-only summary.
+        # summaryContent is the vscode-copilot field; summary is the older alias.
+        # A bare start/end marker still uses the native event id as its summary.
+        raw_summary = data.get("summaryContent")
+        if raw_summary is None:
+            raw_summary = data.get("summary")
+        text = None if raw_summary is None else str(raw_summary).strip() or None
         return _event(
             artifact, session_id=session_id, kind=kind, locator=locator,
-            native_id=native_id, occurred_at=ts, content=None,
-            summary=str(data.get("summary") or native_id or "")[:2048] or None,
+            native_id=native_id, occurred_at=ts, content=text,
+            summary=(text or str(native_id or ""))[:2048] or None,
             native_session=sid,
         )
     if kind is EventKind.TURN_BOUNDARY:
@@ -360,11 +424,16 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     ), Path(artifact.relative_path).stem)
 
     for lineno, record in enumerate(records, start=1):
-        ev = _adapt_record(record, artifact, session_id=session_id,
-                           locator=f"{artifact.relative_path}#L{lineno}")
+        locator = f"{artifact.relative_path}#L{lineno}"
+        ev = _adapt_record(record, artifact, session_id=session_id, locator=locator)
         if ev is None:
             continue
         events.append(ev)
+        reasoning = _reasoning_event(
+            record, artifact, session_id=session_id, locator=locator,
+        )
+        if reasoning is not None:
+            events.append(reasoning)
         data = record.get("data") if isinstance(record.get("data"), dict) else {}
         tool_id = (
             record.get("tool_id") or data.get("toolId") or data.get("toolCallId")

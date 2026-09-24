@@ -40,24 +40,13 @@ from personal_knowledge.core.conversation_events import (
     make_event_id,
 )
 
-ADAPTER_VERSION = "1.3.0"
+ADAPTER_VERSION = "1.4.0"
 
 # Round-4 audit fix: tool/reasoning payloads (kimi wire loop events and
 # workbuddy flat records) were classified but never carried as event content.
-# They are now full-fidelity content with explicit caps; truncation is flagged
-# via a field disposition instead of being silent.
-_TOOL_INPUT_CAP = 50_000
-_TOOL_OUTPUT_CAP = 100_000
-_REASONING_CAP = 100_000
-_UNKNOWN_CAP = 10_000
-
-
-def _capped(text: str, cap: int, field: str, reason: str) -> tuple[str, tuple]:
-    if len(text) <= cap:
-        return text, ()
-    return text[:cap], (FieldDispositionRecord(
-        field_name=field, disposition=FieldDisposition.MAPPED, reason=reason,
-    ),)
+# Tool input/output, reasoning and unmodelled native records are event
+# *content* (the body), so none of them is capped; only navigation summaries
+# stay bounded.
 
 
 def _payload_str(value) -> str | None:
@@ -147,7 +136,7 @@ def _envelope(record):
 
 
 def _spliced_text(payload: dict) -> str | None:
-    """Bounded text of a context.spliced payload (its messages array)."""
+    """Full text of a context.spliced payload (its messages array)."""
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return None
@@ -164,7 +153,7 @@ def _spliced_text(payload: dict) -> str | None:
         if text:
             parts.append(f"{role}: {text}" if role else text)
     joined = "\n".join(parts)
-    return joined[:2048] or None
+    return joined or None
 
 
 
@@ -238,6 +227,40 @@ def _text_blocks(value) -> str | None:
         if saw_text:
             return "\n".join(parts)
     return None
+
+
+def _disposition(field: str, reason: str, *, mapped: bool = False) -> FieldDispositionRecord:
+    return FieldDispositionRecord(
+        field_name=field,
+        disposition=FieldDisposition.MAPPED if mapped else FieldDisposition.UNAVAILABLE,
+        reason=reason,
+    )
+
+
+def _workbuddy_title_text(record: dict) -> str | None:
+    """Title carried by ai-title / custom-title / session-meta, if any."""
+    for key in ("aiTitle", "customTitle", "title"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    meta = record.get("meta")
+    if isinstance(meta, dict):
+        for key in ("title", "aiTitle", "customTitle"):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
+
+
+def _payload_has_prose(payload: dict) -> bool:
+    """True when an envelope payload actually carries message text."""
+    for key in ("prompt", "text", "content", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if _text_blocks(value):
+            return True
+    return False
 
 
 def _extract_model(record: dict) -> str | None:
@@ -462,6 +485,8 @@ class _Family:
             if rtype == "file-history-snapshot":
                 # ambient file/context event, not a user/assistant message
                 return EventKind.FILE_CONTEXT
+            if rtype in ("ai-title", "custom-title", "session-meta"):
+                return EventKind.UNKNOWN_NATIVE
             return _WORKBUDDY_KINDS.get(rtype)
         if _envelope(record) is not None:
             return self._record_kind_envelope(record)
@@ -543,9 +568,7 @@ class _Family:
             summary = str(payload.get("name") or payload.get("description") or "")[:2048] or None
             args_text = _payload_str(payload.get("args") or payload.get("arguments"))
             if args_text is not None:
-                content, content_disp = _capped(
-                    args_text, _TOOL_INPUT_CAP, "args",
-                    "tool input truncated; full text exceeds content cap")
+                content = args_text
         elif kind is EventKind.TOOL_RESULT:
             summary = str(payload.get("output") or "")[:2048] or None
             output_raw = payload.get("output")
@@ -554,11 +577,11 @@ class _Family:
                               else output_raw.get("output"))
             output_text = _payload_str(output_raw)
             if output_text is not None:
-                content, content_disp = _capped(
-                    output_text, _TOOL_OUTPUT_CAP, "output",
-                    "tool output truncated; full text exceeds content cap")
+                content = output_text
         elif etype == "context.spliced":
-            summary = _spliced_text(payload)
+            spliced = _spliced_text(payload)
+            content = spliced
+            summary = spliced[:2048] if spliced else None
         elif kind is EventKind.SUBAGENT_BOUNDARY:
             summary = str(payload.get("subagentId") or "")[:2048] or None
         elif kind is EventKind.COMPACTION_SUMMARY:
@@ -568,19 +591,49 @@ class _Family:
                 summary = None
         elif etype == "error":
             summary = str(payload.get("message") or "")[:2048] or None
-        elif etype in ("turn.started", "turn.ended"):
-            pass
+        elif etype == "turn.started":
+            prompt = payload.get("prompt")
+            if isinstance(prompt, str) and prompt.strip():
+                kind = EventKind.USER_MESSAGE
+                content = prompt
+                content_disp = content_disp + (_disposition(
+                    "payload.prompt",
+                    "用户正文来源字段 payload.prompt",
+                    mapped=True,
+                ),)
+        elif etype == "turn.ended":
+            # Envelope journals do not carry the assistant body; wire.jsonl does.
+            content_disp = content_disp + (_disposition(
+                "assistant",
+                "助手正文在同会话 wire.jsonl，本文件没有",
+            ),)
         elif "task." in (etype or "") and "taskId" in payload:
             summary = str(payload.get("description") or payload.get("taskId"))[:2048] or None
+
+        if etype == "prompt.completed" and not _payload_has_prose(payload):
+            if set(payload) <= {"promptId"}:
+                prompt_reason = "prompt.completed 没有正文，payload 只有 promptId"
+            else:
+                prompt_reason = "prompt.completed 没有正文，文本标识只有 promptId"
+            content_disp = content_disp + (
+                _disposition("promptId", prompt_reason),
+                _disposition("assistant", "助手正文在同会话 wire.jsonl，本文件没有"),
+            )
+        if kind is EventKind.UNKNOWN_NATIVE:
+            content_disp = content_disp + (_disposition(
+                "envelope.type",
+                f"原生 envelope.type={etype}",
+            ),)
 
         if kind is None:
             unknown_text = _payload_str(payload if payload else env)
             unknown_content = None
-            unknown_disp = ()
+            unknown_disp = (_disposition(
+                "envelope.type",
+                f"原生 envelope.type={etype}",
+            ),)
             if unknown_text is not None:
-                unknown_content, unknown_disp = _capped(
-                    unknown_text, _UNKNOWN_CAP, "payload",
-                    "unknown native record truncated; bounded preservation")
+                unknown_content = unknown_text
             return self._event(
                 artifact, session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
                 locator=locator, native_id=native_id, occurred_at=ts,
@@ -614,13 +667,15 @@ class _Family:
             or nested.get("id") or nested.get("call_id") or nested.get("callId")
         )
         if kind is None:
+            rtype = record.get("type") or record.get("kind") or "unknown"
             unknown_text = _payload_str(record)
             unknown_content = None
-            unknown_disp = ()
+            unknown_disp = (_disposition(
+                "type",
+                f"原生 type={rtype}，没有可映射正文",
+            ),)
             if unknown_text is not None:
-                unknown_content, unknown_disp = _capped(
-                    unknown_text, _UNKNOWN_CAP, "record",
-                    "unknown native record truncated; bounded preservation")
+                unknown_content = unknown_text
             return self._event(artifact, session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
                                locator=locator, native_id=mid, occurred_at=ts,
                                content=unknown_content,
@@ -643,9 +698,7 @@ class _Family:
                 raw = nested.get("arguments")
             args_text = _payload_str(raw)
             if args_text is not None:
-                native_content, native_disp = _capped(
-                    args_text, _TOOL_INPUT_CAP, "args",
-                    "tool input truncated; full text exceeds content cap")
+                native_content = args_text
         elif kind is EventKind.TOOL_RESULT:
             raw = nested.get("result")
             if raw is None:
@@ -657,9 +710,7 @@ class _Family:
                     raw = inner
             result_text = _payload_str(raw)
             if result_text is not None:
-                native_content, native_disp = _capped(
-                    result_text, _TOOL_OUTPUT_CAP, "output",
-                    "tool output truncated; full text exceeds content cap")
+                native_content = result_text
         elif kind is EventKind.REASONING:
             raw = part.get("think")
             if raw is None:
@@ -668,17 +719,13 @@ class _Family:
             if think_text is None:
                 think_text = _payload_str(raw)
             if think_text is not None:
-                native_content, native_disp = _capped(
-                    think_text, _REASONING_CAP, "rawContent",
-                    "reasoning truncated; full text exceeds content cap")
+                native_content = think_text
         elif kind is None or kind is EventKind.UNKNOWN_NATIVE:
             # Preserve unmodelled native records (kimi server journal events)
             # as bounded content instead of dropping the payload entirely.
             unknown_text = _payload_str(record)
             if unknown_text is not None:
-                native_content, native_disp = _capped(
-                    unknown_text, _UNKNOWN_CAP, "record",
-                    "unknown native record truncated; bounded preservation")
+                native_content = unknown_text
         summary = str(record.get("result") or "")[:2048] or None
         if summary is None:
             summary = _text_blocks(record.get("content"))
@@ -725,11 +772,31 @@ class _Family:
             if content is None:
                 content = _text_blocks(part.get("text"))
             if content is None and isinstance(record.get("text"), str):
-                content = record["text"][:2048]
+                content = record["text"]
             if content is None:
                 content = summary
         elif native_content is not None:
             content = native_content
+        elif isinstance(nested.get("text"), str) and nested["text"]:
+            # nested text used to live only in a 2048-char summary
+            content = nested["text"]
+        if record.get("type") == "turn.steer":
+            steer_text = _text_blocks(record.get("input"))
+            if steer_text:
+                content = steer_text
+        if self.family == "workbuddy" and record.get("type") in (
+            "ai-title", "custom-title", "session-meta",
+        ):
+            rtype = str(record.get("type"))
+            title_text = _workbuddy_title_text(record)
+            native_disp = tuple(native_disp) + (_disposition(
+                "type",
+                f"原生 type={rtype}",
+                mapped=bool(title_text),
+            ),)
+            if title_text:
+                summary = title_text
+                content = title_text
         return self._event(
             artifact, session_id=session_id, kind=kind, locator=locator,
             native_id=mid, occurred_at=ts,

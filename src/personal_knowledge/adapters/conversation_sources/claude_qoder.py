@@ -25,6 +25,9 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
 from personal_knowledge.adapters.conversation_sources.jsonl_stream import (
     iter_jsonl_lines,
 )
+from personal_knowledge.adapters.conversation_sources.time_utils import (
+    normalize_timestamp,
+)
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
     EventContractError,
@@ -41,27 +44,14 @@ from personal_knowledge.core.conversation_events import (
     make_event_id,
 )
 
-ADAPTER_VERSION = "1.4.0"
+ADAPTER_VERSION = "1.5.0"
 
-# Round-4 fix: attachment payloads are projected as bounded event content.
-_ATTACHMENT_CAP = 50_000
 CONTRACT_VERSION = "2"
 
-# P1-F4 content-fidelity limits for tool blocks.
-# tool_result carries the full native output into ``content`` up to a high
-# bound; tool_call carries its JSON-serialised input parameters. When the
-# native value exceeds a limit the tail is dropped and the loss is declared
-# through CONTENT_AVAILABILITY=partial plus a REDACTED field disposition, so
-# truncation is never silent. ``summary`` always stays a bounded synopsis.
-_TOOL_RESULT_CONTENT_LIMIT = 100_000
-_TOOL_CALL_INPUT_LIMIT = 50_000
+# P1-F4 content-fidelity: tool_call input, tool_result output and reasoning
+# text are all event *content* (the body) and are therefore never capped.
+# Only ``summary`` stays a bounded synopsis (_TOOL_SUMMARY_LIMIT).
 _TOOL_SUMMARY_LIMIT = 2_048
-
-# F11b: thinking/reasoning text is projected into content up to a high bound;
-# beyond it the tail is dropped and the loss is declared through
-# CONTENT_AVAILABILITY=partial plus a REDACTED field disposition, mirroring the
-# tool-block policy. summary stays a bounded synopsis.
-_REASONING_CONTENT_LIMIT = 100_000
 
 _COMPLETE = {
     FidelityDimension.SOURCE_AVAILABILITY: FidelityLevel.COMPLETE,
@@ -96,6 +86,10 @@ _META_RECORD_TYPES = {
     "file-history-snapshot",
     "pr-link",
     "file-history-delta",
+    "active-leaf",
+    "runtime-config",
+    "workspace-directories",
+    "worktree-state",
 }
 
 
@@ -234,6 +228,34 @@ def _nested_text(value) -> str | None:
     return None
 
 
+def _metadata_text(record: dict) -> str | None:
+    """Recover prose or path text from an operational record. None if absent."""
+    rtype = record.get("type")
+    if rtype == "last-prompt":
+        prompt = record.get("lastPrompt")
+        if isinstance(prompt, str) and prompt:
+            return prompt
+    if rtype == "workspace-directories":
+        dirs = record.get("directories")
+        if isinstance(dirs, list):
+            parts = [item for item in dirs if isinstance(item, str) and item]
+            if parts:
+                return "\n".join(parts)
+    for key in ("text", "summary"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _block_text(block: dict) -> str | None:
+    """Text carried by an otherwise unmapped content block, if any."""
+    raw = block.get("text")
+    if isinstance(raw, str) and raw:
+        return raw
+    return _nested_text(block.get("content"))
+
+
 def _metadata_summary(record: dict) -> str | None:
     """Surface a non-empty summary for standalone operational/metadata records.
 
@@ -295,6 +317,22 @@ def _metadata_summary(record: dict) -> str | None:
     if rtype == "file-history-delta":
         tp = record.get("trackingPath")
         return f"file-history-delta: {tp}" if isinstance(tp, str) and tp else None
+    if rtype == "active-leaf":
+        leaf = record.get("leafUuid")
+        return f"active-leaf leafUuid={leaf}" if isinstance(leaf, str) and leaf else "active-leaf"
+    if rtype == "runtime-config":
+        model = record.get("model")
+        return f"runtime-config model={model}" if isinstance(model, str) and model else "runtime-config"
+    if rtype == "workspace-directories":
+        dirs = record.get("directories")
+        if isinstance(dirs, list):
+            parts = [item for item in dirs if isinstance(item, str) and item]
+            if parts:
+                return "workspace-directories: " + ", ".join(parts)
+        return "workspace-directories"
+    if rtype == "worktree-state":
+        state = record.get("worktreeSession")
+        return f"worktree-state: {state}" if isinstance(state, str) and state else "worktree-state"
     if rtype == "system" and record.get("subtype") == "api_error":
         err = record.get("error")
         if isinstance(err, dict):
@@ -412,7 +450,10 @@ class _Family:
         """Map one envelope, expanding each native content block separately."""
 
         kind = _record_kind(record)
-        ts = record.get("timestamp")
+        # Native timestamps arrive in mixed shapes (epoch milliseconds int,
+        # digit string, or ISO-8601); every value that flows into
+        # occurred_at/started_at/ended_at is normalized at this single seam.
+        ts = normalize_timestamp(record.get("timestamp"))
         sid = record.get("session_id") or record.get("sessionId")
         if kind is None:
             dispositions = ()
@@ -446,10 +487,11 @@ class _Family:
             # Round-4 fix: attachment records carry their payload (file diff
             # blocks etc.) on record.attachment; project it as bounded content
             # instead of a type-list-only summary.
-            meta_content = None
+            meta_content = _metadata_text(record)
+            native_type = record.get("type") or "unknown"
             meta_disp = (FieldDispositionRecord(
-                f"type:{record.get('type')}", FieldDisposition.MAPPED,
-                "operational metadata record classified as system_message",
+                f"type:{native_type}", FieldDisposition.MAPPED,
+                f"operational metadata record type {native_type} classified as system_message",
             ),)
             if record.get("type") == "attachment" and record.get("attachment") is not None:
                 try:
@@ -457,12 +499,6 @@ class _Family:
                 except (TypeError, ValueError):
                     att_text = str(record["attachment"])
                 if att_text:
-                    if len(att_text) > _ATTACHMENT_CAP:
-                        att_text = att_text[:_ATTACHMENT_CAP]
-                        meta_disp = meta_disp + (FieldDispositionRecord(
-                            "attachment", FieldDisposition.MAPPED,
-                            "attachment truncated; bounded preservation",
-                        ),)
                     meta_content = att_text
             return [self._event(
                 artifact, session_id=session_id, kind=EventKind.SYSTEM_MESSAGE,
@@ -559,16 +595,6 @@ class _Family:
                         "reasoning_content", FieldDisposition.UNAVAILABLE,
                         "reasoning block has no recoverable text",
                     ),)
-                elif len(text) > _REASONING_CONTENT_LIMIT:
-                    block_content = text[:_REASONING_CONTENT_LIMIT]
-                    block_fidelity = block_fidelity.with_at_least(
-                        FidelityDimension.CONTENT_AVAILABILITY,
-                        FidelityLevel.PARTIAL,
-                    )
-                    dispositions = dispositions + (FieldDispositionRecord(
-                        "reasoning_content", FieldDisposition.REDACTED,
-                        "reasoning text truncated to 100000 chars",
-                    ),)
                 else:
                     block_content = text
                     dispositions = dispositions + (FieldDispositionRecord(
@@ -592,28 +618,16 @@ class _Family:
                         "native tool call block has no recoverable call id",
                     ),)
                 # P1-F4: carry the tool-call input parameters into content
-                # (JSON-serialised and bounded) so they are never dropped.
+                # verbatim (JSON-serialised) so they are never dropped.
                 input_value = block.get("input")
                 if input_value is not None and input_value != "":
-                    serialised = json.dumps(
+                    block_content = json.dumps(
                         input_value, ensure_ascii=False, sort_keys=True,
                     )
-                    if len(serialised) > _TOOL_CALL_INPUT_LIMIT:
-                        block_content = serialised[:_TOOL_CALL_INPUT_LIMIT]
-                        block_fidelity = block_fidelity.with_at_least(
-                            FidelityDimension.CONTENT_AVAILABILITY,
-                            FidelityLevel.PARTIAL,
-                        )
-                        dispositions = dispositions + (FieldDispositionRecord(
-                            "tool_call_input", FieldDisposition.REDACTED,
-                            f"tool call input truncated to {_TOOL_CALL_INPUT_LIMIT} chars",
-                        ),)
-                    else:
-                        block_content = serialised
-                        dispositions = dispositions + (FieldDispositionRecord(
-                            "tool_call_input", FieldDisposition.MAPPED,
-                            "tool call input parameters mapped to content",
-                        ),)
+                    dispositions = dispositions + (FieldDispositionRecord(
+                        "tool_call_input", FieldDisposition.MAPPED,
+                        "tool call input parameters mapped to content",
+                    ),)
                 else:
                     dispositions = dispositions + (FieldDispositionRecord(
                         "tool_call_input", FieldDisposition.UNAVAILABLE,
@@ -637,39 +651,38 @@ class _Family:
                     ),)
                 # P1-F4: map the full native output into content so tool results
                 # longer than the old 2048-char summary are recoverable, not just
-                # preserved-by-locator. Truncation beyond the high bound is flagged.
+                # preserved-by-locator.
                 if text is not None:
-                    if len(text) > _TOOL_RESULT_CONTENT_LIMIT:
-                        block_content = text[:_TOOL_RESULT_CONTENT_LIMIT]
-                        block_fidelity = block_fidelity.with_at_least(
-                            FidelityDimension.CONTENT_AVAILABILITY,
-                            FidelityLevel.PARTIAL,
-                        )
-                        dispositions = dispositions + (FieldDispositionRecord(
-                            "tool_result_content", FieldDisposition.REDACTED,
-                            "tool output truncated; full output preserved by native locator",
-                        ),)
-                    else:
-                        block_content = text
-                        dispositions = dispositions + (FieldDispositionRecord(
-                            "tool_result_content", FieldDisposition.MAPPED,
-                            "tool output mapped exactly to content",
-                        ),)
+                    block_content = text
+                    dispositions = dispositions + (FieldDispositionRecord(
+                        "tool_result_content", FieldDisposition.MAPPED,
+                        "tool output mapped exactly to content",
+                    ),)
                 else:
                     dispositions = dispositions + (FieldDispositionRecord(
                         "tool_result_content", FieldDisposition.UNAVAILABLE,
                         "tool result block has no recoverable content",
                     ),)
             else:
-                block_fidelity = _fidelity(
-                    STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
-                    CONTENT_AVAILABILITY=FidelityLevel.PARTIAL,
-                )
-                dispositions = (FieldDispositionRecord(
-                    f"content[{block_index}]",
-                    FieldDisposition.PRESERVED_BY_REFERENCE,
-                    f"unsupported native content block type {block_type!r}",
-                ),)
+                recovered = _block_text(block) if isinstance(block, dict) else None
+                if recovered:
+                    block_kind = kind
+                    block_content = recovered
+                    dispositions = (FieldDispositionRecord(
+                        f"content[{block_index}].{block_type or 'unknown'}",
+                        FieldDisposition.MAPPED,
+                        f"native content block type {block_type} text mapped to content",
+                    ),)
+                else:
+                    block_fidelity = _fidelity(
+                        STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
+                        CONTENT_AVAILABILITY=FidelityLevel.PARTIAL,
+                    )
+                    dispositions = (FieldDispositionRecord(
+                        f"content[{block_index}]",
+                        FieldDisposition.PRESERVED_BY_REFERENCE,
+                        f"native content block type {block_type} has no text body",
+                    ),)
 
             event = self._event(
                 artifact, session_id=session_id, kind=block_kind,
@@ -720,7 +733,7 @@ class _Family:
                     artifact, session_id=session_id, kind=EventKind.USAGE,
                     locator=f"{artifact.relative_path}#usage:{lineno}",
                     native_id=f"usage:{record.get('uuid') or lineno}",
-                    occurred_at=record.get("timestamp"),
+                    occurred_at=normalize_timestamp(record.get("timestamp")),
                     ordinal=len(events), summary=usage, native_session=native_session,
                 ))
             for call_id, role, event in call_links:
@@ -853,15 +866,24 @@ class _Family:
                 break
 
         # Session-context timestamps: started_at = first record timestamp,
-        # ended_at = last record timestamp (native DAG order, not calendar sort).
-        main_timestamps = [r.get("timestamp") for r in context_records if r.get("timestamp")]
+        # ended_at = last record timestamp (native DAG order, not calendar
+        # sort). Each value is normalized first, so a file mixing epoch
+        # milliseconds with ISO strings yields one canonical shape.
+        main_timestamps = [
+            normalize_timestamp(ts)
+            for ts in (r.get("timestamp") for r in context_records)
+            if ts
+        ]
 
-        _MESSAGE_KINDS = {
+        # Metadata such as last-prompt is a system_message, not dialogue.
+        # Counting it as a main message created a second session whose only
+        # event was an unexplained lifecycle.
+        _DIALOGUE_KINDS = {
             EventKind.USER_MESSAGE, EventKind.ASSISTANT_MESSAGE,
-            EventKind.DEVELOPER_MESSAGE, EventKind.SYSTEM_MESSAGE,
+            EventKind.DEVELOPER_MESSAGE,
         }
         main_has_messages = any(
-            _record_kind(r) in _MESSAGE_KINDS for r in main_records)
+            _record_kind(r) in _DIALOGUE_KINDS for r in main_records)
         agent_ids: list[str] = []
         seen: set[str] = set()
         for r in records:
@@ -872,8 +894,12 @@ class _Family:
 
         # Per-sub-agent timestamps (native DAG order) bound each sub-session.
         agent_timestamps = {
-            agent: [r.get("timestamp") for r in records
-                    if r.get("agentId") == agent and r.get("timestamp")]
+            agent: [
+                normalize_timestamp(ts)
+                for ts in (r.get("timestamp") for r in records
+                           if r.get("agentId") == agent)
+                if ts
+            ]
             for agent in agent_ids
         }
         # F8: the sub-agent model id may sit on any record of the agent session
@@ -904,7 +930,11 @@ class _Family:
             main_lifecycle = self._event(
                 artifact, session_id=session_id, kind=EventKind.SESSION_LIFECYCLE,
                 locator=f"{artifact.relative_path}#session", native_id=native_session,
-                occurred_at=next((r.get("timestamp") for r in records if r.get("timestamp")), None),
+                occurred_at=next(
+                    (normalize_timestamp(ts)
+                     for ts in (r.get("timestamp") for r in records) if ts),
+                    None,
+                ),
                 ordinal=len(events), native_session=native_session,
             )
             events.append(main_lifecycle)
@@ -928,13 +958,11 @@ class _Family:
             ))
 
         for agent in agent_ids:
-            # Round-4 fix: a standalone sub-agent file (main records exist but
-            # none of them is a message; every message belongs to an agent)
-            # already yields its own full session — an extra 1-event
-            # placeholder session would duplicate it, so skip the placeholder
-            # and its self-referential relation. Files with NO main records at
-            # all keep the SUBAGENT_BOUNDARY fallback below.
-            if main_records and not main_has_messages:
+            # Messages already live on the file session. Skip the extra
+            # boundary session when every row has an agentId, and the extra
+            # lifecycle session when the only main rows are metadata
+            # (last-prompt and other non-dialogue records).
+            if not main_records or not main_has_messages:
                 continue
             agent_record = next(r for r in records if r.get("agentId") == agent)
             sub_session_id = make_event_id(
@@ -948,7 +976,7 @@ class _Family:
                 sub_lifecycle = self._event(
                     artifact, session_id=sub_session_id, kind=EventKind.SESSION_LIFECYCLE,
                     locator=f"{artifact.relative_path}#session-agent:{agent}",
-                    native_id=f"agent:{agent}", occurred_at=agent_record.get("timestamp"),
+                    native_id=f"agent:{agent}", occurred_at=normalize_timestamp(agent_record.get("timestamp")),
                     ordinal=len(events), native_session=native_session,
                 )
                 events.append(sub_lifecycle)
@@ -986,7 +1014,7 @@ class _Family:
                 events.append(self._event(
                     artifact, session_id=sub_session_id, kind=EventKind.SUBAGENT_BOUNDARY,
                     locator=f"{artifact.relative_path}#agent:{agent}",
-                    native_id=f"agent:{agent}", occurred_at=agent_record.get("timestamp"),
+                    native_id=f"agent:{agent}", occurred_at=normalize_timestamp(agent_record.get("timestamp")),
                     ordinal=len(events), summary=agent, native_session=native_session,
                 ))
                 # The boundary event references sub_session_id: the session row
@@ -1035,7 +1063,9 @@ class _Family:
 
 _FAMILIES = {
     "claude": _Family("claude", markers=('"stop_reason"', '"isSidechain"')),
-    "qoder": _Family("qoder", markers=('"isCompactSummary"',)),
+    # isCompactSummary is sufficient but not necessary: a DAG jsonl that
+    # carries message envelopes and never compacts must still be detected.
+    "qoder": _Family("qoder", markers=('"isCompactSummary"', '"message"')),
 }
 
 

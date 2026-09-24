@@ -48,7 +48,7 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "codex"
-ADAPTER_VERSION = "1.5.0"
+ADAPTER_VERSION = "1.6.0"
 CONTRACT_VERSION = "2"
 
 _COMPLETE = {
@@ -67,13 +67,23 @@ _COMPLETE = {
 _LOOP_HINTS = ("turn_started", "agent_turn_started")
 
 
-# Cap for full tool-call input / tool-result output carried as event content.
-# Tool outputs routinely run to thousands of lines; storing them in full would
-# bloat the dataset. We keep a generous ceiling (far above the old 2048-char
-# summary truncation) and flag truncation explicitly via a field disposition.
-_CONTENT_CAP = 100_000
-_TOOL_OUTPUT_REASON = "tool output truncated; full text exceeds content cap"
-_REASONING_ENCRYPTED_REASON = "reasoning content is encrypted; plaintext not available"
+# Tool-call input, tool-result output, message bodies and plaintext reasoning
+# are all event *content* (the body), so none of them is capped. Only the
+# navigation ``summary`` stays bounded (see _payload_text / _summary_text).
+_REASONING_ENCRYPTED_REASON = (
+    "no local key; encrypted_content ciphertext cannot be decrypted"
+)
+_TOKEN_COUNT_GAP_REASON = (
+    "token_count is a usage record; missing usage fields: "
+    "info, input_tokens, output_tokens"
+)
+_TOKEN_USAGE_RECORD_GAP_REASON = (
+    "token_usage_record is a usage record; missing usage fields: "
+    "input_tokens, output_tokens"
+)
+_INTER_AGENT_NO_BODY_REASON = (
+    "inter_agent_communication_metadata has no message body"
+)
 
 
 def _fidelity(**overrides) -> FidelityProfile:
@@ -272,14 +282,12 @@ def _adapt_record_impl(record: dict, artifact, *, session_id, locator) -> TypedE
         if item_type == "agent_message":
             # assistant-authored message surfaced as a response_item item.
             content = _text(record)
-            dispositions = ()
             if content is None:
-                content, dispositions = _payload_text_capped(inner, cap=_CONTENT_CAP)
+                content = _payload_text_exact(inner)
             return _event(
                 artifact, session_id=session_id, kind=EventKind.ASSISTANT_MESSAGE,
                 locator=locator, native_id=inner.get("id") or inner.get("item_id"),
-                occurred_at=ts, content=content,
-                field_dispositions=dispositions, native_session=sid,
+                occurred_at=ts, content=content, native_session=sid,
             )
         if item_type == "web_search_call":
             query = ""
@@ -291,6 +299,26 @@ def _adapt_record_impl(record: dict, artifact, *, session_id, locator) -> TypedE
                 locator=locator, native_id=inner.get("call_id") or inner.get("id"),
                 occurred_at=ts, summary=query or "web_search_call",
                 native_session=sid,
+            )
+        if item_type == "image_generation_call":
+            # revised_prompt is the readable text; the image bytes on result
+            # are not a message body.
+            prompt = inner.get("revised_prompt")
+            text = prompt if isinstance(prompt, str) and prompt.strip() else None
+            dispositions = ()
+            if text is None:
+                dispositions = (
+                    FieldDispositionRecord(
+                        field_name="revised_prompt",
+                        disposition=FieldDisposition.UNAVAILABLE,
+                        reason="image_generation_call has no revised_prompt",
+                    ),
+                )
+            return _event(
+                artifact, session_id=session_id, kind=EventKind.ASSISTANT_MESSAGE,
+                locator=locator, native_id=inner.get("id"), occurred_at=ts,
+                content=text, summary="image_generation_call",
+                field_dispositions=dispositions, native_session=sid,
             )
     if kind == "event_msg":
         # loop hints are first-class episode hints; other event messages stay
@@ -322,25 +350,30 @@ def _adapt_record_impl(record: dict, artifact, *, session_id, locator) -> TypedE
                     fidelity=_fidelity(CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
                     native_session=sid,
                 )
-            return _event(artifact, session_id=session_id,
-                          kind=EventKind.UNKNOWN_NATIVE, locator=locator,
-                          native_id=inner.get("turn_id") or inner.get("type"),
-                          occurred_at=ts, fidelity=_fidelity(
-                              STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
-                              RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
-                              CONTENT_AVAILABILITY=FidelityLevel.PARTIAL,
-                          ), native_session=sid)
+            return _event(
+                artifact, session_id=session_id, kind=EventKind.USAGE,
+                locator=locator, native_id=inner.get("turn_id") or hint,
+                occurred_at=ts,
+                fidelity=_fidelity(CONTENT_AVAILABILITY=FidelityLevel.UNAVAILABLE),
+                field_dispositions=(
+                    FieldDispositionRecord(
+                        field_name="info",
+                        disposition=FieldDisposition.UNAVAILABLE,
+                        reason=_TOKEN_COUNT_GAP_REASON,
+                    ),
+                ),
+                native_session=sid,
+            )
         if hint == "agent_message":
             # assistant-authored message delivered as an event message.
-            content, dispositions = _payload_text_capped(inner, cap=_CONTENT_CAP)
+            content = _payload_text_exact(inner)
             if content is None:
                 content = _summary_text(inner.get("summary"))
             return _event(
                 artifact, session_id=session_id, kind=EventKind.ASSISTANT_MESSAGE,
                 locator=locator, native_id=inner.get("turn_id") or inner.get("id") or hint,
                 occurred_at=ts,
-                content=content,
-                field_dispositions=dispositions, native_session=sid,
+                content=content, native_session=sid,
             )
         if hint in ("task_started", "task_complete"):
             # full agent-loop episodes frame turns; surface as loop boundaries.
@@ -377,7 +410,7 @@ def _adapt_record_impl(record: dict, artifact, *, session_id, locator) -> TypedE
             if content is None:
                 content = _payload_text(inner)
             if content is None:
-                content = str(inner.get("stderr") or "")[:2048] or None
+                content = str(inner.get("stderr") or "") or None
             return _event(
                 artifact, session_id=session_id, kind=EventKind.TOOL_RESULT,
                 locator=locator, native_id=f"{call_id}#output",
@@ -426,6 +459,25 @@ def _adapt_record_impl(record: dict, artifact, *, session_id, locator) -> TypedE
                 occurred_at=ts, summary=str(item_text or "")[:256] or None,
                 native_session=sid,
             )
+        if hint == "thread_goal_updated":
+            goal = inner.get("goal") if isinstance(inner.get("goal"), dict) else {}
+            objective = goal.get("objective") if isinstance(goal, dict) else None
+            text = objective if isinstance(objective, str) and objective.strip() else None
+            dispositions = ()
+            if text is None:
+                dispositions = (
+                    FieldDispositionRecord(
+                        field_name="goal.objective",
+                        disposition=FieldDisposition.UNAVAILABLE,
+                        reason="thread_goal_updated has no goal.objective",
+                    ),
+                )
+            return _event(
+                artifact, session_id=session_id, kind=EventKind.FILE_CONTEXT,
+                locator=locator, native_id=inner.get("turn_id") or hint,
+                occurred_at=ts, content=text, summary="thread_goal_updated",
+                field_dispositions=dispositions, native_session=sid,
+            )
         if hint == "error":
             # keep the record as unknown_native but surface the error message.
             err = str(inner.get("message") or inner.get("error") or "")[:2048] or None
@@ -467,6 +519,60 @@ def _adapt_record_impl(record: dict, artifact, *, session_id, locator) -> TypedE
         return _event(artifact, session_id=session_id, kind=EventKind.COMPACTION_SUMMARY,
                       locator=locator, native_id=inner.get("turn_id"), occurred_at=ts,
                       summary=str(inner.get("summary") or "")[:2048] or None, native_session=sid)
+    if kind == "compacted":
+        message = inner.get("message")
+        text = message if isinstance(message, str) and message else None
+        return _event(
+            artifact, session_id=session_id, kind=EventKind.COMPACTION_SUMMARY,
+            locator=locator,
+            native_id=inner.get("compaction_response_id") or f"compacted:{locator}",
+            occurred_at=ts, content=text, summary="compacted",
+            native_session=sid,
+        )
+    if kind == "token_usage_record":
+        usage = None
+        for key in ("turn_token_usage", "usage", "thread_token_usage"):
+            usage = _usage_summary(inner.get(key))
+            if usage:
+                break
+        if usage:
+            return _event(
+                artifact, session_id=session_id, kind=EventKind.USAGE,
+                locator=locator,
+                native_id=inner.get("turn_id") or inner.get("response_id") or kind,
+                occurred_at=ts, summary=usage,
+                fidelity=_fidelity(CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
+                native_session=sid,
+            )
+        return _event(
+            artifact, session_id=session_id, kind=EventKind.USAGE,
+            locator=locator, native_id=inner.get("turn_id") or kind,
+            occurred_at=ts,
+            fidelity=_fidelity(CONTENT_AVAILABILITY=FidelityLevel.UNAVAILABLE),
+            field_dispositions=(
+                FieldDispositionRecord(
+                    field_name="usage",
+                    disposition=FieldDisposition.UNAVAILABLE,
+                    reason=_TOKEN_USAGE_RECORD_GAP_REASON,
+                ),
+            ),
+            native_session=sid,
+        )
+    if kind == "inter_agent_communication_metadata":
+        return _event(
+            artifact, session_id=session_id, kind=EventKind.SUBAGENT_BOUNDARY,
+            locator=locator, native_id=kind, occurred_at=ts,
+            summary="inter_agent_communication_metadata",
+            fidelity=_fidelity(CONTENT_AVAILABILITY=FidelityLevel.UNAVAILABLE),
+            field_dispositions=(
+                FieldDispositionRecord(
+                    field_name="trigger_turn",
+                    disposition=FieldDisposition.UNAVAILABLE,
+                    reason=_INTER_AGENT_NO_BODY_REASON,
+                ),
+            ),
+            native_session=sid,
+        )
     if kind == "world_state":
         return _event(
             artifact, session_id=session_id, kind=EventKind.FILE_CONTEXT,
@@ -504,36 +610,21 @@ def _summary_text(value) -> str | None:
 
 
 def _payload_text(inner: dict, *, keys=("message", "text")) -> str | None:
-    """Plain event-msg text from a short field name or a content-block list.
-
-    Real Codex event messages carry authored/streamed text on a single field
-    (payload.message for agent_message, payload.text for agent_reasoning).
-    Some shapes nest content as a list of input/output text blocks; that is
-    handled here too. Returns a bounded string or None.
-    """
-    text, _ = _payload_text_capped(inner, keys=keys, cap=2048)
-    return text
+    """Bounded navigation text; the same field rides content via
+    :func:`_payload_text_exact`."""
+    text = _payload_text_exact(inner, keys=keys)
+    return text[:2048] if text else None
 
 
-def _payload_text_capped(
-    inner: dict, *, keys=("message", "text"), cap: int,
-) -> tuple[str | None, tuple]:
-    """Round-4 fix: full-fidelity event-msg text with an explicit cap.
+def _payload_text_exact(inner: dict, *, keys=("message", "text")) -> str | None:
+    """Full event-msg text: a short field name or a content-block list.
 
-    agent_message bodies streamed on the event stream were silently truncated
-    at 2048; message content now uses the generous content cap and flags
-    truncation via a field disposition instead.
+    Returns the text verbatim; the caller decides where it goes (content).
     """
     for key in keys:
         value = inner.get(key)
         if isinstance(value, str) and value.strip():
-            if len(value) <= cap:
-                return value, ()
-            return value[:cap], (FieldDispositionRecord(
-                field_name=key,
-                disposition=FieldDisposition.MAPPED,
-                reason="message truncated; full text exceeds content cap",
-            ),)
+            return value
         if isinstance(value, list):
             parts = []
             for block in value:
@@ -544,65 +635,33 @@ def _payload_text_capped(
                     if text:
                         parts.append(str(text))
             if parts:
-                joined = " ".join(parts)
-                if len(joined) <= cap:
-                    return joined, ()
-                return joined[:cap], (FieldDispositionRecord(
-                    field_name=key,
-                    disposition=FieldDisposition.MAPPED,
-                    reason="message truncated; full text exceeds content cap",
-                ),)
-    return None, ()
+                return " ".join(parts)
+    return None
 
 
 def _tool_input_text(inner: dict) -> tuple[str | None, tuple]:
-    """Full tool-call input (the script/arguments) carried as event content.\n\n    function_call puts its arguments on payload.arguments (a JSON string);
+    """Full tool-call input (the script/arguments) carried as event content.
+
+    function_call puts its arguments on payload.arguments (a JSON string);
     custom_tool_call / tool_search_call put theirs on payload.input (string
-    or content-block list). Returns (content, dispositions) where content is
-    capped at _CONTENT_CAP and truncation is recorded via a disposition.
+    or content-block list). Content is the body and is never capped.
     """
     raw = inner.get("arguments")
-    key = "arguments"
     if raw is None:
         raw = inner.get("input")
-        key = "input"
-    text = _coerce_text(raw)
-    if text is None:
-        return None, ()
-    capped, truncated = _capped(text)
-    dispositions = ()
-    if truncated:
-        dispositions = (
-            FieldDispositionRecord(
-                field_name=key,
-                disposition=FieldDisposition.MAPPED,
-                reason="tool input truncated; full text exceeds content cap",
-            ),
-        )
-    return capped, dispositions
+    return _coerce_text(raw), ()
 
 
 def _tool_result_text(inner: dict) -> tuple[str | None, tuple]:
-    """Full tool-result output carried as event content.\n\n    Response-item outputs sit on payload.output (string or content-block
+    """Full tool-result output carried as event content (never capped).
+
+    Response-item outputs sit on payload.output (string or content-block
     list); event-msg tool-execution records carry aggregated_output / stdout.
-    Returns (content, dispositions) where content is capped at _CONTENT_CAP
-    and truncation is flagged via a field disposition.
     """
     for key in ("output", "aggregated_output", "stdout"):
-        value = inner.get(key)
-        text = _coerce_text(value)
+        text = _coerce_text(inner.get(key))
         if text is not None:
-            capped, truncated = _capped(text)
-            dispositions = ()
-            if truncated:
-                dispositions = (
-                    FieldDispositionRecord(
-                        field_name=key,
-                        disposition=FieldDisposition.MAPPED,
-                        reason=_TOOL_OUTPUT_REASON,
-                    ),
-                )
-            return capped, dispositions
+            return text, ()
     return None, ()
 
 
@@ -623,13 +682,6 @@ def _coerce_text(value) -> str | None:
     return None
 
 
-def _capped(text: str) -> tuple[str, bool]:
-    """Cap content at _CONTENT_CAP; returns (text, was_truncated)."""
-    if len(text) <= _CONTENT_CAP:
-        return text, False
-    return text[:_CONTENT_CAP], True
-
-
 def _reasoning_content(inner: dict) -> tuple[str | None, tuple, FidelityLevel]:
     """Plaintext reasoning from a reasoning response-item / event-msg payload.
 
@@ -640,24 +692,16 @@ def _reasoning_content(inner: dict) -> tuple[str | None, tuple, FidelityLevel]:
       (b) only payload.encrypted_content (+ summary) - not readable;
       (c) a mix of plaintext and encrypted content.
 
-    Returns (content, dispositions, content_availability) where the
-    fidelity level truthfully matches the returned content: COMPLETE for full
-    plaintext, PARTIAL when capped, UNAVAILABLE when no plaintext exists
-    (encrypted-only reasoning is not readable and never claims complete).
+    Returns (content, dispositions, content_availability) where the fidelity
+    level truthfully matches the returned content: COMPLETE for full
+    plaintext, UNAVAILABLE when no plaintext exists (encrypted-only reasoning
+    is not readable and never claims complete). Plaintext is the body and is
+    never capped.
     """
     for key in ("content", "text"):
         text = _coerce_text(inner.get(key))
         if text is not None:
-            capped, truncated = _capped(text)
-            if truncated:
-                return capped, (
-                    FieldDispositionRecord(
-                        field_name=key,
-                        disposition=FieldDisposition.REDACTED,
-                        reason="reasoning truncated; full text exceeds content cap",
-                    ),
-                ), FidelityLevel.PARTIAL
-            return capped, (), FidelityLevel.COMPLETE
+            return text, (), FidelityLevel.COMPLETE
     if inner.get("encrypted_content") is not None:
         return None, (
             FieldDispositionRecord(
@@ -710,8 +754,9 @@ def _token_count_usage(inner: dict) -> str | None:
 
     We prefer the per-turn incremental usage (last_token_usage), falling
     back to the cumulative (total_token_usage), then the whole info dict.
-    Returns None when no numeric token field is present so the caller
-    never emits a hollow USAGE event (degrades to unknown_native instead).
+    Returns None when no numeric token field is present. The caller then
+    emits a USAGE event whose disposition names the missing fields, instead
+    of a bare unknown_native.
     """
     if not isinstance(inner, dict):
         return None
@@ -727,6 +772,82 @@ def _token_count_usage(inner: dict) -> str | None:
         if usage:
             return usage
     return None
+
+
+def _history_kind(item: dict) -> EventKind | None:
+    """Map one replacement_history item onto a message or compaction kind."""
+    role = item.get("role")
+    item_type = item.get("type")
+    if role == "user":
+        return EventKind.USER_MESSAGE
+    if role == "assistant" or item_type == "agent_message":
+        return EventKind.ASSISTANT_MESSAGE
+    if role == "developer":
+        return EventKind.DEVELOPER_MESSAGE
+    if role == "system":
+        return EventKind.SYSTEM_MESSAGE
+    if item_type == "compaction" or item.get("encrypted_content") is not None:
+        return EventKind.COMPACTION_SUMMARY
+    return None
+
+
+def _history_item_text(item: dict) -> tuple[str | None, tuple]:
+    """Plaintext from a history item. Ciphertext stays unavailable."""
+    text = _coerce_text(item.get("content"))
+    has_cipher = item.get("encrypted_content") is not None
+    content = item.get("content")
+    if isinstance(content, list):
+        has_cipher = has_cipher or any(
+            isinstance(block, dict) and (
+                block.get("type") == "encrypted_content"
+                or block.get("encrypted_content") is not None
+            )
+            for block in content
+        )
+    if not has_cipher:
+        return text, ()
+    return text, (
+        FieldDispositionRecord(
+            field_name="encrypted_content",
+            disposition=FieldDisposition.UNAVAILABLE,
+            reason=_REASONING_ENCRYPTED_REASON,
+        ),
+    )
+
+
+def _replacement_history_events(
+    record: dict, artifact, *, session_id, locator, native_session, occurred_at,
+) -> list[TypedEvent]:
+    """Turn compacted ``replacement_history`` plaintext into role messages.
+
+    One JSONL row still keeps its compaction event. Each history item with
+    readable text, or with ciphertext and no local key, becomes its own
+    event so the retained text is not dropped and not marked unknown.
+    """
+    if record.get("type") != "compacted":
+        return []
+    history = _inner(record).get("replacement_history")
+    if not isinstance(history, list):
+        return []
+    events: list[TypedEvent] = []
+    for index, item in enumerate(history):
+        if not isinstance(item, dict):
+            continue
+        kind = _history_kind(item)
+        if kind is None:
+            continue
+        text, dispositions = _history_item_text(item)
+        if text is None and not dispositions:
+            continue
+        child = f"{locator}#hist:{index}"
+        events.append(_event(
+            artifact, session_id=session_id, kind=kind, locator=child,
+            native_id=str(item.get("id") or f"hist:{index}"),
+            occurred_at=occurred_at, content=text,
+            summary=None if text else "compacted",
+            field_dispositions=dispositions, native_session=native_session,
+        ))
+    return events
 
 
 def _is_system_placeholder_title(text) -> bool:
@@ -852,10 +973,10 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             native_session = sid
             break
 
-    # Every record is ordered by its file line number; the line number is the
-    # event stream's total order, so it doubles as the typed event ordinal
-    # (stamped through _adapt_record, which maps one record to at most one
-    # event; the response_item usage event inherits the same ordinate).
+    # Every record is ordered by its file line number. That line number is the
+    # typed event ordinal. A compacted row also emits one event per
+    # replacement_history item; those share the source line ordinal and stay
+    # in history order after the compaction event.
     for lineno, record in enumerate(records, start=1):
         locator = f"{artifact.relative_path}#L{lineno}"
         ev = _adapt_record(record, artifact, session_id=session_id,
@@ -865,6 +986,12 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             tid = _inner(record).get("turn_id")
             if tid:
                 turn_of[ev.event_id] = tid
+        occurred_at = record.get("timestamp") or _inner(record).get("timestamp")
+        for extra in _replacement_history_events(
+            record, artifact, session_id=session_id, locator=locator,
+            native_session=native_session, occurred_at=occurred_at,
+        ):
+            events.append(replace(extra, ordinal=lineno))
         if record.get("type") == "response_item":
             usage = _usage_summary(_inner(record).get("usage"))
             if usage:

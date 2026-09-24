@@ -40,7 +40,7 @@ from personal_knowledge.core.conversation_events import (
     make_event_id,
 )
 
-ADAPTER_VERSION = "1.4.0"
+ADAPTER_VERSION = "1.5.0"
 CONTRACT_VERSION = "2"
 
 ALLOWED_TABLES: tuple[str, ...] = ("sessions", "messages", "message_parts")
@@ -77,11 +77,10 @@ _PART_KINDS = {
 }
 
 # Reasoning blocks routinely run to hundreds of thousands of characters
-# (a single Mimo reasoning part was observed at ~159k chars).  Canonical
-# content keeps the full text up to this cap; an overrun is honestly declared
-# REDACTED + partial rather than silently truncated while still advertising
-# complete content availability.
-_REASONING_CONTENT_LIMIT = 100_000
+# (a single Mimo reasoning part was observed at ~159k chars). Reasoning, tool
+# arguments, tool output and compaction bodies are all event *content* (the
+# body) and are therefore never capped; only the navigation ``summary`` stays
+# bounded at _SUMMARY_LIMIT.
 _SUMMARY_LIMIT = 2048
 
 
@@ -155,7 +154,7 @@ class _Family:
         input / arguments) and the result under state.output; the
         old code only read text/content and silently dropped both
         (fidelity claimed complete while the args never landed).  Arguments
-        and output are truncated to bounded canonical content; CONTENT_
+        and output go into content verbatim (never truncated); CONTENT_
         AVAILABILITY is only complete when the payload actually mapped, and a
         field disposition documents a missing argument payload.
         """
@@ -182,26 +181,17 @@ class _Family:
                     break
         output = state.get("output") if "output" in state else part_data.get("output")
 
-        def _payload(value, limit=50000):
-            # Round-5 fix: preserve native whitespace verbatim (no strip) and
-            # report truncation so the caller can record a field disposition.
+        def _payload(value) -> str | None:
+            # Round-5 fix: preserve native whitespace verbatim (no strip).
+            # Tool payloads are content, so they are never truncated.
             if value is None:
-                return None, False
+                return None
             text = value if isinstance(value, str) else json.dumps(
                 value, ensure_ascii=False, default=str)
-            if not text:
-                return None, False
-            truncated = len(text) > limit
-            return (text[:limit] if truncated else text), truncated
+            return text or None
 
-        args_json, args_truncated = _payload(args)
+        args_json = _payload(args)
         if args_json:
-            args_disp = ()
-            if args_truncated:
-                args_disp = (FieldDispositionRecord(
-                    args_field or "state.input", FieldDisposition.MAPPED,
-                    "tool input truncated; full text exceeds content cap",
-                ),)
             call = self._event(
                 artifact, session_id=session_id, kind=EventKind.TOOL_CALL,
                 locator=f"{locator_base}#part:{part_id}:call",
@@ -210,7 +200,6 @@ class _Family:
                 summary=(args_json if len(args_json) <= 2048 else args_json[:2048]),
                 native_payload_ref=f"{part_id}#{args_field}",
                 fidelity=_fidelity(),
-                field_dispositions=args_disp,
                 native_session=native_session,
             )
         else:
@@ -230,14 +219,8 @@ class _Family:
             )
         events.append(call)
 
-        out_json, out_truncated = _payload(output)
+        out_json = _payload(output)
         if out_json:
-            out_disp = ()
-            if out_truncated:
-                out_disp = (FieldDispositionRecord(
-                    "state.output", FieldDisposition.MAPPED,
-                    "tool output truncated; full text exceeds content cap",
-                ),)
             result = self._event(
                 artifact, session_id=session_id, kind=EventKind.TOOL_RESULT,
                 locator=f"{locator_base}#part:{part_id}:result",
@@ -246,7 +229,6 @@ class _Family:
                 summary=(out_json if len(out_json) <= 2048 else out_json[:2048]),
                 native_payload_ref=f"{part_id}#state.output",
                 fidelity=_fidelity(),
-                field_dispositions=out_disp,
                 native_session=native_session,
             )
             events.append(result)
@@ -264,12 +246,8 @@ class _Family:
         """Emit one REASONING event with the full reasoning text in content.
 
         Reasoning carries the semantics of the turn itself, so it must not be
-        reduced to a 2048-char summary the way long non-message parts are.
-        Canonical content keeps the full text up to _REASONING_CONTENT_LIMIT
-        and summary holds the 2048-char digest; an overrun is declared with
-        a REDACTED field disposition and PARTIAL content availability instead
-        of advertising complete coverage of truncated text (repeat of the
-        observed ~159k-char reasoning loss).
+        reduced to a 2048-char summary the way short labels are. Content keeps
+        the text verbatim (no cap) and summary holds a bounded digest.
         """
         session_id = parent.session_id
         native_session = parent.provenance.native_session_id
@@ -279,7 +257,23 @@ class _Family:
         if not text:
             # No reasoning text mapped: content and summary stay absent and
             # content availability is honestly partial, like the empty tool
-            # argument path.
+            # argument path. Ciphertext without a local key is the same gap,
+            # named by the field that actually holds it.
+            cipher_field = _reasoning_ciphertext_field(part_data)
+            if cipher_field:
+                return self._event(
+                    artifact, session_id=session_id, kind=EventKind.REASONING,
+                    locator=locator, native_id=part_id, occurred_at=occurred_at,
+                    content=None, summary=None, native_payload_ref=None,
+                    fidelity=_fidelity(
+                        CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
+                    field_dispositions=(
+                        FieldDispositionRecord(
+                            cipher_field, FieldDisposition.UNAVAILABLE,
+                            f"{cipher_field} 无本地密钥，不能解密"),
+                    ),
+                    native_session=native_session,
+                )
             return self._event(
                 artifact, session_id=session_id, kind=EventKind.REASONING,
                 locator=locator, native_id=part_id, occurred_at=occurred_at,
@@ -294,26 +288,17 @@ class _Family:
                 native_session=native_session,
             )
 
-        over_limit = len(text) > _REASONING_CONTENT_LIMIT
-        dispositions = (
-            FieldDispositionRecord(
-                "text", FieldDisposition.REDACTED,
-                f"reasoning truncated to {_REASONING_CONTENT_LIMIT} chars"),
-        ) if over_limit else (
-            FieldDispositionRecord(
-                "text", FieldDisposition.MAPPED, "full reasoning text mapped"),
-        )
         return self._event(
             artifact, session_id=session_id, kind=EventKind.REASONING,
             locator=locator, native_id=part_id, occurred_at=occurred_at,
-            content=text[:_REASONING_CONTENT_LIMIT],
+            content=text,
             summary=text[:_SUMMARY_LIMIT],
             native_payload_ref=f"{part_id}#text",
-            fidelity=_fidelity(
-                CONTENT_AVAILABILITY=(
-                    FidelityLevel.PARTIAL if over_limit
-                    else FidelityLevel.COMPLETE)),
-            field_dispositions=dispositions,
+            fidelity=_fidelity(CONTENT_AVAILABILITY=FidelityLevel.COMPLETE),
+            field_dispositions=(
+                FieldDispositionRecord(
+                    "text", FieldDisposition.MAPPED, "full reasoning text mapped"),
+            ),
             native_session=native_session,
         )
 
@@ -378,6 +363,9 @@ class _Family:
                         msg_cwd_by_session.setdefault(
                             str(_msg["session_id"]), _pwd.strip()[:512])
 
+        sessions_with_messages = {str(row["session_id"]) for row in messages}
+        sessions_with_parts = _sessions_with_parts(parts, messages)
+
         for row in sessions_rows:
             sid = str(row["id"])
             session_id = make_event_id(self.family, artifact.artifact_id, CONTRACT_VERSION,
@@ -405,12 +393,21 @@ class _Family:
                 cwd=_session_cwd_field(row) or msg_cwd_by_session.get(sid),
                 model=_session_model_field(row) or msg_model_by_session.get(sid),
             ))
+            empty_session = (
+                sid not in sessions_with_messages and sid not in sessions_with_parts
+            )
             events.append(self._event(artifact, session_id=session_id, kind=EventKind.SESSION_LIFECYCLE,
                                       locator=f"{artifact.relative_path}#session:{sid}", native_id=sid,
                                       occurred_at=normalize_timestamp(
                                           row["time_created"] if live else row["created_at"]
                                       ),
-                                      summary=str(row["title"] or "")[:256] or None, native_session=sid))
+                                      summary=str(row["title"] or "")[:256] or None, native_session=sid,
+                                      field_dispositions=(
+                                          FieldDispositionRecord(
+                                              "session", FieldDisposition.UNAVAILABLE,
+                                              "该 session 没有 message 和 part",
+                                          ),
+                                      ) if empty_session else ()))
 
         for msg in messages:
             sid = str(msg["session_id"])
@@ -510,6 +507,11 @@ class _Family:
             kind = _PART_KINDS.get(part_type)
             if live and part_type == "text":
                 kind = parent.kind
+            subtask_body = None
+            if part_type == "subtask":
+                kind = EventKind.SUBAGENT_BOUNDARY
+                prompt = part_data.get("prompt")
+                subtask_body = None if prompt is None else str(prompt)
             if kind is None:
                 unknown += 1
                 kind = EventKind.UNKNOWN_NATIVE
@@ -537,6 +539,23 @@ class _Family:
                     ),
                 )
             else:
+                if part_type == "subtask":
+                    part_content = subtask_body
+                    part_summary = None
+                else:
+                    # Compaction/file bodies were previously only reachable
+                    # through a 2048-char summary; they are content too.
+                    part_content = text
+                    part_summary = None if is_message else (text[:2048] if text else None)
+                part_dispositions = (
+                    (
+                        FieldDispositionRecord(
+                            "type", FieldDisposition.UNAVAILABLE,
+                            "type=patch 只有 hash/files，没有正文",
+                        ),
+                    )
+                    if part_type == "patch" else ()
+                )
                 ev = self._event(
                     artifact, session_id=parent.session_id, kind=kind,
                     locator=f"{artifact.relative_path}#part:{part['id']}",
@@ -544,8 +563,9 @@ class _Family:
                     occurred_at=normalize_timestamp(
                         part["time_created"] if live else part["created_at"]
                     ),
-                    content=text if is_message else None,
-                    summary=None if is_message else (text[:2048] if text else None),
+                    content=part_content,
+                    summary=part_summary,
+                    field_dispositions=part_dispositions,
                     native_session=parent.provenance.native_session_id,
                 )
             events.append(ev)
@@ -581,6 +601,34 @@ class _Family:
             fidelity=_fidelity(STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL if unknown else FidelityLevel.COMPLETE),
             sessions=tuple(sessions), relations=tuple(relations), warnings=tuple(warnings),
         )
+
+
+def _reasoning_ciphertext_field(part_data: dict) -> str | None:
+    """Native field holding reasoning ciphertext, when text is empty."""
+    metadata = part_data.get("metadata") if isinstance(part_data, dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    openai = metadata.get("openai")
+    if not isinstance(openai, dict):
+        return None
+    cipher = openai.get("reasoningEncryptedContent")
+    if isinstance(cipher, str) and cipher:
+        return "metadata.openai.reasoningEncryptedContent"
+    return None
+
+
+def _sessions_with_parts(parts, messages) -> set[str]:
+    message_session = {str(row["id"]): str(row["session_id"]) for row in messages}
+    found: set[str] = set()
+    for part in parts:
+        part_session = part["session_id"] if "session_id" in part.keys() else None
+        if part_session:
+            found.add(str(part_session))
+            continue
+        owner = message_session.get(str(part["message_id"]))
+        if owner:
+            found.add(owner)
+    return found
 
 
 def _json_object(value) -> dict:
