@@ -1,4 +1,4 @@
-"""zcode 家族适配器契约（模块 ``zcode``，ADAPTER_VERSION 1.5.0）。
+"""zcode 家族适配器契约（模块 ``zcode``，ADAPTER_VERSION 1.7.0）。
 
 registry 是唯一的族级 seam：生产代码只经 ``adapt_for`` / ``detect_family``
 消费适配器，所以本文件也只经 registry 调用，不直接摸 ``zcode.adapt`` /
@@ -20,7 +20,11 @@ from pathlib import Path
 import pytest
 
 from personal_knowledge.adapters.conversation_sources import registry
-from personal_knowledge.core.conversation_events import EventKind, RelationKind
+from personal_knowledge.core.conversation_events import (
+    EventKind,
+    FieldDisposition,
+    RelationKind,
+)
 
 # 注意：这里的 ``zcode`` 是夹具构建器（support/zcode.py），不是生产模块。
 # 生产 ``zcode`` 适配器只经 registry 调用，所以本文件结构上不可能绕过 seam。
@@ -160,3 +164,83 @@ def test_zcode_oversized_bodies_are_kept_in_full(tmp_path: Path) -> None:
     assert not artifacts.any_reason(result, "truncated"), (
         "content cap removed: no truncation disposition may be produced"
     )
+
+
+# --------------------------------------- file 正文：回落原生嵌套槽位（1.7.0）
+
+def test_zcode_file_body_falls_back_to_nested_native_slots(tmp_path: Path) -> None:
+    """``file`` part 顶层没有正文，正文只在 ``source.text.value``（其次 preview）。"""
+    artifact, root = zcode.live_file_artifact(tmp_path)
+    result = registry.adapt_for(FAMILY, artifacts.single(artifact), artifact_root=root)
+
+    source_only = _event_by_native(result, "part-file-source")
+    assert source_only.kind is EventKind.FILE_CONTEXT
+    assert source_only.content == zcode.FILE_SOURCE_TEXT
+
+    both = _event_by_native(result, "part-file-both")
+    assert both.kind is EventKind.FILE_CONTEXT
+    assert both.content == zcode.FILE_SOURCE_TEXT, (
+        "source.text.value must win over metadata.preview.text"
+    )
+
+    preview_only = _event_by_native(result, "part-file-preview")
+    assert preview_only.kind is EventKind.FILE_CONTEXT
+    assert preview_only.content == zcode.FILE_PREVIEW_TEXT
+
+
+# -------------------------- 诚实为空：原生确实没正文，但必须留下解释（1.7.0）
+
+def test_zcode_honest_empty_native_records_explain_themselves(tmp_path: Path) -> None:
+    """读不出正文的三条记录只加解释：不造正文，缺口必须点名原因。"""
+    artifact, root = zcode.live_honest_empty_artifact(tmp_path)
+    result = registry.adapt_for(FAMILY, artifacts.single(artifact), artifact_root=root)
+
+    # 指针指向的那条消息本身就在语料里：正文没有丢，只是不在这一行。
+    assert _event_by_native(result, "part-summary-text").content == zcode.SUMMARY_TEXT
+
+    think = _event_by_native(result, "part-think-empty")
+    assert think.kind is EventKind.REASONING
+    assert not think.content, "empty native text must not become content"
+    assert [
+        (record.field_name, record.disposition, record.reason)
+        for record in think.field_dispositions
+    ] == [
+        (
+            "text",
+            FieldDisposition.UNAVAILABLE,
+            "data.text is empty or absent and reasoningEncryptedContent "
+            "is not stored (null in all rows): native reasoning text is "
+            "not recoverable",
+        ),
+    ]
+
+    compact = _event_by_native(result, "part-compact-meta")
+    assert compact.kind is EventKind.COMPACTION_SUMMARY
+    assert not compact.content and not compact.summary
+    assert [
+        (record.field_name, record.disposition, record.reason)
+        for record in compact.field_dispositions
+    ] == [
+        (
+            "summaryMessageId",
+            FieldDisposition.PRESERVED_BY_REFERENCE,
+            "compaction row has no text/content; body is on the message "
+            f"data.summaryMessageId={zcode.SUMMARY_POINTER} points at",
+        ),
+    ]
+
+    attach = _event_by_native(result, "part-attach-text")
+    assert attach.kind is EventKind.USER_MESSAGE
+    assert not attach.content, "an attachment-only message must not invent a body"
+    assert [
+        (record.field_name, record.disposition, record.reason)
+        for record in attach.field_dispositions
+    ] == [
+        (
+            "text",
+            FieldDisposition.UNAVAILABLE,
+            "data.text is empty and sibling part(s) "
+            f"{zcode.ATTACHMENT_FILE_PART} are the only other parts: "
+            "attachment-only user message",
+        ),
+    ]

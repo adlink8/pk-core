@@ -1,4 +1,4 @@
-"""zcode 家族原生夹具构建器（模块 ``zcode``，ADAPTER_VERSION 1.5.0）。
+"""zcode 家族原生夹具构建器（模块 ``zcode``，ADAPTER_VERSION 1.7.0）。
 
 适配器认两种原生库形态：
 
@@ -38,6 +38,31 @@ _LIVE_UPDATED = 1_700_000_000_500
 # 在线形态的合成正文常量：断言侧引用同一份，避免魔法字符串漂移。
 LIVE_USER_TEXT = "fixture user text"
 LIVE_ASSISTANT_TEXT = "fixture assistant text"
+
+# 切片 1：真实 ``file`` part 顶层没有可读文本，正文只在嵌套槽位
+# ``source.text.value``（少数记录另有 ``metadata.preview.text``）。
+FILE_SOURCE_TEXT = "fixture attached file body"
+FILE_PREVIEW_TEXT = "fixture attachment preview"
+
+# 切片 2：三种「原生确实为空」的记录。
+SUMMARY_POINTER = "msg-fixture-summary"
+SUMMARY_TEXT = "fixture compaction summary body"
+ATTACHMENT_FILE_PART = "part-attach-file"
+
+_LIVE_SCHEMA = """
+    CREATE TABLE session (
+        id TEXT PRIMARY KEY, parent_id TEXT, title TEXT,
+        time_created INTEGER, time_updated INTEGER, directory TEXT
+    );
+    CREATE TABLE message (
+        id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+        time_updated INTEGER, data TEXT, sequence INTEGER
+    );
+    CREATE TABLE part (
+        id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+        time_created INTEGER, time_updated INTEGER, data TEXT, sequence INTEGER
+    );
+"""
 
 
 def oversized_text(prefix: str, length: int) -> str:
@@ -225,6 +250,133 @@ def build_live_oversize_db(path: Path) -> None:
         con.close()
 
 
+def _write_live_db(
+    path: Path,
+    *,
+    session_id: str,
+    title: str,
+    messages: list[tuple[str, str]],
+    parts: list[tuple[str, str, dict]],
+) -> None:
+    """迷你在线形态库：``messages`` 是 ``(message_id, role)``，``parts`` 是 ``(part_id, message_id, data)``。"""
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(_LIVE_SCHEMA)
+        con.execute(
+            "INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, None, title, _LIVE_CREATED, _LIVE_UPDATED, "/tmp/fixture"),
+        )
+        con.executemany(
+            "INSERT INTO message VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (mid, session_id, _LIVE_CREATED, _LIVE_CREATED,
+                 json.dumps({"role": role}), seq)
+                for seq, (mid, role) in enumerate(messages, start=1)
+            ],
+        )
+        con.executemany(
+            "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (pid, mid, session_id, _LIVE_CREATED + 400, _LIVE_CREATED + 400,
+                 json.dumps(data), seq)
+                for seq, (pid, mid, data) in enumerate(parts, start=1)
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def build_live_file_db(path: Path) -> None:
+    """在线形态库：``file`` part 的正文只在 ``source.text.value`` / ``metadata.preview.text``。"""
+    _write_live_db(
+        path,
+        session_id="sess-file",
+        title="fixture file session",
+        messages=[("msg-file", "user")],
+        parts=[
+            (
+                "part-file-source",
+                "msg-file",
+                {
+                    "type": "file",
+                    "filename": "fixture-source.txt",
+                    "source": {"type": "text", "text": {"value": FILE_SOURCE_TEXT}},
+                },
+            ),
+            (
+                "part-file-both",
+                "msg-file",
+                {
+                    "type": "file",
+                    "filename": "fixture-both.txt",
+                    "source": {"type": "text", "text": {"value": FILE_SOURCE_TEXT}},
+                    "metadata": {"preview": {"text": FILE_PREVIEW_TEXT}},
+                },
+            ),
+            (
+                "part-file-preview",
+                "msg-file",
+                {
+                    "type": "file",
+                    "filename": "fixture-preview.txt",
+                    "metadata": {"preview": {"text": FILE_PREVIEW_TEXT}},
+                },
+            ),
+        ],
+    )
+
+
+def build_live_honest_empty_db(path: Path) -> None:
+    """在线形态库：三种「原生确实为空」的记录（正文不可恢复，但必须留下解释）。"""
+    _write_live_db(
+        path,
+        session_id="sess-honest",
+        title="fixture honest empty session",
+        messages=[
+            ("msg-think", "assistant"),
+            ("msg-compact-meta", "assistant"),
+            ("msg-summary", "assistant"),
+            ("msg-attach", "user"),
+        ],
+        parts=[
+            (
+                "part-think-empty",
+                "msg-think",
+                {
+                    "type": "reasoning",
+                    "text": "",
+                    "metadata": {"itemId": "fixture-thinking-item"},
+                },
+            ),
+            (
+                "part-compact-meta",
+                "msg-compact-meta",
+                {
+                    "type": "compaction",
+                    "auto": True,
+                    "trigger": "auto",
+                    "phase": "end",
+                    "compactReason": "fixture window full",
+                    "compactBoundary": {"messageId": SUMMARY_POINTER},
+                    "summaryMessageId": SUMMARY_POINTER,
+                },
+            ),
+            ("part-summary-text", "msg-summary", {"type": "text", "text": SUMMARY_TEXT}),
+            ("part-attach-text", "msg-attach", {"type": "text", "text": ""}),
+            (
+                ATTACHMENT_FILE_PART,
+                "msg-attach",
+                {
+                    "type": "file",
+                    "filename": "fixture-attach.txt",
+                    "source": {"type": "text", "text": {"value": FILE_SOURCE_TEXT}},
+                },
+            ),
+        ],
+    )
+
+
 def build_store_db(path: Path) -> None:
     """写出可捕获形态库，并附上兄弟凭据表（哨兵值 + 假邮箱）。"""
     con = sqlite3.connect(path)
@@ -299,6 +451,38 @@ def live_oversize_artifact(
     db = directory / ".build" / f"{label}.db"
     db.parent.mkdir(parents=True, exist_ok=True)
     build_live_oversize_db(db)
+    return artifacts.file_artifact(
+        directory, label, "db.sqlite", db.read_bytes(),
+        family="zcode", source_kind="sqlite",
+    )
+
+
+def live_file_artifact(
+    directory: Path,
+    *,
+    label: str = "zcode.live.file",
+) -> tuple[SourceArtifact, Path]:
+    """``file`` part 嵌套正文的在线库 → ``(artifact, artifact_root)``。"""
+    directory = Path(directory)
+    db = directory / ".build" / f"{label}.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    build_live_file_db(db)
+    return artifacts.file_artifact(
+        directory, label, "db.sqlite", db.read_bytes(),
+        family="zcode", source_kind="sqlite",
+    )
+
+
+def live_honest_empty_artifact(
+    directory: Path,
+    *,
+    label: str = "zcode.live.honest",
+) -> tuple[SourceArtifact, Path]:
+    """三种「原生确实为空」记录的在线库 → ``(artifact, artifact_root)``。"""
+    directory = Path(directory)
+    db = directory / ".build" / f"{label}.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    build_live_honest_empty_db(db)
     return artifacts.file_artifact(
         directory, label, "db.sqlite", db.read_bytes(),
         family="zcode", source_kind="sqlite",

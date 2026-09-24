@@ -157,6 +157,49 @@ def test_no_raw_epoch_integer_leaks_into_events(tmp_path):
         assert not isinstance(event.occurred_at, int)
 
 
+# --------------------------------------------- qoder queue-operation 正文
+
+def test_queue_operation_content_is_kept_in_full(tmp_path):
+    """queue-operation 的正文只在顶层 content 上，必须全文进事件 content。
+
+    对这类记录原生没有 message 信封，也没有 text/summary 键；一旦只靠
+    有界摘要（256 字符）承载，超出部分就没有任何地方落脚。
+    """
+    assert len(fixtures.QUEUE_OPERATION_TEXT) > 256, (
+        "fixture must exceed the bounded-summary cap for this test to mean anything"
+    )
+    _, _, result = fixtures.adapt_family(
+        "qoder", tmp_path, "qoder-queue-operation.jsonl",
+        fixtures.queue_operation_records(),
+    )
+
+    assert artifacts.has_event(
+        result, EventKind.SYSTEM_MESSAGE, fixtures.QUEUE_OPERATION_TEXT
+    ), "queue-operation 正文被砍或丢失；全文必须落到 content"
+    event = next(
+        item for item in result.events
+        if item.content == fixtures.QUEUE_OPERATION_TEXT
+    )
+    # summary 仍是有界导航标签，既有 512 上限不变。
+    assert event.summary
+    assert len(event.summary) <= 512
+
+
+def test_short_queue_operation_content_also_lands_in_content(tmp_path):
+    """短正文同样走 content，不是只在超长时才被救回来。"""
+    _, _, result = fixtures.adapt_family(
+        "qoder", tmp_path, "qoder-queue-operation-short.jsonl",
+        fixtures.queue_operation_records(),
+    )
+
+    assert artifacts.has_event(
+        result, EventKind.SYSTEM_MESSAGE, fixtures.QUEUE_OPERATION_SHORT_TEXT
+    )
+    assert artifacts.has_event(
+        result, EventKind.ASSISTANT_MESSAGE, fixtures.QUEUE_OPERATION_ASSISTANT_TEXT
+    )
+
+
 # ------------------------------------------------------------ 超限正文
 
 def test_oversized_bodies_are_kept_in_full(tmp_path):

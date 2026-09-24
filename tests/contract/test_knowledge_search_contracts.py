@@ -280,9 +280,16 @@ def test_search_dialogue_canonical_messages_snippet(tmp_path: Path) -> None:
     assert hits[0]["collection"] == "canonical_messages"
 
 
-def test_search_dialogue_uses_only_active_v2_projection_when_legacy_coexists(
+def test_search_dialogue_keeps_legacy_and_active_v2_projection_rows_visible(
     tmp_path: Path,
 ) -> None:
+    """合并并集契约：有 active v2 代时，legacy 行与投影行都必须可见。
+
+    Contract change (2026-09-23 uniform-id 迁移): 旧的 ``canonical_message_id
+    LIKE 'v2|%'`` 谓词按前缀区分投影行，但迁移后投影行与周围的行共用同一来源
+    派生的 id 形态，前缀匹配不到任何行，会静默清空消费者；该库按设计是合并
+    并集，故读路径不再过滤（停用清理由写入时记录的 ``ce_projected_ids`` 承担）。
+    """
     import personal_knowledge.retrieval.unified_search as us
 
     db = tmp_path / "coexist-canon.sqlite"
@@ -317,7 +324,12 @@ def test_search_dialogue_uses_only_active_v2_projection_when_legacy_coexists(
         "shared searchable projection marker", top_k=5, db_path=db,
     )
 
-    assert [hit["unit_id"] for hit in hits] == ["v2|gen|message"]
+    # Active v2 generation exists and legacy rows coexist: nothing is filtered
+    # out, so both rows come back (逐项列出，不用「非空/包含」弱断言).
+    assert [hit["unit_id"] for hit in hits] == [
+        "legacy-message",
+        "v2|gen|message",
+    ]
 
 
 def test_layered_tags_dialogue_vs_event(

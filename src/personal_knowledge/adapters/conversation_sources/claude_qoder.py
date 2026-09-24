@@ -44,7 +44,7 @@ from personal_knowledge.core.conversation_events import (
     make_event_id,
 )
 
-ADAPTER_VERSION = "1.5.0"
+ADAPTER_VERSION = "1.6.0"
 
 CONTRACT_VERSION = "2"
 
@@ -241,6 +241,12 @@ def _metadata_text(record: dict) -> str | None:
             parts = [item for item in dirs if isinstance(item, str) and item]
             if parts:
                 return "\n".join(parts)
+    if rtype == "queue-operation":
+        # content is the body of the queued entry; it is never capped (only
+        # ``_metadata_summary`` stays a bounded synopsis).
+        c = record.get("content")
+        if isinstance(c, str) and c:
+            return c
     for key in ("text", "summary"):
         value = record.get(key)
         if isinstance(value, str) and value:

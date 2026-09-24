@@ -44,7 +44,7 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "zcode"
-ADAPTER_VERSION = "1.6.0"
+ADAPTER_VERSION = "1.7.0"
 CONTRACT_VERSION = "2"
 
 ALLOWED_TABLES: tuple[str, ...] = ("conversation_traces", "conversation_parts")
@@ -334,10 +334,27 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                              summary=title, native_session=sid))
 
     message_roles = {}
+    # 1.7.0: sibling parts per native message (live form only), so an
+    # attachment-only user message can be explained instead of staying empty.
+    siblings_by_message: dict[str, list] = {}
     if live:
         for message in messages:
             data = _json_object(message["data"])
             message_roles[str(message["id"])] = data.get("role")
+        for part in parts:
+            siblings_by_message.setdefault(str(part["message_id"]), []).append(part)
+
+    def _file_only_sibling_ids(part) -> list[str]:
+        """Sorted sibling ids when every other part of the message is a ``file``."""
+        others = [
+            row for row in siblings_by_message.get(str(part["message_id"]), [])
+            if str(row["id"]) != str(part["id"])
+        ]
+        if not others or not all(
+            _json_object(row["data"]).get("type") == "file" for row in others
+        ):
+            return []
+        return sorted(str(row["id"]) for row in others)
 
     for part in parts:
         sid = str(part["session_id"] if live else part["trace_id"])
@@ -414,14 +431,54 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 events.append(ev)
                 by_part[part_id] = ev
                 continue
-        raw_content = data.get("text") if "text" in data else data.get("content")
-        text = None if raw_content is None else str(raw_content)
+        if kind is EventKind.FILE_CONTEXT:
+            # 1.7.0: a file part's body is not at the top level.
+            text = _file_body(data)
+        else:
+            raw_content = data.get("text") if "text" in data else data.get("content")
+            text = None if raw_content is None else str(raw_content)
         is_message = kind in {
             EventKind.USER_MESSAGE,
             EventKind.ASSISTANT_MESSAGE,
             EventKind.DEVELOPER_MESSAGE,
             EventKind.SYSTEM_MESSAGE,
         }
+        # 1.7.0: a native field that is honestly empty still needs an explicit
+        # disposition - an unexplained empty event reads as silent loss, and no
+        # body may ever be invented for it.
+        dispositions: tuple[FieldDispositionRecord, ...] = ()
+        if not text and kind is EventKind.REASONING:
+            dispositions = (FieldDispositionRecord(
+                field_name="text",
+                disposition=FieldDisposition.UNAVAILABLE,
+                reason=(
+                    "data.text is empty or absent and reasoningEncryptedContent "
+                    "is not stored (null in all rows): native reasoning text is "
+                    "not recoverable"
+                ),
+            ),)
+        elif not text and kind is EventKind.COMPACTION_SUMMARY:
+            pointer = data.get("summaryMessageId")
+            if pointer:
+                # Metadata-only compaction row: a real one carries no text, the
+                # body is the message the pointer names (itself in the corpus).
+                dispositions = (FieldDispositionRecord(
+                    field_name="summaryMessageId",
+                    disposition=FieldDisposition.PRESERVED_BY_REFERENCE,
+                    reason="compaction row has no text/content; body is on the message "
+                           f"data.summaryMessageId={pointer} points at",
+                ),)
+        elif not text and kind is EventKind.USER_MESSAGE and live:
+            file_siblings = _file_only_sibling_ids(part)
+            if file_siblings:
+                # Attachment-only user message: every other part is a file part.
+                dispositions = (FieldDispositionRecord(
+                    field_name="text",
+                    disposition=FieldDisposition.UNAVAILABLE,
+                    reason="data.text is empty and sibling part(s) "
+                           f"{','.join(file_siblings)} are the only other parts: "
+                           "attachment-only user message",
+                ),)
         if kind is EventKind.REASONING:
             # Round-4 fix: reasoning text is full-fidelity content (no cap)
             # instead of a silently capped summary.
@@ -432,6 +489,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                     part["time_created"] if live else part["created_at"]
                 ),
                 content=text, summary=None, native_session=sid,
+                field_dispositions=dispositions,
             )
         else:
             ev = _event(
@@ -443,6 +501,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 content=text,
                 summary=None if is_message else (text[:2048] or None if text else None),
                 native_session=sid,
+                field_dispositions=dispositions,
             )
         events.append(ev)
         by_part[str(part["id"] if live else part["part_id"])] = ev
@@ -592,6 +651,32 @@ def _timeline_body(data: dict) -> str | None:
             _add_timeline_text(pieces, model.get("modelId"))
     _add_timeline_text(pieces, data.get("compactReason"))
     return "\n".join(pieces) if pieces else None
+
+
+def _file_body(data: dict) -> str | None:
+    """Body of a native ``file`` part, or None when the part carries none.
+
+    A real file part has no top-level body: the attached file's text is at
+    ``source.text.value``, with ``metadata.preview.text`` as the fallback. The
+    captured form keeps its body in the top-level ``content`` column, so that
+    slot is the last resort - never a shadow over the native slots.
+    """
+    candidates: list = []
+    source = data.get("source")
+    if isinstance(source, dict):
+        slot = source.get("text")
+        if isinstance(slot, dict):
+            candidates.append(slot.get("value"))
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict):
+        preview = metadata.get("preview")
+        if isinstance(preview, dict):
+            candidates.append(preview.get("text"))
+    candidates.extend((data.get("text"), data.get("content")))
+    for value in candidates:
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _timeline_event(artifact, *, session_id, locator, part_id, occurred_at, native_session, data):

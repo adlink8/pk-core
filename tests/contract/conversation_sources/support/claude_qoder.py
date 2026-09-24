@@ -61,6 +61,15 @@ MIXED_TIMESTAMP_USER_TEXT = "夹具：清洗步骤这句是假的。"
 MIXED_TIMESTAMP_ASSISTANT_TEXT = "夹具：先看数据源这句是假的。"
 MIXED_TIMESTAMP_COMPACT_TEXT = "compacted"
 
+# qoder：queue-operation 没有 message 信封，正文只挂在顶层 content 上。
+QUEUE_OPERATION_SESSION_ID = "s-qo"
+QUEUE_OPERATION_OP = "enqueue"
+QUEUE_OPERATION_ASSISTANT_TEXT = "夹具：排队记录旁边的假回复。"
+# 显著超过适配器摘要里的 256 字符截断（400 字符，可读重复句，非随机）。
+QUEUE_OPERATION_TEXT = "夹具：排队正文长句。" * 40
+# 短正文：断言它照常进 content，防止只在超长时才走新分支。
+QUEUE_OPERATION_SHORT_TEXT = "夹具：短排队句。"
+
 # 规范化后的时间必须是 UTC ISO Z 串。
 ISO_Z = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$")
 
@@ -253,6 +262,41 @@ def last_prompt_records() -> list[dict]:
             "message": {
                 "role": "assistant",
                 "content": [{"type": "text", "text": LAST_PROMPT_AGENT_TEXT}],
+            },
+        },
+    ]
+
+
+def queue_operation_records() -> list[dict]:
+    """queue-operation 没有 message 信封，正文只在顶层 content 上。"""
+    return [
+        {
+            "type": "queue-operation",
+            "uuid": "qo-1",
+            "parentUuid": None,
+            "sessionId": QUEUE_OPERATION_SESSION_ID,
+            "timestamp": "2026-01-05T00:00:00Z",
+            "operation": QUEUE_OPERATION_OP,
+            "content": QUEUE_OPERATION_TEXT,
+        },
+        {
+            "type": "queue-operation",
+            "uuid": "qo-2",
+            "parentUuid": "qo-1",
+            "sessionId": QUEUE_OPERATION_SESSION_ID,
+            "timestamp": "2026-01-05T00:00:01Z",
+            "operation": QUEUE_OPERATION_OP,
+            "content": QUEUE_OPERATION_SHORT_TEXT,
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "parentUuid": "qo-2",
+            "sessionId": QUEUE_OPERATION_SESSION_ID,
+            "timestamp": "2026-01-05T00:00:02Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": QUEUE_OPERATION_ASSISTANT_TEXT}],
             },
         },
     ]
