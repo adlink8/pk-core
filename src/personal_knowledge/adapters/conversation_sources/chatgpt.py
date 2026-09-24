@@ -215,12 +215,21 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         kind = EventKind.SYSTEM_MESSAGE if row["is_system"] else _MESSAGE_KINDS.get(
             role, EventKind.UNKNOWN_NATIVE
         )
-        content = None if row["content"] is None else str(row["content"])
-        mapped_content = FieldDispositionRecord(
-            "content",
-            FieldDisposition.MAPPED,
-            "exact AgentsView compatibility observation",
-        )
+        raw_content = row["content"]
+        if raw_content is None or (isinstance(raw_content, str) and not raw_content.strip()):
+            content = None
+            mapped_content = FieldDispositionRecord(
+                "content",
+                FieldDisposition.UNAVAILABLE,
+                "content missing",
+            )
+        else:
+            content = str(raw_content)
+            mapped_content = FieldDispositionRecord(
+                "content",
+                FieldDisposition.MAPPED,
+                "exact AgentsView compatibility observation",
+            )
         events.append(TypedEvent(
             event_id=make_event_id(
                 FAMILY,

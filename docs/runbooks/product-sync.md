@@ -284,6 +284,83 @@ pwsh -File tools\register-native-sync.ps1 -Unregister
 
 日志：`var/logs/native-sync.log`。任务只做 discover→stage→shadow；
 激活始终是人工显式步骤，与 Phase 62 D-18/D-31 一致（零付费）。
+
+#### 权威库直写入库：v2 staging 轨道已退役（2026-09-23）
+
+**现状（现行）**：唯一在跑的同步任务是 `\pk-authority-ingest`，**每周一 01:00** 触发
+`var/run/pk_authority_ingest_entry.py`，执行
+`python -m personal_knowledge.application.conversation.authority_ingest --write`：
+
+```
+inventory（只读）→ normalized 构建（自带 secret/回填 fail-closed 修订门）
+→ authority_ingest 正确性门禁 → canonical 原子发布进权威库 → 审计落账
+```
+
+* **硬门**（消息丢失 / 时间倒挂 / 密钥残留 / 空 eligible 会话 / 重复源会话 /
+  孤儿消息 / 发布收缩）：任一不过即拦批，权威库零接触，退出码 1；
+* **软门**（时间戳 null/0/epoch 秒/非 ISO、消息盈余）：问题会话写入 normalized 库
+  `ingest_quarantine` 隔离表（只保留最近一轮，自查愈），canonical 构建排除这些
+  会话，批次其余照常发布；
+* **发布前收缩守卫**：投影会话数低于权威库现有数即拦批——canonical 发布是整库
+  原子替换，缩水即静默删除，与 append-only 原则冲突；
+* canonical 发布沿用 staging + 原子 replace，旧权威库备份为
+  `agent_conversations.backup.sqlite`（单份滚动覆盖）；
+* 审计：`var/db/ingest_audit.sqlite`（`ingest_runs` + `ingest_findings`，与权威库
+  物理分离，失败也落账）；人读日志 `var/logs/authority-ingest.log` 与任务包装日志
+  `var/logs/authority-ingest-weekly.log`。
+
+管理入口：`python tools/register-authority-ingest.py`（`--check` 体检 /
+无参重建入口并注册 / `--run-now` 立即触发 / `--unregister` 删除 /
+`--retire-live` 停用旧任务）。**改时间只改该脚本的 `SCHEDULE` 再重跑**。
+
+**已退役（2026-09-23，任务定义保留、置为「已禁用」，可回滚）**：
+
+| 任务 | 原触发 | 动作 | 退役理由 |
+|---|---|---|---|
+| `\pk-live-weekly` | 每周一 01:00 | v2 live-sync 增量同步进 staging 库 | staging 库整体弃用；直写链替代 |
+| `\pk-live-watch` | 登陆时 | 30s 轮询守护 | 实测 62% 周期 no-op，常驻扫 4.2 万文件 |
+| `\pk-live-catchup` | 每 15 分钟 | catch-up 同步 | 单次 527s，占空比约 59% |
+
+> staging 库（`data/staging/v2/agent_conversations_v2.sqlite`）与 live-wt worktree
+> 保留不删：首次成功追平后再归档。worktree 删除会使旧任务静默失败——旧任务已禁用，
+> 此风险随之关闭。
+
+> **当前拦批中（2026-09-23 实测）**：grok 家族 7 个会话消息丢失（6 个声明 2-3 条
+> 消息但 normalized 0 行；1 个声明 258 实际 235），硬门拦批，详细发现见
+> `ingest_findings` 表。修好上游前每周会稳定拦批并记日志——这是设计行为。
+
+#### live 增量同步：已由「实时轮询」改为「每周一次」（2026-09-18，已退役）
+
+**现状（现行）**：只有一个计划任务 `\pk-live-weekly`，**每周一 01:00**（即周日夜里跨过
+零点那一刻）触发一次 `pk_weekly_entry.py`，内部等价于
+`pk-sync conversations --live-sync`
+（目标 `data/staging/v2/agent_conversations_v2.sqlite` + `data/staging/v2/native`）。
+日志：`D:\ADLINK\数据分析-live-wt\var\run\weekly.log`。
+
+> 时间沿革：2026-09-18 建立时为「周日 23:00」，当日调整为「周一 01:00」——
+> 23:00 常与游戏/交互重叠，凌晨 1 点机器已空闲。
+> **改时间只改 `tools/register-weekly-sync.py` 的 `SCHEDULE`，然后重跑该脚本**；
+> 直接 `schtasks /change` 改不掉「星期」（/change 不支持 /d），且下次重建会退回默认值。
+> 该脚本会自动把 StartBoundary 算成「下一个 <SCHEDULE["day"]>」，无需手填日期。
+
+**已退役（保留任务定义但置为「已禁用」，可回滚）**：
+
+| 任务 | 原触发 | 动作 | 停用理由（实测） |
+|---|---|---|---|
+| `\pk-live-watch` | 登陆时 | `pk_live_entry.py watch`（30s 轮询守护） | 常驻进程每 ~39s 全量扫描 4.2 万源文件；2026-09-15→09-18 共 1304 次心跳，其中仅 285 次真正成 cycle，且 177/285（62%）为 `no-op` |
+| `\pk-live-catchup` | 每 15 分钟（续 10 年） | `pk_live_entry.py once` | 单次耗时 527s → 占空比约 59%，近乎连续占用 |
+
+**⚠ 修改入口脚本时必须知道**：`pk_live_entry.py` 的 `once` 分支结尾会调用
+`_ensure_watch_alive()`，用 `schtasks /run /tn pk-live-watch` **把轮询守护重新拉起**。
+因此每周任务用的是**另一个入口** `pk_weekly_entry.py`（同参数，但刻意不做该自愈调用）。
+若日后恢复轮询，改回 `pk_live_entry.py` 即可；若要彻底移除，删除全部 `pk-live-*` 任务与
+`var/run/` 下两个入口脚本。
+
+**依赖**：`pk_weekly_entry.py` 位于 git worktree `D:\ADLINK\数据分析-live-wt`
+（分支 `fix/audit-20260915`，`var/run/` 不入库）。该 worktree 若删除，每周任务会静默失败
+——`var/run/weekly.log` 是唯一证据。重建方式见 `tools/register-weekly-sync.py`
+（`--check` 体检 / 无参数重建入口脚本并注册任务 / `--run-now` 立即触发 / `--unregister` 删除）。
+
 ## Live incremental sync (single live generation, 2026-09)
 
 替代"每轮全量重写快照"的路径：**稳定槽位身份 + 原地增量更新**。
@@ -299,6 +376,8 @@ pk-sync conversations --live-sync
 pk-sync conversations --live-dry-run --live-db <db> --live-mirror <mirror>
 
 # 常驻后台监听（30s 轮询 + 连续 2 次稳定扫描才触发；Ctrl-C 优雅退出）
+# ⚠ 已退役（2026-09-18）：日常不要再用。改用每周任务 \pk-live-weekly。
+#    保留此命令仅用于临时排查；用完务必 Ctrl-C，否则又变成常驻轮询。
 pk-sync conversations --watch [--watch-interval 30]
 
 # 只读运维视图：槽位计数 / 最近一次同步 / 待变更数（零写入）

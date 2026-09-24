@@ -175,7 +175,7 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
 
 def _event(artifact, *, session_id, kind, locator, native_id=None, occurred_at=None,
            content=None, summary=None, fidelity=None, native_session=None,
-           locator_hint=None) -> TypedEvent:
+           locator_hint=None, field_dispositions=()) -> TypedEvent:
     return TypedEvent(
         event_id=make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION,
                                native_id or locator, kind=kind, session_id=session_id,
@@ -188,6 +188,7 @@ def _event(artifact, *, session_id, kind, locator, native_id=None, occurred_at=N
         ),
         fidelity=fidelity or _fidelity(), occurred_at=occurred_at,
         content=content, summary=summary,
+        field_dispositions=tuple(field_dispositions),
     )
 
 
@@ -288,7 +289,11 @@ def _adapt_message(record, artifact, *, session_id, locator, native_session) -> 
                 RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
             ), native_session=native_session,
         )
-        return [result_event]
+        return [result_event, *_image_block_events(
+            message.get("content"), artifact, session_id=session_id, locator=locator,
+            native_id=record.get("id"), occurred_at=record.get("timestamp"),
+            native_session=native_session,
+        )]
     if role == "user":
         message_kind = EventKind.USER_MESSAGE
     elif role == "assistant":
@@ -345,6 +350,42 @@ def _adapt_message(record, artifact, *, session_id, locator, native_session) -> 
                 ), native_session=native_session, locator_hint=block_locator,
             ))
     return block_events
+
+
+def _image_block_events(blocks, artifact, *, session_id, locator, native_id, occurred_at,
+                        native_session) -> list[TypedEvent]:
+    """An image block with no text must still become an event.
+
+    The bytes are not transcript text. Dropping the block leaves no trace that
+    the tool result carried an image, so each such block gets its own event
+    whose disposition says the image block has no text.
+    """
+    if not isinstance(blocks, list):
+        return []
+    events: list[TypedEvent] = []
+    for index, block in enumerate(blocks):
+        if not isinstance(block, dict) or block.get("type") != "image":
+            continue
+        if isinstance(block.get("text"), str) and block.get("text").strip():
+            continue
+        block_locator = f"{locator}#block[{index}]"
+        events.append(_event(
+            artifact, session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
+            locator=block_locator, native_id=f"{native_id}#image[{index}]",
+            occurred_at=occurred_at,
+            fidelity=_fidelity(
+                STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
+                RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
+                CONTENT_AVAILABILITY=FidelityLevel.PARTIAL,
+            ),
+            native_session=native_session, locator_hint=block_locator,
+            field_dispositions=(FieldDispositionRecord(
+                field_name="content",
+                disposition=FieldDisposition.UNAVAILABLE,
+                reason="image 块没有 text",
+            ),),
+        ))
+    return events
 
 
 def _tool_call_text(block: dict) -> str | None:

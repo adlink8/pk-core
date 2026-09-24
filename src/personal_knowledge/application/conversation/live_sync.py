@@ -103,9 +103,11 @@ from personal_knowledge.adapters.conversation_sources.snapshots import (
 from personal_knowledge.application.conversation import event_schema
 from personal_knowledge.application.conversation.compatibility_projection import (
     _ensure_tables,
-    _norm_hash,
     compute_projection,
     write_compatibility_projection,
+)
+from personal_knowledge.application.conversation.uniform_id_migration import (
+    make_session_id,
 )
 from personal_knowledge.application.conversation.event_repository import (
     GenerationInput,
@@ -638,6 +640,17 @@ def _remove_slot(
     old_events, old_sessions = _read_slot_sigs(con, generation_id, slot_id)
     event_ids = set(old_events)
     session_ids = set(old_sessions)
+    # The origin-derived canonical ids must be captured BEFORE the ce rows are
+    # pruned: afterwards there is nothing left to derive them from, and the
+    # session's projected rows would survive as orphans. ``old_sessions`` maps
+    # ce session_id -> _SESSION_COLUMNS[1:] (session_id is the key).
+    doomed_canonical = {
+        make_session_id(
+            (row[0] or "unknown").strip().lower(),
+            (row[1] or "").strip() or f"ce:{sid}",
+        )
+        for sid, row in old_sessions.items()
+    }
     relations = _slot_relation_ids(con, generation_id, slot_id) | (
         _relation_ids_touching(con, generation_id, event_ids)
     )
@@ -656,6 +669,7 @@ def _remove_slot(
         "rows_pruned": rows_pruned,
         "rows_inserted": 0,
         "old_sessions": session_ids,
+        "doomed_canonical_ids": doomed_canonical,
         "new_sessions": set(),
         "new_event_ids": set(),
         "new_session_ids": set(),
@@ -739,8 +753,18 @@ def _refresh_artifact_row(con: sqlite3.Connection, artifact, family: str) -> Non
 # ------------------------------------------------------------- projection
 
 
+def _family_of(session_row: dict) -> str:
+    return (session_row.get("family") or "unknown").strip().lower()
+
+
+def _native_of(session_row: dict) -> str:
+    native = (session_row.get("native_session_id") or "").strip()
+    return native or f"ce:{session_row['session_id']}"
+
+
 def _project_sessions(
-    con: sqlite3.Connection, generation_id: str, session_ids: set[str]
+    con: sqlite3.Connection, generation_id: str, session_ids: set[str],
+    extra_canonical_ids: set[str] | None = None,
 ) -> dict:
     """Rebuild the compatibility rows for ``session_ids`` only.
 
@@ -757,25 +781,6 @@ def _project_sessions(
     _ensure_tables(con)
 
     ordered = sorted(session_ids)
-    canonical = [_norm_hash("v2|cs", sid) for sid in ordered]
-    for chunk in _chunks(canonical):
-        marks = _placeholders(len(chunk))
-        con.execute(
-            f"DELETE FROM canonical_tool_events "
-            f"WHERE canonical_session_id IN ({marks})",
-            chunk,
-        )
-        con.execute(
-            f"DELETE FROM canonical_messages "
-            f"WHERE canonical_session_id IN ({marks})",
-            chunk,
-        )
-        con.execute(
-            f"DELETE FROM canonical_sessions "
-            f"WHERE canonical_session_id IN ({marks})",
-            chunk,
-        )
-
     session_rows: list[dict] = []
     event_rows: list[dict] = []
     for chunk in _chunks(ordered):
@@ -802,6 +807,33 @@ def _project_sessions(
                 (generation_id, *chunk),
             )
         )
+
+    # Rows are deleted by the origin-derived canonical_session_id (a pure
+    # function of the ce session's family + native id), so a session that
+    # disappeared is dropped and a session whose content changed is rewritten
+    # under the same canonical id. ``extra_canonical_ids`` carries the ids of
+    # sessions whose ce rows this apply already pruned — they can no longer be
+    # derived here, so the caller hands them over.
+    canonical = [make_session_id(_family_of(r), _native_of(r)) for r in session_rows]
+    canonical.extend(sorted(extra_canonical_ids or ()))
+    for chunk in _chunks(canonical):
+        marks = _placeholders(len(chunk))
+        con.execute(
+            f"DELETE FROM canonical_tool_events "
+            f"WHERE canonical_session_id IN ({marks})",
+            chunk,
+        )
+        con.execute(
+            f"DELETE FROM canonical_messages "
+            f"WHERE canonical_session_id IN ({marks})",
+            chunk,
+        )
+        con.execute(
+            f"DELETE FROM canonical_sessions "
+            f"WHERE canonical_session_id IN ({marks})",
+            chunk,
+        )
+
     report = compute_projection(generation_id, session_rows, event_rows)
     write_compatibility_projection(con, report)
     return {
@@ -1032,6 +1064,7 @@ def live_sync_once(
         rows_pruned = 0
         rows_inserted = 0
         touched: set[str] = set()
+        doomed_canonical: set[str] = set()
         inserted_sessions: list[str] = []
         inserted_events: list[str] = []
         projection = {"sessions": 0, "messages": 0, "tools": 0}
@@ -1043,6 +1076,7 @@ def live_sync_once(
             for slot_id, family, mirror_path in removed:
                 outcome = _remove_slot(con, generation_id, slot_id)
                 touched |= outcome["old_sessions"]
+                doomed_canonical |= outcome["doomed_canonical_ids"]
                 rows_pruned += outcome["rows_pruned"]
                 _bump(per_family, family, removed=1, rows_pruned=outcome["rows_pruned"])
 
@@ -1069,7 +1103,8 @@ def live_sync_once(
                     rows_inserted=outcome["rows_inserted"],
                 )
 
-            projection = _project_sessions(con, generation_id, touched)
+            projection = _project_sessions(
+                con, generation_id, touched, extra_canonical_ids=doomed_canonical)
             _assert_invariants(
                 con,
                 generation_id,

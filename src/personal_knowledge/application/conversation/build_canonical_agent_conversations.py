@@ -12,14 +12,86 @@
 canonical store 契约：
   - canonical message 保留 role；assistant/subagent/tool 不能伪装为 user evidence
   - parent/subagent session 保持独立内容边界，通过 relation 表连接
-  - staging + 原子 replace；旧 canonical store 发布前备份
+  - 原子发布；旧 canonical store 发布前备份
   - legacy-only 和 AgentView-only session 都可回查
   - 无强证据的相似会话不自动合并
+
+发布语义（union）：以现有权威库为底，按 canonical_session_id 做增量并集——
+投影中的 id 新增或更新，现有库中投影没有的 id 原样保留、绝不删除。整库替换
+已退役：它对 v2 适配器轨（``v2|cs|`` 前缀 id）是毁灭性的，而 v1 链已让出
+主摄入地位，只作为缺口家族的 feeder 存活（见下）。
+
+union 的 id 消歧：AgentView 消息/tool 的 canonical id 只对 source id 取哈希
+（``_norm_id("cm","av", source_message_id)``），而整数型 source id（grok、
+zcode、qoder、gemini、codex 等家族的消息序号与 tool_event_id）跨家族并不
+唯一——2026-09-23 实测：冻结轨（cs|）与当前投影相撞 165 条 message + 874
+条 tool，涉及 24 个既有会话（zcode/grok/codex）。若放任 INSERT OR REPLACE，
+这些既有行会被投影行顶掉，证据归属被静默改判。因此碰撞的投影行改用确定性
+变体 id（``_norm_id("cm","av+session", session, source_id)``）：既有行原样
+保留、投影消息一条不丢，计数见 ``Id disambiguated``（副本实测 1039=165+874，
+发布后 24 个受影响会话消息/tool 行数零变化）。根治要改 id 方案（按 session
+命名空间），那会动摇所有下游证据锚点，不在本任务范围。
 
 用法::
 
     python build_canonical_agent_conversations.py --dry-run
     python build_canonical_agent_conversations.py --write
+    python build_canonical_agent_conversations.py --write --families chatgpt,gemini
+
+缺口家族（GAP_CHANNEL_FAMILIES）与判定证据
+==========================================
+
+v1 链（AgentsView → normalized → 本模块）是下列家族的唯一自动摄入源：适配器
+discovery 在本机没有可用的原生根，v2 轨因此一条都没有。证据为 2026-09-23 实测
+（AgentsView sessions.db 只读查询 + discovery.discover_client_sources() 实跑
++ 权威库 canonical_sessions 分轨统计）：
+
+AgentsView sessions.agent 分布（normalized 共 2351 会话）：codex 776、
+zcode 485、workbuddy 325、grok 247、chatgpt 170、antigravity 113、kimi 97、
+claude 62、vscode-copilot 20、qoder 17、mimocode 15、copilot 12、gemini 4、
+pi 3、kimi-work 2、opencode 2、cursor 1。
+
+逐家族缺口证据（ AgentsView 有 / discovery 实跑发现文件数 / v2 轨条数 ）：
+
+  chatgpt        170 / 0  / 0
+    discovery.py DEFAULT_ROOTS 的 chatgpt 条目是空元组（无原生目录，仅手动
+    zip 导入）；AgentsView 170 条会话 file_path 全为 NULL（SUM(file_path
+    IS NULL)=170），离开 AgentsView 即无源可读。权威库 104 条 chatgpt
+    会话全部来自 v1 轨。
+
+  vscode-copilot  20 / 12（但属 copilot CLI）/ 0
+    会话文件在 ``AppData/Roaming/Code/User/globalStorage/emptyWindowChatSessions``
+    （VS Code 聊天存储），不在任何 DEFAULT_ROOTS；discovery 在 ~/.copilot
+    找到的 12 个文件对应 'copilot' agent 的 12 条会话（两轨都有），与
+    vscode-copilot 的 20 条不是同一批。v1 轨独有 20 条。
+
+  mimocode        15 / 1（mimocode.db，但走 'mimo' 家族）/ 0
+    registry.resolve_family('mimocode') 抛 KeyError——AgentsView 的 agent
+    标签没有注册适配器家族（只注册了 'mimo'）；v2 轨以 'mimo' 标签投影了
+    同样 15 条会话（started_at 逐一相同，message_count 92 vs 37 等口径
+    不同），但没有任何按 AgentsView agent 名寻址的链路能解析它。v1 轨是
+    唯一以 'mimocode' 标签发布的记录。
+
+  gemini           4 / 0  / 0
+    会话树 ``~/.gemini/tmp/**/chats/session-*.json`` 命中 discovery 的
+    SKIP_DIR_NAMES（'tmp'），root 存在却扫不到文件；v1 轨独有 4 条。
+
+  kimi-work        2 / 0  / 0
+    会话文件在 ``AppData/Roaming/kimi-desktop/daimon-share/daimon/runtime/
+    kimi-code/home/sessions/wd_*``，而 DEFAULT_ROOTS 只列 ~/.kimi-work、
+    ~/.kimi-webbridge（其中只有 bin/daemon 文件）。两轨皆无：v1 轨冻结于
+    2026-07-25（cs| 轨 max started_at=2026-07-25T11:43:42.238Z），而这 2
+    条 started_at=2026-08-04，只有重跑老链才能进权威库。
+
+  qoder           17 / 7（不含主会话树）/ 0
+    已入权威库的 13 条会话文件在 ``~/.qoderwork/projects``，不在
+    DEFAULT_ROOTS（~/.qoder、~/.qoder-cli、~/.qoder-cn）；discovery 找到
+    的 7 个文件来自 .qoder/.qoder-cn 树。v2 轨 qoder 条数为 0，老链是
+    权威库中 qoder 会话的唯一发布者。
+
+反证（非缺口，无需 feeder）：codex/zcode/workbuddy/grok/kimi/claude/
+antigravity/opencode/pi/cursor/copilot 在 v2 轨均有投影（v2 轨 max
+started_at=2026-09-14），discovery 亦能发现其原生文件。
 """
 
 from __future__ import annotations
@@ -124,6 +196,12 @@ CANONICAL_INDEXES = [
     ("idx_ssl_source", "session_source_links", "source, source_session_id"),
 ]
 
+# 缺口家族白名单：适配器 discovery 在本机无可用原生根、v2 轨零覆盖，
+# 只有 v1 链（本模块）能读 AgentsView 的家族。判定证据见模块 docstring。
+GAP_CHANNEL_FAMILIES: tuple[str, ...] = (
+    "chatgpt", "vscode-copilot", "mimocode", "gemini", "kimi-work", "qoder",
+)
+
 
 def _norm_id(prefix: str, *parts: object) -> str:
     payload = "|".join(str(p) for p in parts)
@@ -149,6 +227,12 @@ class CrosswalkStats:
     file_hash_divergent: int = 0
     superseded_marked: int = 0
     unexpected_duplicate_stable_key: int = 0
+    family_filter: str = ""  # 生效时的家族过滤（空=不过滤）
+    union_preserved_sessions: int = 0  # 现有库中投影没有、原样保留的会话
+    union_added_sessions: int = 0  # 投影中现有库没有的新增会话
+    union_updated_sessions: int = 0  # 投影与现有库同 id 的覆写会话
+    legacy_only_skipped: int = 0  # 家族过滤下被跳过的 legacy-only 会话
+    union_id_disambiguated: int = 0  # 与保留行相撞、改用命名空间变体 id 的投影行数
 
 
 def _native_session_uuid(source: str, session_id: str) -> str | None:
@@ -166,22 +250,43 @@ def _native_session_uuid(source: str, session_id: str) -> str | None:
     return value.lower() if value else None
 
 
-def _load_agentsview_sessions(db: Path) -> list[dict]:
-    """从 normalized DB 读 eligible agent sessions + messages + tools。"""
+def _load_agentsview_sessions(
+    db: Path, families: set[str] | None = None
+) -> list[dict]:
+    """从 normalized DB 读 eligible agent sessions + messages + tools。
+
+    ``families`` 非 None 时只保留 agent（大小写不敏感）在集合内的会话——
+    缺口家族 feeder 通道用此把构建产物收缩到指定家族。``ingest_quarantine``
+    表存在时（由 authority_ingest 软门创建），其中登记的源会话被排除出本次
+    canonical 构建——软门问题会话进隔离表留待人工复查，批次其余部分照常发布。
+    表不存在时不过滤，旧 normalized 库行为不变。
+    """
     if not db.exists():
         return []
     con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
+    has_quarantine = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ingest_quarantine'"
+    ).fetchone() is not None
+    where = (" WHERE source_session_id NOT IN "
+             "(SELECT source_session_id FROM ingest_quarantine)"
+             if has_quarantine else "")
     sessions = [
         dict(r) for r in con.execute(
             "SELECT session_id, source_session_id, agent, started_at, ended_at, "
             "message_count, user_message_count, file_hash, parent_session_id, "
             "relationship_type, cwd, git_branch, evidence_eligible, evidence_scope "
-            "FROM sessions"
+            f"FROM sessions{where}"
             " ORDER BY started_at, session_id"
         )
     ]
     con.close()
+    if families:
+        # 空集合按不过滤处理：与 CLI 把 --families "" 解析为不过滤一致，
+        # 避免调用方误传空集合把整个发布打成空转。
+        wanted = {str(f).strip().lower() for f in families if str(f).strip()}
+        sessions = [s for s in sessions
+                    if str(s.get("agent") or "").strip().lower() in wanted]
     return sessions
 
 
@@ -289,11 +394,16 @@ def build_crosswalk(
     legacy_sessions: list[dict],
     legacy_db: Path,
     stats: CrosswalkStats,
+    families: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """构建 canonical session 列表 + source links。
 
     返回 ``(canonical_sessions_meta, source_links)``。
     canonical_sessions_meta 每项含 canonical_session_id, primary_source, merged source ids。
+
+    ``families`` 非 None 时启用家族过滤：产物只含指定家族（ AgentsView 侧
+    已在加载时过滤 ），legacy 侧仅作为这些会话的合并配对出现——legacy-only
+    会话不进入产物，否则不过滤的 legacy 全会话会从家族缝隙漏进构建结果。
     """
     stats.agentsview_sessions = len(agentsview_sessions)
     stats.legacy_sessions = len(legacy_sessions)
@@ -439,12 +549,18 @@ def build_crosswalk(
 
     # Pass 3: legacy-only sessions. Same-hash legacy twins remain separate so
     # lifecycle/supersede semantics are observable instead of being collapsed.
-    for leg_sess in legacy_sessions:
-        leg_sid = leg_sess["session_id"]
-        if leg_sid in seen_legacy:
-            continue
-        add_canonical(None, leg_sess, match_method="single_source", merged=False)
-        stats.legacy_only += 1
+    # 家族过滤激活时整段跳过：legacy 只以合并配对身份出现（见 build_crosswalk docstring）。
+    if families is None:
+        for leg_sess in legacy_sessions:
+            leg_sid = leg_sess["session_id"]
+            if leg_sid in seen_legacy:
+                continue
+            add_canonical(None, leg_sess, match_method="single_source", merged=False)
+            stats.legacy_only += 1
+    else:
+        stats.legacy_only_skipped = sum(
+            1 for s in legacy_sessions if s["session_id"] not in seen_legacy
+        )
 
     weak_groups: dict[str, list[dict]] = {}
     for item in canonical_list:
@@ -472,6 +588,93 @@ def build_crosswalk(
     return canonical_list, source_links
 
 
+def _table_exists_in(con: sqlite3.Connection, schema: str, name: str) -> bool:
+    return con.execute(
+        f"SELECT 1 FROM {schema}.sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone() is not None
+
+
+def _union_preserve_existing(
+    con: sqlite3.Connection,
+    dest_db: Path,
+    canonical_list: list[dict],
+    stats: CrosswalkStats,
+) -> None:
+    """把现有权威库中投影没有的 canonical id 原样并进 staging（union 发布）。
+
+    以 canonical_session_id 为界：投影已包含的 id 由本次构建全权重写
+    （新增或更新），现有库中投影没有的 id 一行不删、原样保留——v2 适配器
+    轨（``v2|cs|`` 前缀）即由此在 v1 链发布后存活。session_relations 只在
+    两端都未被投影覆写时保留（投影只为自有会话重写关系）。ATTACH/DETACH 都不能
+    在事务内执行，故本函数自行管理 commit 边界；复制全程在 staging 内完成，
+    未写完则发布方的 os.replace 永不发生，现有库不受影响。
+    """
+    if not dest_db.exists():
+        return
+    projected = {c["canonical_session_id"] for c in canonical_list}
+    con.commit()  # ATTACH 不能在事务内执行
+    con.execute("ATTACH DATABASE ? AS existing",
+                (dest_db.as_uri() + "?mode=ro",))
+    try:
+        existing_ids = {
+            r[0] for r in con.execute(
+                "SELECT canonical_session_id FROM existing.canonical_sessions")
+        }
+        stats.union_preserved_sessions = len(existing_ids - projected)
+        stats.union_added_sessions = len(projected - existing_ids)
+        stats.union_updated_sessions = len(projected & existing_ids)
+        preserved = sorted(existing_ids - projected)
+        con.commit()  # DETACH 不能在事务内执行（报 'database existing is locked'）
+        if not preserved:
+            return
+        # 保留 id 先进 temp 表：relations 要同时匹配两端，分块 IN 会漏掉
+        # 跨块的父子关系；join temp 表一条语句搞定，也绕开变量数上限。
+        con.execute(
+            "CREATE TEMP TABLE union_preserved_ids "
+            "(canonical_session_id TEXT PRIMARY KEY)")
+        con.executemany(
+            "INSERT OR IGNORE INTO union_preserved_ids VALUES (?)",
+            [(csid,) for csid in preserved],
+        )
+        for table in ("canonical_sessions", "canonical_messages",
+                      "canonical_tool_events", "session_source_links"):
+            if not _table_exists_in(con, "existing", table):
+                continue
+            cols = ", ".join(c for c, _ in CANONICAL_SCHEMA[table])
+            con.execute(
+                f"INSERT INTO main.{table} ({cols}) "
+                f"SELECT {cols} FROM existing.{table} "
+                f"WHERE canonical_session_id IN "
+                f"(SELECT canonical_session_id FROM union_preserved_ids)"
+            )
+        if _table_exists_in(con, "existing", "session_relations"):
+            rel_cols = ", ".join(c for c, _ in CANONICAL_SCHEMA["session_relations"])
+            con.execute(
+                f"INSERT INTO main.session_relations ({rel_cols}) "
+                f"SELECT {rel_cols} FROM existing.session_relations "
+                f"WHERE parent_canonical_id IN "
+                f"(SELECT canonical_session_id FROM union_preserved_ids) "
+                f"AND child_canonical_id IN "
+                f"(SELECT canonical_session_id FROM union_preserved_ids)"
+            )
+        # crosswalk_review 不挂 canonical id；当前投影不写该表，OR IGNORE
+        # 保证万一未来投影写入同 review_id 时投影行优先、不撞主键。
+        if _table_exists_in(con, "existing", "crosswalk_review"):
+            rev_cols = ", ".join(c for c, _ in CANONICAL_SCHEMA["crosswalk_review"])
+            con.execute(
+                f"INSERT OR IGNORE INTO main.crosswalk_review ({rev_cols}) "
+                f"SELECT {rev_cols} FROM existing.crosswalk_review"
+            )
+        con.execute("DROP TABLE union_preserved_ids")
+        con.commit()  # union 复制落账后再 DETACH
+    finally:
+        try:
+            con.execute("DETACH DATABASE existing")
+        except sqlite3.Error:
+            pass
+
+
 def _write_canonical_store(
     dest_db: Path,
     canonical_list: list[dict],
@@ -483,7 +686,9 @@ def _write_canonical_store(
 ) -> Path | None:
     """写 canonical store：sessions + messages + tools + links + relations。"""
     staging = dest_db.parent / f"{dest_db.stem}.staging.sqlite"
-    con = sqlite3.connect(str(staging))
+    # uri=True：union 发布要 ATTACH 只读打开现有库（URI 文件名处理是连接级
+    # 设置，普通 connect 会把 file:…?mode=ro 当字面路径而打不开）。
+    con = sqlite3.connect(staging.as_uri(), uri=True)
     cur = con.cursor()
 
     # 建 schema
@@ -552,6 +757,48 @@ def _write_canonical_store(
     msg_rows: list[tuple] = []
     tool_rows: list[tuple] = []
 
+    # union 发布的 id 消歧输入：现有库里属于"非投影会话"的 message/tool id。
+    # 这些 id 投影不得占用——整数型 source id（grok/zcode/qoder/gemini 等
+    # 家族的消息序号、tool_event_id）跨家族相撞是既有数据缺陷，冻结轨与当前
+    # 投影因此会算出同一个 canonical id。直接INSERT会覆盖既有行（静默改判
+    # 证据归属），故碰撞的投影行改用会话命名空间变体 id，两边都保留。
+    reserved_msg_ids: set[str] = set()
+    reserved_tool_ids: set[str] = set()
+    if dest_db.exists():
+        projected_csids = {c["canonical_session_id"] for c in canonical_list}
+        rcon = sqlite3.connect(f"file:{dest_db.as_posix()}?mode=ro", uri=True)
+        try:
+            if _table_exists(rcon, "canonical_messages"):
+                reserved_msg_ids = {
+                    r[0] for r in rcon.execute(
+                        "SELECT canonical_message_id, canonical_session_id"
+                        " FROM canonical_messages")
+                    if r[1] not in projected_csids
+                }
+            if _table_exists(rcon, "canonical_tool_events"):
+                reserved_tool_ids = {
+                    r[0] for r in rcon.execute(
+                        "SELECT canonical_tool_id, canonical_session_id"
+                        " FROM canonical_tool_events")
+                    if r[1] not in projected_csids
+                }
+        finally:
+            rcon.close()
+
+    def _av_msg_id(av_src: str, source_ref: str) -> str:
+        natural = _norm_id("cm", "av", source_ref)
+        if natural in reserved_msg_ids:
+            stats.union_id_disambiguated += 1
+            return _norm_id("cm", "av+session", av_src, source_ref)
+        return natural
+
+    def _av_tool_id(av_src: str, tool_event_id: str) -> str:
+        natural = _norm_id("cte", "av", tool_event_id)
+        if natural in reserved_tool_ids:
+            stats.union_id_disambiguated += 1
+            return _norm_id("cte", "av+session", av_src, tool_event_id)
+        return natural
+
     # AgentView messages + tool events（从 normalized DB）
     if av_db.exists():
         probe_con = sqlite3.connect(f"file:{av_db.as_posix()}?mode=ro", uri=True)
@@ -592,7 +839,7 @@ def _write_canonical_store(
                         continue
                     stats.canonical_messages += 1
                     msg_rows.append((
-                        _norm_id("cm", "av", m["source_message_id"] or m["message_id"]),
+                        _av_msg_id(av_src, m["source_message_id"] or m["message_id"]),
                         csid, "agentsview", str(m["source_message_id"] or m["message_id"]),
                         m["ordinal"], m["role"], m["content"], m["content_length"],
                         m["timestamp"], m["model"], m["is_system"], m["is_sidechain"],
@@ -611,7 +858,7 @@ def _write_canonical_store(
                         continue
                     stats.canonical_tool_events += 1
                     tool_rows.append((
-                        _norm_id("cte", "av", t["tool_event_id"]),
+                        _av_tool_id(av_src, t["tool_event_id"]),
                         csid, "agentsview", t["source_kind"], t["tool_name"],
                         t["category"], t["status"], t["call_index"],
                         t["subagent_session_id"], t["content_length"], t["timestamp"],
@@ -690,11 +937,17 @@ def _write_canonical_store(
                 )
 
     con.commit()
-    con.close()
 
     if dry_run:
+        con.close()
         staging.unlink(missing_ok=True)
         return None
+
+    # union 发布：先把现有权威库中投影没有的 id 并进 staging，再备份 +
+    # 原子 replace。staging 未写完则 replace 永不发生，现有库不受影响。
+    _union_preserve_existing(con, dest_db, canonical_list, stats)
+    con.commit()
+    con.close()
 
     dest_db.parent.mkdir(parents=True, exist_ok=True)
     if dest_db.exists():
@@ -704,22 +957,65 @@ def _write_canonical_store(
     return dest_db
 
 
+def _assert_publish_compatible(dest_db: Path, canonical_list: list) -> None:
+    """Fail closed when a migrated authority DB would be re-published with
+    pre-migration ids.
+
+    ``uniform_id_migration`` re-keyed the whole store onto origin-derived ids
+    (``cs|<family>|<native_session_id>``, recorded by the ``id_migration_map``
+    table). This module still derives ids the old way (``cs|<hash>``), so
+    publishing into a migrated DB would recreate the dual-track state the
+    migration removed — the same native session under two ids in one table.
+    Refuse instead, and migrate this module's id derivation first.
+    """
+    if not dest_db.exists():
+        return
+    con = sqlite3.connect(f"file:{dest_db.as_posix()}?mode=ro", uri=True)
+    try:
+        migrated = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='id_migration_map'"
+        ).fetchone() is not None
+    finally:
+        con.close()
+    if not migrated:
+        return
+    stale = [str(c.get("canonical_session_id") or "") for c in canonical_list]
+    stale = [s for s in stale if s.count("|") < 2]
+    if stale:
+        raise RuntimeError(
+            f"authority DB {dest_db} uses uniform origin-derived ids "
+            f"(id_migration_map present), but this build derives "
+            f"{len(stale)} pre-migration session ids (e.g. {stale[0]}). "
+            "Publishing would recreate the dual-track id state. Migrate "
+            "build_canonical_agent_conversations' id derivation to "
+            "uniform_id_migration.make_session_id/make_message_id first."
+        )
+
+
 def run(dry_run: bool, write: bool,
         av_db: Path = AGENTSVIEW_NORMALIZED_DB,
         legacy_db: Path = AGENT_DB,
-        dest_db: Path = AGENT_CONVERSATIONS_DB) -> int:
+        dest_db: Path = AGENT_CONVERSATIONS_DB,
+        families: set[str] | None = None) -> int:
     if dry_run and write:
         print("[error] --dry-run 与 --write 互斥", file=sys.stderr)
         return 2
 
     stats = CrosswalkStats()
+    if families is not None:
+        # 空集合归一为 None（不过滤），与 loader / CLI 的约定一致
+        families = {str(f).strip() for f in families if str(f).strip()} or None
+    stats.family_filter = ",".join(sorted(families)) if families else ""
 
-    av_sessions = _load_agentsview_sessions(av_db)
+    av_sessions = _load_agentsview_sessions(av_db, families)
     legacy_sessions = _load_legacy_sessions(legacy_db)
 
     canonical_list, source_links = build_crosswalk(
-        av_sessions, legacy_sessions, legacy_db, stats
+        av_sessions, legacy_sessions, legacy_db, stats, families
     )
+
+    if write:
+        _assert_publish_compatible(dest_db, canonical_list)
 
     final = _write_canonical_store(
         dest_db, canonical_list, source_links, av_db, legacy_db, stats, dry_run
@@ -746,6 +1042,16 @@ def run(dry_run: bool, write: bool,
     print(f"Tool events:        {stats.canonical_tool_events}")
     print(f"Duplicate links:    {stats.duplicate_source_links} (must be 0)")
     print(f"Review auto-merged: {stats.review_auto_merged} (must be 0)")
+    if stats.family_filter:
+        print(f"--- family filter ---")
+        print(f"Families:           {stats.family_filter}")
+        print(f"Legacy-only skipped: {stats.legacy_only_skipped}")
+    if not dry_run:
+        print(f"--- union publish ---")
+        print(f"Preserved sessions: {stats.union_preserved_sessions}")
+        print(f"Added sessions:     {stats.union_added_sessions}")
+        print(f"Updated sessions:   {stats.union_updated_sessions}")
+        print(f"Id disambiguated:   {stats.union_id_disambiguated}")
 
     if final:
         print(f"\n[ok] canonical store 已发布: {final}")
@@ -760,13 +1066,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--write", action="store_true")
+    p.add_argument("--families", default="",
+                   help="逗号分隔的家族白名单（如 chatgpt,gemini）；"
+                        "只构建指定家族，legacy 仅作合并配对。默认不过滤。")
     p.add_argument("--av-db", type=Path, default=AGENTSVIEW_NORMALIZED_DB)
     p.add_argument("--legacy-db", type=Path, default=AGENT_DB)
     p.add_argument("--dest-db", type=Path, default=AGENT_CONVERSATIONS_DB)
     args = p.parse_args(argv)
     if not args.dry_run and not args.write:
         args.dry_run = True  # 默认 dry-run
-    return run(args.dry_run, args.write, args.av_db, args.legacy_db, args.dest_db)
+    families = {f.strip() for f in args.families.split(",") if f.strip()} or None
+    return run(args.dry_run, args.write, args.av_db, args.legacy_db, args.dest_db,
+               families)
 
 
 if __name__ == "__main__":

@@ -63,7 +63,8 @@ def capability() -> CapabilityDescriptor:
     return CapabilityDescriptor(
         family=FAMILY, adapter_version=ADAPTER_VERSION, contract_version=CONTRACT_VERSION,
         supported_event_kinds=(EventKind.SESSION_LIFECYCLE, EventKind.USER_MESSAGE,
-                               EventKind.ASSISTANT_MESSAGE, EventKind.USAGE,
+                               EventKind.ASSISTANT_MESSAGE, EventKind.TOOL_CALL,
+                               EventKind.TURN_BOUNDARY, EventKind.USAGE,
                                EventKind.UNKNOWN_NATIVE),
         supported_relation_kinds=(),
         fidelity_dimensions=tuple(FidelityDimension),
@@ -324,6 +325,52 @@ def _first_model(rows):
     return None
 
 
+def _tool_input_text(block: dict) -> str | None:
+    """Serialize a tool_use input without dropping the arguments."""
+    raw = block.get("input")
+    if raw is None:
+        raw = block.get("arguments")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw or None
+    try:
+        return json.dumps(raw, ensure_ascii=False, sort_keys=True) or None
+    except (TypeError, ValueError):
+        return str(raw) or None
+
+
+def _content_parts(source_content):
+    """Plain text plus tool_use blocks from a Cursor message body.
+
+    String content stays a string. A list of ``{type: text, text: ...}``
+    blocks becomes the joined text, not ``str(list)``. ``tool_use`` blocks
+    are returned separately so they can become tool events.
+    """
+    if source_content is None:
+        return None, []
+    if isinstance(source_content, str):
+        return source_content, []
+    if not isinstance(source_content, list):
+        return str(source_content), []
+    texts: list[str] = []
+    tools: list[dict] = []
+    for block in source_content:
+        if isinstance(block, str):
+            texts.append(block)
+            continue
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use":
+            tools.append(block)
+            continue
+        raw = block.get("text")
+        if raw is not None and block.get("type") in (None, "text"):
+            texts.append(str(raw))
+    text = "\n".join(part for part in texts if part != "")
+    return text, tools
+
+
 def _first_user_message(rows):
     """Use the first user message as the session title (bounded)."""
     for row in rows:
@@ -331,8 +378,9 @@ def _first_user_message(rows):
             continue
         message = row.get("message")
         content = message.get("content") if isinstance(message, dict) else message
-        if isinstance(content, str) and content.strip():
-            return content.strip()[:256]
+        text, _tools = _content_parts(content)
+        if isinstance(text, str) and text.strip():
+            return text.strip()[:256]
     return None
 
 
@@ -386,9 +434,23 @@ def _adapt_jsonl(artifact: SourceArtifact, *, artifact_root: Path) -> Adaptation
             source_content = message.get("content")
         else:
             source_content = message
-        exact_content = None if source_content is None else str(source_content)
+        exact_content, tool_blocks = _content_parts(source_content)
         is_message = kind in (EventKind.USER_MESSAGE, EventKind.ASSISTANT_MESSAGE)
+        raw_error = row.get("error")
+        if raw_error is None and isinstance(message, dict):
+            raw_error = message.get("error")
+        error_text = None if raw_error is None else (
+            raw_error if isinstance(raw_error, str) else _tool_input_text(
+                {"input": raw_error}
+            )
+        )
         locator = f"{artifact.relative_path}#L{index}"
+        if kind is EventKind.TURN_BOUNDARY and error_text:
+            non_message_summary = error_text[:2048]
+        elif exact_content:
+            non_message_summary = exact_content[:2048]
+        else:
+            non_message_summary = None
         events.append(TypedEvent(
             event_id=make_event_id(
                 FAMILY, artifact.artifact_id, CONTRACT_VERSION, None,
@@ -408,11 +470,36 @@ def _adapt_jsonl(artifact: SourceArtifact, *, artifact_root: Path) -> Adaptation
             ),
             ordinal=index,
             content=exact_content if is_message else None,
-            summary=None if is_message else (
-                exact_content[:2048] or None if exact_content is not None else None
-            ),
+            summary=None if is_message else non_message_summary,
             native_payload_ref=f"{artifact.artifact_id}:{locator}",
         ))
+        if is_message:
+            for tool_index, block in enumerate(tool_blocks, start=1):
+                tool_locator = f"{locator}#tool:{tool_index}"
+                events.append(TypedEvent(
+                    event_id=make_event_id(
+                        FAMILY, artifact.artifact_id, CONTRACT_VERSION, None,
+                        kind=EventKind.TOOL_CALL, session_id=session_id,
+                        native_locator=tool_locator,
+                    ),
+                    session_id=session_id, kind=EventKind.TOOL_CALL,
+                    provenance=Provenance(
+                        artifact_id=artifact.artifact_id,
+                        artifact_hash=artifact.content_hash,
+                        native_locator=tool_locator,
+                        native_session_id=native_session,
+                        contract_version=CONTRACT_VERSION,
+                    ),
+                    fidelity=_fidelity(
+                        RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
+                        COMPACTION_VISIBILITY=FidelityLevel.UNKNOWN,
+                        NATIVE_ID_STABILITY=FidelityLevel.PARTIAL,
+                    ),
+                    ordinal=index,
+                    content=_tool_input_text(block),
+                    summary=str(block.get("name") or "tool_use")[:256] or None,
+                    native_payload_ref=f"{artifact.artifact_id}:{tool_locator}",
+                ))
         usage = row.get("usage")
         if isinstance(usage, dict) or isinstance(usage, (int, float)) or any(
             k in row for k in ("input_tokens", "output_tokens", "prompt_tokens",

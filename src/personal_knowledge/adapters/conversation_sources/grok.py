@@ -376,7 +376,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                     event = _with_disposition(
                         event, field_name="encrypted_content",
                         disposition=FieldDisposition.PRESERVED_BY_REFERENCE,
-                        reason="reasoning content is encrypted; plaintext not available",
+                        reason="encrypted_content 无密钥",
                     )
                 events.append(event)
                 continue
@@ -429,6 +429,41 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                     fidelity=_fidelity(CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
                     native_session=native_session,
                 ))
+
+    # ``events.jsonl`` is a side channel (phase changes, tool start/stop), not
+    # a message transcript. Every record still becomes an event: the native
+    # type is named in the disposition reason so it is not a bare unknown and
+    # not a silent drop.
+    events_artifact = by_path.get("events.jsonl")
+    if events_artifact is not None:
+        for index, row in enumerate(_read_jsonl_blob(artifact_root, events_artifact)):
+            native_type = row.get("type")
+            type_name = native_type if isinstance(native_type, str) and native_type else ""
+            locator = f"events.jsonl#{index}"
+            native_id = str(row.get("id") or f"event-{index}")
+            reason = (
+                f"events.jsonl type {type_name} is not a message"
+                if type_name
+                else "events.jsonl record has no type"
+            )
+            occurred = row.get("ts")
+            event = _event(
+                events_artifact, session_id=session_id,
+                kind=EventKind.UNKNOWN_NATIVE,
+                locator=locator, native_id=native_id,
+                occurred_at=occurred if isinstance(occurred, str) else None,
+                fidelity=_fidelity(
+                    STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
+                    RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
+                    CONTENT_AVAILABILITY=FidelityLevel.PARTIAL,
+                ),
+                native_session=native_session,
+            )
+            events.append(_with_disposition(
+                event, field_name=type_name or "type",
+                disposition=FieldDisposition.UNSUPPORTED,
+                reason=reason,
+            ))
 
     # Compaction: a markdown/checkpoint file is a typed compaction summary.
     for name in ("compaction.md", "checkpoint.json", "recap.md"):
