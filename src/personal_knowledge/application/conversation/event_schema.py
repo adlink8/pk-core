@@ -18,6 +18,10 @@ Tables:
   - ``ce_events``                — typed semantic events (D-10/D-11)
   - ``ce_event_relations``       — first-class relations (D-12)
   - ``ce_field_dispositions``    — explicit field mapping decisions (D-07)
+  - ``ce_event_versions``        — append-only history of superseded
+                                  ``ce_events`` rows: one row per *previous*
+                                  value of an event, ``version_seq`` from 0
+  - ``ce_session_versions``      — the same for superseded ``ce_sessions`` rows
   - ``ce_generation_authority``  — active-generation pointer (read-only here;
                                   activation owned by a later orchestration plan)
   - ``ce_live_slots``            — stable per-source-slot registry: ``slot_id``
@@ -44,6 +48,8 @@ V2_TABLES = (
     "ce_events",
     "ce_event_relations",
     "ce_field_dispositions",
+    "ce_event_versions",
+    "ce_session_versions",
     "ce_generation_authority",
     "ce_schema_meta",
     "ce_live_slots",
@@ -170,6 +176,59 @@ _DDL: tuple[str, ...] = (
         updated_at    TEXT
     )
     """,
+    # ---- Append-only row history (live-sync collection contract) ----------
+    # ``ce_events`` / ``ce_sessions`` are keyed by ``(generation_id, id)``, so a
+    # row has exactly ONE version in place; "the same id carrying different
+    # values" can therefore only be kept in a side table. The live-sync engine
+    # appends a row's *current* values here (``version_seq`` from 0, incremented
+    # per id, ``superseded_at`` = the moment it was replaced) before refreshing
+    # the main row in place. Nothing is ever overwritten: the collected store
+    # keeps every value it has ever seen, in the same style as the KU growth
+    # line. Deliberately NO foreign key: an archive must be able to outlive the
+    # row it describes and must never block a write.
+    """
+    CREATE TABLE IF NOT EXISTS ce_event_versions (
+        generation_id      TEXT NOT NULL,
+        event_id           TEXT NOT NULL,
+        version_seq        INTEGER NOT NULL,
+        session_id         TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        artifact_id        TEXT NOT NULL,
+        native_locator     TEXT NOT NULL,
+        native_event_id    TEXT,
+        occurred_at        TEXT,
+        ordinal            INTEGER,
+        native_payload_ref TEXT,
+        content            TEXT,
+        summary            TEXT,
+        contract_version   TEXT NOT NULL,
+        fidelity_json      TEXT NOT NULL,
+        superseded_at      TEXT NOT NULL,
+        PRIMARY KEY (generation_id, event_id, version_seq)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ce_session_versions (
+        generation_id      TEXT NOT NULL,
+        session_id         TEXT NOT NULL,
+        version_seq        INTEGER NOT NULL,
+        family             TEXT NOT NULL,
+        native_session_id  TEXT,
+        started_at         TEXT,
+        ended_at           TEXT,
+        artifact_id        TEXT NOT NULL,
+        native_locator     TEXT NOT NULL,
+        contract_version   TEXT NOT NULL,
+        fidelity_json      TEXT NOT NULL,
+        cwd                TEXT,
+        git_branch         TEXT,
+        model              TEXT,
+        title              TEXT,
+        stop_reason        TEXT,
+        superseded_at      TEXT NOT NULL,
+        PRIMARY KEY (generation_id, session_id, version_seq)
+    )
+    """,
     """
     CREATE INDEX IF NOT EXISTS ce_sessions_generation_family
         ON ce_sessions(generation_id, family, session_id)
@@ -209,6 +268,11 @@ _DDL: tuple[str, ...] = (
         UNIQUE(family, mirror_path)
     )
     """,
+    # ``rows_pruned`` is a legacy name for "rows the apply removed"; the live
+    # engine never removes a collected row, so it is written as 0 and the
+    # per-run refresh counters live in ``detail`` (rows_updated / rows_versioned
+    # / removed_slots). The column is kept because SQLite cannot drop one
+    # without rebuilding the table, and rebuilding it would be a delete.
     """
     CREATE TABLE IF NOT EXISTS ce_live_sync_log (
         sync_id        TEXT PRIMARY KEY,

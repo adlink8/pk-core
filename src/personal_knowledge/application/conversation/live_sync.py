@@ -4,7 +4,7 @@ Why this module exists
 ----------------------
 ``pk-sync conversations --v2-native`` stages a **new immutable generation** per
 run: the cohort id is derived from the whole staged set, so one changed byte
-produces a new generation id, every mirrored file is re-parsed, and every event
+produces a new generation id, every collected file is re-parsed, and every event
 row is rewritten (measured 2026-09-14: 872,069 events / ~1.9 GiB per run, of
 which ~11 % was genuinely new). Nothing ever prunes old generations.
 
@@ -17,39 +17,57 @@ event ids are derived from ``(family, artifact_id, contract_version, native id)`
 so a file edit no longer rotates the ids of the rows it previously produced.
 
 This module is the engine that exploits it. ``live_sync_once`` keeps **one** live
-generation and replaces data **per source slot**::
+generation and grows it **per source slot**::
 
-    changed file -> re-capture + adapt that file alone -> prune exactly the rows
-    of that slot that are no longer current -> INSERT OR IGNORE the current rows
+    changed file -> re-capture + adapt that file alone -> refresh the rows that
+    file now emits -> INSERT the rows it newly contributes
+
+The store is a **collection**, not a mirror: what has been collected stays
+collected.
 
 Correctness notes
 -----------------
 * **One transaction.** The whole apply runs under a single ``BEGIN IMMEDIATE``;
   a crash rolls back completely, so there is no recovery logic and no partial
   slot. The DB is never left half-migrated.
-* **Prune set.** Because a surviving event id can still carry changed values
-  (an edited message body keeps its native id and locator, and a session row's
-  ``ended_at`` moves when a turn is appended), the prune set is
-  ``stale ids (no longer emitted) ∪ dirty ids (same id, different row)``.
-  Deleting only the stale ids would leave stale *content* behind and
-  ``INSERT OR IGNORE`` could not repair it. Unchanged rows are never touched,
-  which is what keeps a one-file edit to a handful of written rows.
-* **FK-safe order.** No v2 FK declares ``ON DELETE CASCADE``, so deletes are
+* **Append-only.** No row of ``ce_sessions`` / ``ce_events`` /
+  ``ce_event_relations`` is ever deleted, for any reason, and no row is ever
+  rewritten with its previous value lost. A same id can still carry different
+  values (an edited message body keeps its native id and locator; a session
+  row's ``ended_at`` moves when a turn is appended), so the three buckets are:
+  - **stale ids** (the id is stored but the source no longer emits it: a
+    truncated/edited file, a vanished source file, a deactivated slot) — the
+    collected row is left exactly as it was captured;
+  - **dirty ids** (the id is stored and its row values changed) — the row's
+    *current* values are appended to ``ce_event_versions`` /
+    ``ce_session_versions`` (``version_seq`` from 0 per id, ``superseded_at`` =
+    now) and the main row is then refreshed **in place** with an ``UPDATE``.
+    ``INSERT OR IGNORE`` alone could not do that: it is a no-op for a present
+    id, which is how stale *content* used to survive unnoticed;
+  - **new ids** — ``INSERT OR IGNORE``.
+  The only writes this engine performs are INSERT, UPDATE and state markers.
+* **No FK cascade to worry about.** Because nothing is deleted, the deletes once
   ordered ``ce_event_relations -> ce_field_dispositions -> ce_events ->
-  ce_sessions``. Relations are deleted from **both** endpoint columns.
-  ``ce_source_artifacts`` rows are **kept** (the slot is marked ``active = 0``)
-  so provenance/history of a removed source survives reconciliation.
-* **Projection.** The compatibility rows are recomputed only for the sessions
-  the apply touched. That is exact, not approximate: every projected row is a
-  pure function of one session and that session's own events
-  (``canonical_session_id = f(session_id)``, ``canonical_message_id =
-  f(event_id)``). The whole generation is never re-projected.
-* **Fast path.** A ``(mtime_ns, size)`` fingerprint per mirror path is kept in
+  ce_sessions`` no longer exist; ``ce_source_artifacts`` rows are likewise kept
+  (a vanished source slot is only marked ``active = 0``), so the provenance and
+  every collected row of a removed source survive reconciliation.
+* **Projection.** The compatibility rows are recomputed only for the sessions the
+  apply touched, and are written with ``upsert_compatibility_projection``
+  (insert missing, ``UPDATE`` changed — never delete). That is exact, not
+  approximate: every projected row is a pure function of one session and that
+  session's own events (``canonical_session_id = f(session_id)``,
+  ``canonical_message_id = f(event_id)``). The whole generation is never
+  re-projected, the rows of a deactivated slot keep the exact projection they
+  were collected with, and no ``canonical_*`` rowid moves or gets recycled —
+  which is the contract the rowid cursor in
+  ``retrieval/conversation_fts.py`` (:28-33) depends on.
+* **Fast path.** A ``(mtime_ns, size)`` fingerprint per collected path is kept in
   ``ce_live_state['mirror_fingerprints']``, so an unchanged file is neither
   hashed nor parsed.
-* **No new tables.** The schema (including ``ce_live_slots`` / ``ce_live_state``
-  / ``ce_live_sync_log`` and the three supporting indexes) is owned by
-  ``event_schema``; this module declares no DDL of its own.
+* **Schema.** All DDL (including ``ce_live_slots`` / ``ce_live_state`` /
+  ``ce_live_sync_log``, the two ``*_versions`` history tables and the three
+  supporting indexes) is owned by ``event_schema``; this module declares no DDL
+  of its own.
 
 Known limits (deliberate, documented rather than hidden)
 --------------------------------------------------------
@@ -61,11 +79,19 @@ Known limits (deliberate, documented rather than hidden)
   generation's artifact to bytes will find the newer content hash. Consequence
   and handling are spelled out at ``_refresh_artifact_row``.
 * Rollback is the enclosing transaction, not a generation pointer: there is
-  exactly one live generation, mutated in place.
-* A relation that disappears while **both** endpoints survive is only pruned
-  when both endpoints belong to the replaced slot (the normal case, since every
-  adapter is handed a single-artifact set). A cross-artifact relation whose
-  endpoints both live in other, untouched slots is preserved.
+  exactly one live generation, grown in place.
+* Derived rows are not history-carrying. ``ce_event_relations`` and
+  ``ce_field_dispositions`` have no ``*_versions`` companion, so a relation or
+  disposition that disappears from the source is retained as collected evidence,
+  and a *changed* one (same primary key, different values) keeps its first
+  captured values because both inserts are ``INSERT OR IGNORE``. Relation ids
+  are derived per code path (``rel-call:<event_id>`` &c.), which is why a
+  changed relation has not been observed in practice; a ``ce_relation_versions``
+  table would be the fix if it ever is.
+* Deactivating a slot records ``{slot_id, family, mirror_path, removed_at}`` in
+  ``ce_live_state['removed_slots']`` (append-only) and in the run's
+  ``ce_live_sync_log.detail``, so "which source disappeared and when" stays
+  auditable without removing its rows.
 
 The CLI (``pk-sync conversations --live-sync``) and the watch loop are later
 milestones; this module is the engine only. No live canonical store is ever
@@ -102,12 +128,8 @@ from personal_knowledge.adapters.conversation_sources.snapshots import (
 )
 from personal_knowledge.application.conversation import event_schema
 from personal_knowledge.application.conversation.compatibility_projection import (
-    _ensure_tables,
     compute_projection,
-    write_compatibility_projection,
-)
-from personal_knowledge.application.conversation.uniform_id_migration import (
-    make_session_id,
+    upsert_compatibility_projection,
 )
 from personal_knowledge.application.conversation.event_repository import (
     GenerationInput,
@@ -123,9 +145,10 @@ from personal_knowledge.application.conversation.event_repository import (
 # ``ce_live_state`` keys owned by this engine.
 FINGERPRINT_STATE_KEY = "mirror_fingerprints"
 LAST_SYNC_STATE_KEY = "last_sync"
+REMOVED_SLOTS_STATE_KEY = "removed_slots"
 
 # SQLite's default parameter ceiling is 999 (older builds) / 32766 (3.32+).
-# Chunk well below both so a large prune can never fail on arity.
+# Chunk well below both so a large id set can never fail on arity.
 _PARAM_CHUNK = 400
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
@@ -185,16 +208,18 @@ def _get_state(con: sqlite3.Connection, key: str) -> str | None:
     return None if row is None else row[0]
 
 
-# ------------------------------------------------------------- mirror scan
+# ------------------------------------------------------------ source scan
 
 
 def scan_mirror(mirror_root: Path) -> dict[str, tuple[str, Path]]:
-    """Enumerate the mirrored sources as ``{mirror_path: (family, path)}``.
+    """Enumerate the collected sources as ``{mirror_path: (family, path)}``.
 
     ``mirror_path`` is the path relative to ``mirror_root`` (``"<family>/<rel>"``,
     via ``discovery.mirror_path_for``) — the same string the full-rebuild path
     feeds to ``capture_*`` as ``mirror_path=``, which is what makes the slot id
-    identical between an incremental apply and a fresh rebuild.
+    identical between an incremental apply and a fresh rebuild. The name is
+    historical (the source tree is a copy of the originals); this engine *adds*
+    what it finds to the collected store and never removes anything.
 
     ``.hashes.json`` bookkeeping, capture intermediates (``.snap-`` /
     ``.filtered-`` / ``.tmp-``) and the blob/staging dirs are never sources:
@@ -247,7 +272,7 @@ def _capture_and_adapt(
     byte_limit: int,
     count_limit: int,
 ):
-    """Capture one mirror file (WAL-safe for SQLite) and adapt it in isolation.
+    """Capture one collected source file (WAL-safe for SQLite) and adapt it.
 
     Mirrors ``v2_sync._adapt_source_file``: the same ``relative_path=path.name``
     and the same ``family`` / ``mirror_path`` arguments, so the emitted
@@ -342,10 +367,12 @@ def _assert_adaptation_integrity(family: str, result) -> None:
 
 # ------------------------------------------------------------ row signatures
 #
-# A row signature is the stored column tuple minus the primary key. It exists so
-# the prune set can include rows whose id survived but whose values did not —
-# ``INSERT OR IGNORE`` alone cannot refresh those. The column order MUST mirror
-# the corresponding ``_insert_*`` helper in ``event_repository``.
+# A row signature is the stored column tuple minus the primary key. Comparing the
+# stored signature with the freshly adapted one is what separates the three
+# buckets of an apply: unchanged (not touched at all), dirty (archived to
+# ``ce_*_versions`` and refreshed with an UPDATE) and new (INSERT OR IGNORE).
+# The column order MUST mirror the corresponding ``_insert_*`` helper in
+# ``event_repository``.
 
 _EVENT_COLUMNS = (
     "event_id", "session_id", "kind", "artifact_id", "native_locator",
@@ -357,6 +384,19 @@ _SESSION_COLUMNS = (
     "session_id", "family", "native_session_id", "started_at", "ended_at",
     "artifact_id", "native_locator", "contract_version", "fidelity_json",
     "cwd", "git_branch", "model", "title", "stop_reason",
+)
+
+# The append-only history tables (``event_schema``): the main table's columns
+# with the version sequence spliced in after the primary key and
+# ``superseded_at`` appended, exactly the column order of their DDL.
+_EVENT_VERSION_COLUMNS = (
+    "generation_id", "event_id", "version_seq", *_EVENT_COLUMNS[1:],
+    "superseded_at",
+)
+
+_SESSION_VERSION_COLUMNS = (
+    "generation_id", "session_id", "version_seq", *_SESSION_COLUMNS[1:],
+    "superseded_at",
 )
 
 
@@ -433,109 +473,135 @@ def _slot_relation_ids(
     Adapters are handed a single-artifact set, so every emitted relation is
     intra-file; this is therefore the complete relation set the slot currently
     owns, obtained without a per-slot relation column.
+
+    Written as a single SELECT joining ``ce_events`` twice, the plan could only
+    constrain the relation scan by ``generation_id``
+    (``ix_ce_rel_gen_target (generation_id=?)``): every slot, however small or
+    even empty, enumerated every relation row of the generation and probed
+    ``ce_events`` twice per row (measured 6.7 s per call on the 8 GB staging db,
+    ~88% of a live run's wall time). The slot's own event ids are read through
+    ``ix_ce_events_gen_art`` and drive the relation scan through
+    ``ce_relations_generation_source``; the far endpoint is then settled against
+    that same id set, which is exactly "both endpoints are slot events" and
+    visits no more relation rows than the slot itself emits. Asking for both
+    endpoints as an ``IN (SELECT ...)`` predicate instead makes the planner treat
+    the two lists as a cross-product driver and degrades badly on large slots.
     """
 
+    event_ids = {
+        str(row[0])
+        for row in con.execute(
+            "SELECT event_id FROM ce_events WHERE generation_id=? AND artifact_id=?",
+            (generation_id, slot_id),
+        )
+    }
+    if not event_ids:
+        # No events, so no relation can have both endpoints inside the slot.
+        return set()
     return {
         str(row[0])
         for row in con.execute(
-            "SELECT r.relation_id FROM ce_event_relations r "
-            "JOIN ce_events a ON a.generation_id=r.generation_id "
-            "  AND a.event_id=r.source_event_id "
-            "JOIN ce_events b ON b.generation_id=r.generation_id "
-            "  AND b.event_id=r.target_event_id "
-            "WHERE r.generation_id=? AND a.artifact_id=? AND b.artifact_id=?",
-            (generation_id, slot_id, slot_id),
+            "SELECT r.relation_id, r.target_event_id FROM ce_event_relations r "
+            "WHERE r.generation_id=? AND r.source_event_id IN "
+            "(SELECT event_id FROM ce_events "
+            " WHERE generation_id=? AND artifact_id=?)",
+            (generation_id, generation_id, slot_id),
         )
+        if str(row[1]) in event_ids
     }
 
 
-def _relation_ids_touching(
-    con: sqlite3.Connection, generation_id: str, event_ids: set[str]
-) -> set[str]:
-    """Relation ids with an endpoint in ``event_ids`` (either side).
+def _next_version_seqs(
+    con: sqlite3.Connection,
+    table: str,
+    id_column: str,
+    generation_id: str,
+    ids: set[str],
+) -> dict[str, int]:
+    """``{id: next version_seq}`` — one past the highest archived version.
 
-    Asked as one ``... OR ...`` predicate, SQLite can only use the first key
-    column of a single index (``(generation_id=?)``), so each chunk scanned
-    every relation row of the generation. The two predicates are therefore
-    issued separately — one per index, ``ce_relations_generation_source`` and
-    ``ix_ce_rel_gen_target`` — and their union is exactly the old answer
-    (duplicates collapse in both forms, and in ``found``).
+    Ids that were never archived get ``0``, so a history always starts at
+    version 0 and only ever grows. ``table`` / ``id_column`` are module
+    constants, never caller input.
     """
 
-    found: set[str] = set()
-    for chunk in _chunks(sorted(event_ids)):
+    seqs: dict[str, int] = {}
+    for chunk in _chunks(sorted(ids)):
         marks = _placeholders(len(chunk))
-        found.update(
-            str(row[0])
-            for row in con.execute(
-                "SELECT relation_id FROM ce_event_relations "
-                f"WHERE generation_id=? AND source_event_id IN ({marks})",
-                (generation_id, *chunk),
-            )
-        )
-        found.update(
-            str(row[0])
-            for row in con.execute(
-                "SELECT relation_id FROM ce_event_relations "
-                f"WHERE generation_id=? AND target_event_id IN ({marks})",
-                (generation_id, *chunk),
-            )
-        )
-    return found
+        for row in con.execute(
+            f"SELECT {id_column}, MAX(version_seq) FROM {table} "
+            f"WHERE generation_id=? AND {id_column} IN ({marks}) "
+            f"GROUP BY {id_column}",
+            (generation_id, *chunk),
+        ):
+            seqs[str(row[0])] = int(row[1]) + 1
+    return seqs
 
 
-# ------------------------------------------------------------------ prune
-
-
-def _prune(
+def _archive_rows(
     con: sqlite3.Connection,
-    generation_id: str,
     *,
-    relation_ids: set[str],
-    event_ids: set[str],
-    session_ids: set[str],
+    table: str,
+    id_column: str,
+    columns: tuple[str, ...],
+    generation_id: str,
+    rows: dict[str, tuple],
 ) -> int:
-    """Delete the given rows in FK-safe order; return the row count deleted."""
+    """Append the *current* values of ``rows`` to an append-only history table.
 
-    deleted = 0
-    for chunk in _chunks(sorted(relation_ids)):
-        marks = _placeholders(len(chunk))
-        cursor = con.execute(
-            f"DELETE FROM ce_event_relations "
-            f"WHERE generation_id=? AND relation_id IN ({marks})",
-            (generation_id, *chunk),
-        )
-        deleted += max(cursor.rowcount, 0)
-    for chunk in _chunks(sorted(event_ids)):
-        marks = _placeholders(len(chunk))
-        cursor = con.execute(
-            f"DELETE FROM ce_field_dispositions "
-            f"WHERE generation_id=? AND event_id IN ({marks})",
-            (generation_id, *chunk),
-        )
-        deleted += max(cursor.rowcount, 0)
-    for chunk in _chunks(sorted(event_ids)):
-        marks = _placeholders(len(chunk))
-        cursor = con.execute(
-            f"DELETE FROM ce_events "
-            f"WHERE generation_id=? AND event_id IN ({marks})",
-            (generation_id, *chunk),
-        )
-        deleted += max(cursor.rowcount, 0)
-    for chunk in _chunks(sorted(session_ids)):
-        marks = _placeholders(len(chunk))
-        # Defensive: a session still referenced by an event must survive, or the
-        # FK check aborts the transaction. Sessions are slot-private by
-        # construction, so this is a guard rather than a normal path.
-        cursor = con.execute(
-            f"DELETE FROM ce_sessions "
-            f"WHERE generation_id=? AND session_id IN ({marks}) "
-            "AND session_id NOT IN "
-            "(SELECT session_id FROM ce_events WHERE generation_id=?)",
-            (generation_id, *chunk, generation_id),
-        )
-        deleted += max(cursor.rowcount, 0)
-    return deleted
+    ``rows`` maps id -> the stored non-key column tuple (the signature the slot
+    was read with). Nothing is overwritten: the version sequence continues where
+    the previous archive for that id stopped. Returns the number of rows
+    appended.
+    """
+
+    if not rows:
+        return 0
+    superseded_at = _now()
+    seqs = _next_version_seqs(
+        con, table, id_column, generation_id, set(rows)
+    )
+    payload = [
+        (generation_id, row_id, seqs.get(row_id, 0), *rows[row_id], superseded_at)
+        for row_id in sorted(rows)
+    ]
+    con.executemany(
+        f"INSERT INTO {table} ({', '.join(columns)}) "
+        f"VALUES ({_placeholders(len(columns))})",
+        payload,
+    )
+    return len(payload)
+
+
+def _update_rows(
+    con: sqlite3.Connection,
+    *,
+    table: str,
+    id_column: str,
+    payload_columns: tuple[str, ...],
+    generation_id: str,
+    rows: dict[str, tuple],
+) -> int:
+    """Refresh the given rows **in place** (no INSERT, no DELETE).
+
+    An ``UPDATE`` keeps the row's identity and its rowid, which is what lets a
+    reader that walks ``canonical_*`` by rowid (and any future rowid cursor over
+    ``ce_*``) see a value change without the row appearing to move or to be
+    re-created. Returns the number of rows refreshed.
+    """
+
+    if not rows:
+        return 0
+    assignments = ", ".join(f"{column}=?" for column in payload_columns)
+    payload = [
+        (*rows[row_id], generation_id, row_id) for row_id in sorted(rows)
+    ]
+    con.executemany(
+        f"UPDATE {table} SET {assignments} "
+        f"WHERE generation_id=? AND {id_column}=?",
+        payload,
+    )
+    return len(payload)
 
 
 def _apply_slot(
@@ -546,7 +612,7 @@ def _apply_slot(
     artifact,
     result,
 ) -> dict:
-    """Replace one slot's rows in place (added / changed).
+    """Grow one slot's rows in place (added / changed).
 
     ``artifact`` / ``result`` are the already-captured, already-adapted outputs
     of this file: the caller needed them to classify added vs changed, so they
@@ -560,45 +626,64 @@ def _apply_slot(
     new_events = _new_event_sigs(result)
     new_sessions = _new_session_sigs(result)
 
-    # Prune set: ids that disappeared ("no longer emitted") UNION ids whose row
-    # values changed (an edit that keeps a native id would otherwise leave stale
-    # content behind, because INSERT OR IGNORE is a no-op for a present id).
-    stale_events = set(old_events) - set(new_events)
+    # Three buckets, and no deletion anywhere:
+    #   stale  — stored id, no longer emitted -> left exactly as collected
+    #            (``set(old) - set(new)`` is deliberately not computed: there is
+    #            nothing to do with it);
+    #   dirty  — stored id, different row values -> archived, then UPDATEd;
+    #   new    — id the store has never seen -> INSERT OR IGNORE below.
     dirty_events = {
         eid
         for eid in set(old_events) & set(new_events)
         if old_events[eid] != new_events[eid]
     }
-    stale_sessions = set(old_sessions) - set(new_sessions)
     dirty_sessions = {
         sid
         for sid in set(old_sessions) & set(new_sessions)
         if old_sessions[sid] != new_sessions[sid]
     }
-    sessions_to_prune = stale_sessions | dirty_sessions
-    # A pruned session row must not be left with events pointing at it, so its
-    # old events are replaced too (FK: ce_events -> ce_sessions).
-    events_to_prune = stale_events | dirty_events | {
-        eid
-        for eid, sig in old_events.items()
-        if sig[0] in sessions_to_prune
-    }
+
+    # 1) Keep what was collected: append the current values of every row that is
+    #    about to be refreshed, so no value the store has ever seen is lost.
+    rows_versioned = _archive_rows(
+        con,
+        table="ce_event_versions",
+        id_column="event_id",
+        columns=_EVENT_VERSION_COLUMNS,
+        generation_id=generation_id,
+        rows={eid: old_events[eid] for eid in dirty_events},
+    ) + _archive_rows(
+        con,
+        table="ce_session_versions",
+        id_column="session_id",
+        columns=_SESSION_VERSION_COLUMNS,
+        generation_id=generation_id,
+        rows={sid: old_sessions[sid] for sid in dirty_sessions},
+    )
+
+    # 2) Refresh those rows in place (an UPDATE, never a delete + re-insert).
+    rows_updated = _update_rows(
+        con,
+        table="ce_events",
+        id_column="event_id",
+        payload_columns=_EVENT_COLUMNS[1:],
+        generation_id=generation_id,
+        rows={eid: new_events[eid] for eid in dirty_events},
+    ) + _update_rows(
+        con,
+        table="ce_sessions",
+        id_column="session_id",
+        payload_columns=_SESSION_COLUMNS[1:],
+        generation_id=generation_id,
+        rows={sid: new_sessions[sid] for sid in dirty_sessions},
+    )
 
     old_relations = _slot_relation_ids(con, generation_id, slot_id)
     new_relations = {r.relation_id for r in result.relations}
-    relations_to_prune = (old_relations - new_relations) | _relation_ids_touching(
-        con, generation_id, events_to_prune
-    )
-
-    rows_pruned = _prune(
-        con,
-        generation_id,
-        relation_ids=relations_to_prune,
-        event_ids=events_to_prune,
-        session_ids=sessions_to_prune,
-    )
-    # Rows actually written: ids that were never present, plus the pruned rows
-    # that are re-inserted (a pruned stale row is NOT re-inserted).
+    # Rows the store sees for the first time. Relations are derivations of events
+    # and carry no history table: a relation row that disappeared upstream is
+    # kept as collected evidence, and one whose id survived keeps its first
+    # captured values (``_insert_relations`` is INSERT OR IGNORE).
     new_event_ids = set(new_events)
     new_session_ids = set(new_sessions)
     old_event_ids = set(old_events)
@@ -607,9 +692,6 @@ def _apply_slot(
         len(new_event_ids - old_event_ids)
         + len(new_session_ids - old_session_ids)
         + len(new_relations - old_relations)
-        + len(events_to_prune & new_event_ids)
-        + len(sessions_to_prune & new_session_ids)
-        + len(relations_to_prune & new_relations)
     )
 
     gen = _generation_input(result)
@@ -631,65 +713,76 @@ def _apply_slot(
 
     return {
         "slot_id": slot_id,
-        "rows_pruned": rows_pruned,
         "rows_inserted": rows_inserted,
-        "old_sessions": set(old_sessions),
+        "rows_updated": rows_updated,
+        "rows_versioned": rows_versioned,
         "new_sessions": set(new_sessions),
-        "new_event_ids": set(new_events),
-        "new_session_ids": set(new_sessions),
+        "new_event_ids": new_event_ids,
+        "new_session_ids": new_session_ids,
         "new_relation_ids": new_relations,
     }
 
 
 def _remove_slot(
-    con: sqlite3.Connection, generation_id: str, slot_id: str
-) -> dict:
-    """Prune a vanished slot's rows and mark the slot inactive.
+    con: sqlite3.Connection,
+    slot_id: str,
+    *,
+    family: str,
+    mirror_path: str,
+) -> None:
+    """Mark a vanished slot inactive and record it. No row of it is deleted.
 
-    ``ce_source_artifacts`` is deliberately NOT deleted: the slot's provenance
-    row is retained so "this artifact existed and belonged to this family/path"
-    survives reconciliation. Nothing references it once its rows are pruned, so
-    keeping it is FK-safe and cheap.
+    A source that disappeared is a *state* change, not a reason to erase what was
+    collected from it: the slot's sessions, events (and their dispositions),
+    relations and ``ce_source_artifacts`` provenance row all stay exactly as
+    they were, and so does the compatibility projection that was derived from
+    them (the caller therefore does not re-project this slot's sessions at all).
+    Only ``ce_live_slots.active`` flips to 0, and the removal — with the mirror
+    path it happened to — is appended to ``ce_live_state['removed_slots']``
+    (plus the run's sync-log detail) so it stays auditable.
     """
 
-    old_events, old_sessions = _read_slot_sigs(con, generation_id, slot_id)
-    event_ids = set(old_events)
-    session_ids = set(old_sessions)
-    # The origin-derived canonical ids must be captured BEFORE the ce rows are
-    # pruned: afterwards there is nothing left to derive them from, and the
-    # session's projected rows would survive as orphans. ``old_sessions`` maps
-    # ce session_id -> _SESSION_COLUMNS[1:] (session_id is the key).
-    doomed_canonical = {
-        make_session_id(
-            (row[0] or "unknown").strip().lower(),
-            (row[1] or "").strip() or f"ce:{sid}",
-        )
-        for sid, row in old_sessions.items()
-    }
-    relations = _slot_relation_ids(con, generation_id, slot_id) | (
-        _relation_ids_touching(con, generation_id, event_ids)
-    )
-    rows_pruned = _prune(
-        con,
-        generation_id,
-        relation_ids=relations,
-        event_ids=event_ids,
-        session_ids=session_ids,
-    )
     con.execute(
         "UPDATE ce_live_slots SET active=0, last_synced_at=? WHERE slot_id=?",
         (_now(), slot_id),
     )
-    return {
-        "rows_pruned": rows_pruned,
-        "rows_inserted": 0,
-        "old_sessions": session_ids,
-        "doomed_canonical_ids": doomed_canonical,
-        "new_sessions": set(),
-        "new_event_ids": set(),
-        "new_session_ids": set(),
-        "new_relation_ids": set(),
-    }
+    _record_removal(
+        con, slot_id=slot_id, family=family, mirror_path=mirror_path
+    )
+
+
+def _removed_slots(con: sqlite3.Connection) -> list[dict]:
+    """The append-only removal record; never truncated, never rewritten."""
+
+    raw = _get_state(con, REMOVED_SLOTS_STATE_KEY)
+    try:
+        history = json.loads(raw) if raw else []
+    except ValueError:
+        history = []
+    return history if isinstance(history, list) else []
+
+
+def _record_removal(
+    con: sqlite3.Connection, *, slot_id: str, family: str, mirror_path: str
+) -> None:
+    """Append ``{slot_id, family, mirror_path, removed_at}`` for a deactivated slot.
+
+    Appended, not replaced: the store keeps the history of which sources were
+    deactivated and when. Entries accumulate one per removal event (a slot that
+    is reactivated and removed again records a second entry) and no data row of
+    the slot is involved.
+    """
+
+    history = _removed_slots(con)
+    history.append(
+        {
+            "slot_id": slot_id,
+            "family": family,
+            "mirror_path": mirror_path,
+            "removed_at": _now(),
+        }
+    )
+    _set_state(con, REMOVED_SLOTS_STATE_KEY, json.dumps(history, sort_keys=True))
 
 
 # ------------------------------------------------------------- slot rows
@@ -768,32 +861,32 @@ def _refresh_artifact_row(con: sqlite3.Connection, artifact, family: str) -> Non
 # ------------------------------------------------------------- projection
 
 
-def _family_of(session_row: dict) -> str:
-    return (session_row.get("family") or "unknown").strip().lower()
-
-
-def _native_of(session_row: dict) -> str:
-    native = (session_row.get("native_session_id") or "").strip()
-    return native or f"ce:{session_row['session_id']}"
-
-
 def _project_sessions(
-    con: sqlite3.Connection, generation_id: str, session_ids: set[str],
-    extra_canonical_ids: set[str] | None = None,
+    con: sqlite3.Connection, generation_id: str, session_ids: set[str]
 ) -> dict:
-    """Rebuild the compatibility rows for ``session_ids`` only.
+    """Upsert the compatibility rows for ``session_ids`` only.
 
     Exact because every projected row depends solely on one session and that
-    session's own events (see the module docstring). Rows are deleted by
-    ``canonical_session_id``, which is a pure function of the ce ``session_id``,
-    so a session that disappeared is dropped and a session whose content changed
-    is rewritten under the same canonical id. Reads go through ``con`` so rows
-    written earlier in this transaction are visible.
+    session's own events (see the module docstring). Rows are matched by the
+    origin-derived ``canonical_session_id`` / ``canonical_message_id``, missing
+    rows are inserted and changed rows are refreshed in place — a row is never
+    deleted. Two consequences are deliberate:
+
+    * a session whose source disappeared keeps exactly the projection it was
+      collected with, which is why the caller never asks for a deactivated
+      slot's sessions here;
+    * every ``canonical_*`` rowid stays stable (and is never recycled behind a
+      reader's watermark), which is what the rowid cursor in
+      ``retrieval/conversation_fts.py`` relies on.
+
+    Reads go through ``con`` so rows written earlier in this transaction are
+    visible.
     """
 
     if not session_ids:
-        return {"sessions": 0, "messages": 0, "tools": 0}
-    _ensure_tables(con)
+        return {
+            "sessions": 0, "messages": 0, "tools": 0, "inserted": 0, "updated": 0,
+        }
 
     ordered = sorted(session_ids)
     session_rows: list[dict] = []
@@ -823,38 +916,16 @@ def _project_sessions(
             )
         )
 
-    # Rows are deleted by the origin-derived canonical_session_id (a pure
-    # function of the ce session's family + native id), so a session that
-    # disappeared is dropped and a session whose content changed is rewritten
-    # under the same canonical id. ``extra_canonical_ids`` carries the ids of
-    # sessions whose ce rows this apply already pruned — they can no longer be
-    # derived here, so the caller hands them over.
-    canonical = [make_session_id(_family_of(r), _native_of(r)) for r in session_rows]
-    canonical.extend(sorted(extra_canonical_ids or ()))
-    for chunk in _chunks(canonical):
-        marks = _placeholders(len(chunk))
-        con.execute(
-            f"DELETE FROM canonical_tool_events "
-            f"WHERE canonical_session_id IN ({marks})",
-            chunk,
-        )
-        con.execute(
-            f"DELETE FROM canonical_messages "
-            f"WHERE canonical_session_id IN ({marks})",
-            chunk,
-        )
-        con.execute(
-            f"DELETE FROM canonical_sessions "
-            f"WHERE canonical_session_id IN ({marks})",
-            chunk,
-        )
-
     report = compute_projection(generation_id, session_rows, event_rows)
-    write_compatibility_projection(con, report)
+    written = upsert_compatibility_projection(con, report)
     return {
         "sessions": len(report.sessions),
         "messages": len(report.messages),
         "tools": len(report.tools),
+        # Rows actually written: unchanged rows are left untouched, so a repeat
+        # apply of the same content reports zeros here.
+        "inserted": sum(entry["inserted"] for entry in written.values()),
+        "updated": sum(entry["updated"] for entry in written.values()),
     }
 
 
@@ -865,14 +936,14 @@ def _assert_invariants(
     con: sqlite3.Connection,
     generation_id: str,
     *,
-    inserted_session_ids: list[str],
-    inserted_event_ids: list[str],
+    emitted_session_ids: list[str],
+    emitted_event_ids: list[str],
 ) -> None:
     """Pre-commit gate: a violation must roll the whole apply back."""
 
-    if len(inserted_session_ids) != len(set(inserted_session_ids)):
+    if len(emitted_session_ids) != len(set(emitted_session_ids)):
         raise LiveSyncError("duplicate session ids emitted in this apply")
-    if len(inserted_event_ids) != len(set(inserted_event_ids)):
+    if len(emitted_event_ids) != len(set(emitted_event_ids)):
         raise LiveSyncError("duplicate event ids emitted in this apply")
 
     orphans = con.execute(
@@ -882,6 +953,7 @@ def _assert_invariants(
         (generation_id,),
     ).fetchone()[0]
     if orphans:
+        # Cannot regress (nothing is ever deleted) but still guards a bad insert.
         raise LiveSyncError(f"{orphans} event(s) have no session row")
 
     missing = con.execute(
@@ -942,8 +1014,9 @@ def _empty_report(status: str, generation_id: str, started: float, **extra) -> d
         "n_changed": 0,
         "n_removed": 0,
         "n_unchanged": 0,
-        "rows_pruned": 0,
         "rows_inserted": 0,
+        "rows_updated": 0,
+        "rows_versioned": 0,
         "per_family": {},
         "touched_sessions": [],
         "duration_s": round(time.monotonic() - started, 3),
@@ -959,14 +1032,16 @@ def live_sync_once(
     generation_id: str,
     dry_run: bool = False,
 ) -> dict:
-    """Run one incremental pass over the mirrored sources.
+    """Run one incremental pass over the collected sources.
 
     Enumerates ``mirror_root/<family>/...``, classifies every file against the
     ``ce_live_slots`` watermark (added / changed / removed, with an
     ``(mtime_ns, size)`` fingerprint fast path in ``ce_live_state``), and — in a
-    single ``BEGIN IMMEDIATE`` transaction — prunes + re-inserts only the rows
-    each changed slot no longer / now emits, refreshing the compatibility
-    projection for the touched sessions only.
+    single ``BEGIN IMMEDIATE`` transaction — grows the store with what each
+    changed slot newly emits (inserting new rows, archiving + refreshing the rows
+    whose values changed, leaving everything else exactly as collected) and
+    refreshes the compatibility projection for the sessions the apply touched.
+    Nothing is removed: the store is a collection, not a mirror of the sources.
 
     ``dry_run=True`` computes and returns the plan (classification counts) while
     writing nothing at all: no schema, no slot row, no log row, no blob, not even
@@ -1076,24 +1151,23 @@ def live_sync_once(
         n_added = sum(1 for item in prepared if item["kind"] == "added")
         n_changed = len(prepared) - n_added
         per_family: dict[str, dict] = {}
-        rows_pruned = 0
         rows_inserted = 0
+        rows_updated = 0
+        rows_versioned = 0
         touched: set[str] = set()
-        doomed_canonical: set[str] = set()
-        inserted_sessions: list[str] = []
-        inserted_events: list[str] = []
-        projection = {"sessions": 0, "messages": 0, "tools": 0}
+        projected_sessions: list[str] = []
+        emitted_events: list[str] = []
+        projection = {
+            "sessions": 0, "messages": 0, "tools": 0, "inserted": 0, "updated": 0,
+        }
 
         con.execute("BEGIN IMMEDIATE")
         try:
             _ensure_generation(con, generation_id)
 
             for slot_id, family, mirror_path in removed:
-                outcome = _remove_slot(con, generation_id, slot_id)
-                touched |= outcome["old_sessions"]
-                doomed_canonical |= outcome["doomed_canonical_ids"]
-                rows_pruned += outcome["rows_pruned"]
-                _bump(per_family, family, removed=1, rows_pruned=outcome["rows_pruned"])
+                _remove_slot(con, slot_id, family=family, mirror_path=mirror_path)
+                _bump(per_family, family, removed=1)
 
             for item in prepared:
                 family = item["family"]
@@ -1104,27 +1178,31 @@ def live_sync_once(
                     artifact=item["artifact"],
                     result=item["result"],
                 )
-                touched |= outcome["old_sessions"] | outcome["new_sessions"]
-                rows_pruned += outcome["rows_pruned"]
+                # Only the sessions this file still emits are re-projected: the
+                # rows of a deactivated slot (and of a session the source stopped
+                # emitting) keep exactly the projection they were collected with.
+                touched |= outcome["new_sessions"]
                 rows_inserted += outcome["rows_inserted"]
-                inserted_sessions.extend(sorted(outcome["new_session_ids"]))
-                inserted_events.extend(sorted(outcome["new_event_ids"]))
+                rows_updated += outcome["rows_updated"]
+                rows_versioned += outcome["rows_versioned"]
+                projected_sessions.extend(sorted(outcome["new_session_ids"]))
+                emitted_events.extend(sorted(outcome["new_event_ids"]))
                 _bump(
                     per_family,
                     family,
                     added=1 if item["kind"] == "added" else 0,
                     changed=1 if item["kind"] == "changed" else 0,
-                    rows_pruned=outcome["rows_pruned"],
                     rows_inserted=outcome["rows_inserted"],
+                    rows_updated=outcome["rows_updated"],
+                    rows_versioned=outcome["rows_versioned"],
                 )
 
-            projection = _project_sessions(
-                con, generation_id, touched, extra_canonical_ids=doomed_canonical)
+            projection = _project_sessions(con, generation_id, touched)
             _assert_invariants(
                 con,
                 generation_id,
-                inserted_session_ids=inserted_sessions,
-                inserted_event_ids=inserted_events,
+                emitted_session_ids=projected_sessions,
+                emitted_event_ids=emitted_events,
             )
             _write_fingerprints(con, scanned)
             report = {
@@ -1134,10 +1212,16 @@ def live_sync_once(
                 "n_changed": n_changed,
                 "n_removed": len(removed),
                 "n_unchanged": len(scanned) - len(prepared),
-                "rows_pruned": rows_pruned,
                 "rows_inserted": rows_inserted,
+                "rows_updated": rows_updated,
+                "rows_versioned": rows_versioned,
                 "per_family": per_family,
                 "touched_sessions": sorted(touched),
+                "removed_slots": [
+                    {"slot_id": slot_id, "family": family,
+                     "mirror_path": mirror_path}
+                    for slot_id, family, mirror_path in removed
+                ],
                 "projection": projection,
                 "duration_s": round(time.monotonic() - started, 3),
             }
@@ -1232,7 +1316,10 @@ def _plan(
 def _bump(per_family: dict, family: str, **counts: int) -> None:
     entry = per_family.setdefault(
         family,
-        {"added": 0, "changed": 0, "removed": 0, "rows_pruned": 0, "rows_inserted": 0},
+        {
+            "added": 0, "changed": 0, "removed": 0,
+            "rows_inserted": 0, "rows_updated": 0, "rows_versioned": 0,
+        },
     )
     for key, value in counts.items():
         entry[key] = entry.get(key, 0) + value
@@ -1260,6 +1347,11 @@ def _write_fingerprints(con: sqlite3.Connection, scanned: dict) -> None:
 
 
 def _write_sync_log(con: sqlite3.Connection, report: dict) -> None:
+    """Append one row per apply. ``rows_pruned`` is always 0 (legacy column name:
+    this engine never removes a collected row); the per-run counters and the
+    deactivated slots are carried in ``detail``.
+    """
+
     sync_id = hashlib.sha256(
         f"{report['generation_id']}|{_now()}|{uuid.uuid4().hex}".encode("utf-8")
     ).hexdigest()[:24]
@@ -1276,13 +1368,16 @@ def _write_sync_log(con: sqlite3.Connection, report: dict) -> None:
             report["n_added"],
             report["n_changed"],
             report["n_removed"],
-            report["rows_pruned"],
+            0,
             report["rows_inserted"],
             json.dumps(report["per_family"], sort_keys=True),
             report["status"],
             json.dumps(
                 {
                     "touched_sessions": report["touched_sessions"],
+                    "removed_slots": report.get("removed_slots", []),
+                    "rows_updated": report.get("rows_updated", 0),
+                    "rows_versioned": report.get("rows_versioned", 0),
                     "projection": report["projection"],
                     "duration_s": report["duration_s"],
                 },
@@ -1302,6 +1397,7 @@ def _rollback(con: sqlite3.Connection) -> None:
 __all__ = [
     "FINGERPRINT_STATE_KEY",
     "LAST_SYNC_STATE_KEY",
+    "REMOVED_SLOTS_STATE_KEY",
     "LiveSyncError",
     "live_sync_once",
     "scan_mirror",

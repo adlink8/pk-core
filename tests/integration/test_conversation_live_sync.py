@@ -1,13 +1,19 @@
-"""Milestone 2: incremental live-sync (stable slot identity, per-file replace).
+"""Milestone 2: incremental live-sync (stable slot identity, append-only store).
 
 RED/GREEN tests for :func:`personal_knowledge.application.conversation.live_sync.
 live_sync_once`. The engine keeps ONE live generation and, per source slot,
-prunes + re-inserts only the rows that file no longer / now emits.
+collects what that file newly emits and refreshes in place the rows whose values
+changed. Rows already collected are **never removed** — not when the source
+stops emitting a message, not when the source file vanishes, not when a slot is
+deactivated (the store is a collection, not a mirror of the current source).
 
-The load-bearing test is the **equality oracle**: after an incremental apply the
-compatibility projection (``canonical_sessions`` / ``canonical_messages``) must
-be row-for-row identical to a fresh full rebuild of the same corpus. Any missed
-prune or missed insert shows up there and nowhere else.
+The load-bearing oracle is the **equality oracle**: after an incremental apply
+of an in-place edit (same native ids, one changed body) the compatibility
+projection (``canonical_sessions`` / ``canonical_messages``) must be row-for-row
+identical to a fresh full rebuild of the same corpus, while a removed source
+makes the live store a strict **superset** of the rebuild (the rebuild drops it,
+the live store keeps it). Any missed insert or missed in-place refresh shows up
+there and nowhere else.
 
 All tests run against temporary SQLite files under ``tmp_path``. No live
 database, no ``data/``, no network, no provider calls.
@@ -32,7 +38,7 @@ from personal_knowledge.application.conversation.event_schema import (
     create_v2_schema,
 )
 from personal_knowledge.application.conversation.live_sync import (
-    _relation_ids_touching,
+    _slot_relation_ids,
     live_sync_once,
 )
 from personal_knowledge.application.run_pipeline import shadow_conversation_generation
@@ -45,14 +51,17 @@ DEFAULT_FILES = ("a.jsonl", "b.jsonl", "c.jsonl", "d.jsonl")
 # --------------------------------------------------------------- synthetic corpus
 
 
-def _codex_session(session_id: str, turns: int, *, revised: bool = False) -> str:
+def _codex_session(
+    session_id: str, turns: int, *, revised: bool = False,
+    revision: str | None = None,
+) -> str:
     """A synthetic Codex JSONL export: meta, then per-turn context/user/answer.
 
-    ``revised=True`` rewrites the FIRST answer body only, keeping the line count
-    and every native id/locator unchanged. That is the hardest edit shape for an
-    incremental engine: the event id survives while its row content does not, so
-    it exercises the "same id, different row" prune path — an engine that only
-    prunes *vanished* ids would silently keep the stale text.
+    ``revised=True`` / ``revision="…"`` rewrite the FIRST answer body only,
+    keeping the line count and every native id/locator unchanged. That is the
+    hardest edit shape for an incremental engine: the event id survives while its
+    row content does not, so it exercises the "same id, different row" path — an
+    engine that only handled *vanished* ids would silently keep the stale text.
     """
 
     records: list[dict] = [
@@ -85,7 +94,9 @@ def _codex_session(session_id: str, turns: int, *, revised: bool = False) -> str
             }
         )
         answer = f"answer {turn} of {session_id}"
-        if revised and turn == 1:
+        if turn == 1 and revision is not None:
+            answer += f" ({revision})"
+        elif revised and turn == 1:
             answer += " (revised)"
         records.append(
             {
@@ -188,6 +199,47 @@ def _slot_row_total(db: Path, slot_id: str) -> int:
     )
 
 
+def _slot_event_count(db: Path, slot_id: str) -> int:
+    return _rows(
+        db, "SELECT COUNT(*) FROM ce_events WHERE artifact_id=?", (slot_id,)
+    )[0][0]
+
+
+def _slot_session_count(db: Path, slot_id: str) -> int:
+    return _rows(
+        db, "SELECT COUNT(*) FROM ce_sessions WHERE artifact_id=?", (slot_id,)
+    )[0][0]
+
+
+def _rowids(db: Path, table: str, id_column: str) -> dict[str, int]:
+    """``{id: rowid}`` — the physical row identity a rowid cursor walks."""
+
+    return {
+        str(row[0]): int(row[1])
+        for row in _rows(db, f"SELECT {id_column}, rowid FROM {table}")
+    }
+
+
+def _version_rows(db: Path, table: str, id_column: str, row_id: str) -> list[tuple]:
+    return _rows(
+        db,
+        f"SELECT version_seq, superseded_at FROM {table} WHERE {id_column}=? "
+        "ORDER BY version_seq",
+        (row_id,),
+    )
+
+
+REMOVED_SLOTS_KEY = "removed_slots"
+
+
+def _removal_records(db: Path) -> list[dict]:
+    """The append-only record of deactivated slots (mirror path + when)."""
+
+    rows = _rows(db, "SELECT value FROM ce_live_state WHERE key=?",
+                 (REMOVED_SLOTS_KEY,))
+    return json.loads(rows[0][0]) if rows else []
+
+
 def _canonical_session_for_content(db: Path, marker: str) -> str:
     """Identify a projected session by a marker in its projected message text."""
 
@@ -241,7 +293,7 @@ def test_equality_oracle_incremental_matches_full_rebuild(tmp_path: Path) -> Non
     assert first["status"] == "ok"
     assert first["n_added"] == len(DEFAULT_FILES)
     assert first["n_changed"] == 0 and first["n_removed"] == 0
-    assert first["rows_inserted"] > 0 and first["rows_pruned"] == 0
+    assert first["rows_inserted"] > 0 and first["rows_versioned"] == 0
     assert len(_table(db, "canonical_sessions")) == len(DEFAULT_FILES)
 
     # One file is edited in place: same line count, same native ids, one changed
@@ -271,7 +323,7 @@ def test_equality_oracle_incremental_matches_full_rebuild(tmp_path: Path) -> Non
 
 
 def test_oracle_holds_after_a_source_is_removed(tmp_path: Path) -> None:
-    """A removal must not leave a stale projected session behind."""
+    """A removal must not corrupt the projection of the surviving sources."""
 
     mirror = tmp_path / "mirror"
     _build_corpus(mirror)
@@ -284,9 +336,15 @@ def test_oracle_holds_after_a_source_is_removed(tmp_path: Path) -> None:
     report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
     assert report["n_removed"] == 1
 
+    # The rebuild sees the corpus without b.jsonl's sibling c.jsonl, so every row
+    # it produces must exist in the live store too; the live store additionally
+    # keeps the collected rows of the removed source (the append-only contract).
     ref_db = _full_rebuild_projection(mirror, tmp_path, "oracle-removed")
-    assert _table(db, "canonical_sessions") == _table(ref_db, "canonical_sessions")
-    assert _table(db, "canonical_messages") == _table(ref_db, "canonical_messages")
+    live_sessions = set(_table(db, "canonical_sessions"))
+    live_messages = set(_table(db, "canonical_messages"))
+    assert set(_table(ref_db, "canonical_sessions")) <= live_sessions
+    assert set(_table(ref_db, "canonical_messages")) <= live_messages
+    assert len(live_sessions) == len(set(_table(ref_db, "canonical_sessions"))) + 1
 
 
 # ------------------------------------------------------------- 2. idempotency
@@ -301,6 +359,7 @@ def test_second_run_without_a_source_change_writes_nothing(tmp_path: Path) -> No
     tables = (
         "ce_events", "ce_sessions", "ce_event_relations", "ce_field_dispositions",
         "ce_source_artifacts", "ce_live_slots", "ce_live_sync_log",
+        "ce_event_versions", "ce_session_versions",
         "canonical_sessions", "canonical_messages",
     )
     before = _counts(db, tables)
@@ -309,7 +368,7 @@ def test_second_run_without_a_source_change_writes_nothing(tmp_path: Path) -> No
     second = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
     assert second["status"] == "no-op"
     assert second["rows_inserted"] == 0
-    assert second["rows_pruned"] == 0
+    assert second["rows_updated"] == 0 and second["rows_versioned"] == 0
     assert second["n_added"] == second["n_changed"] == second["n_removed"] == 0
     assert second["n_unchanged"] == len(DEFAULT_FILES)
 
@@ -334,7 +393,8 @@ def test_touch_without_a_content_change_is_not_a_rewrite(tmp_path: Path) -> None
     report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
 
     assert report["n_changed"] == 0 and report["n_added"] == 0
-    assert report["rows_inserted"] == 0 and report["rows_pruned"] == 0
+    assert report["rows_inserted"] == 0 and report["rows_updated"] == 0
+    assert report["rows_versioned"] == 0
     assert row_total == _slot_row_total(db, _slot_id("b.jsonl"))
 
 
@@ -376,11 +436,16 @@ def test_one_file_edit_is_a_few_row_write(tmp_path: Path) -> None:
     # An unrelated slot's event ids are untouched.
     assert _event_ids_for_slot(db, slot_a) == unrelated_before
 
-    # The write is proportional to the edited file, nowhere near the corpus.
+    # The write is proportional to the edited file, nowhere near the corpus: one
+    # answer body changed, so exactly one event row is refreshed in place and
+    # exactly one previous value is appended to the history. Nothing is inserted
+    # (every native id survived the edit) and nothing is removed.
     assert report["n_changed"] == 1
-    assert 0 < report["rows_inserted"] <= 4
-    assert report["rows_inserted"] < file_rows
-    assert report["rows_inserted"] < first["rows_inserted"] / 4
+    assert report["rows_updated"] == 1
+    assert report["rows_versioned"] == 1
+    assert report["rows_inserted"] == 0
+    assert report["rows_updated"] + report["rows_inserted"] < file_rows
+    assert report["rows_updated"] + report["rows_inserted"] < first["rows_inserted"] / 4
 
     # The edited body is visible both in the event authority and in the
     # compatibility projection (proves the same-id/different-row refresh).
@@ -398,68 +463,267 @@ def test_one_file_edit_is_a_few_row_write(tmp_path: Path) -> None:
     )) == 1
 
 
-# -------------------------------------------------------------- 4. removal
+# ------------------------------------------------- 4. append-only retention
+#
+# The chain is a *collection* store: a row already collected is never removed,
+# for any reason (the source stops emitting a message, the source file vanishes,
+# the slot is deactivated), and a row whose values changed keeps its previous
+# values in an append-only history table instead of being overwritten. Every
+# expectation below is measured on the database itself (count the rows before,
+# count them after) or derived from the text this test wrote — never from the
+# engine's own set arithmetic.
 
 
-def test_removed_source_is_pruned_and_leaves_no_dangling_rows(
-    tmp_path: Path,
-) -> None:
+def test_stale_event_is_retained_in_ce_events(tmp_path: Path) -> None:
+    """A message the source no longer emits stays in the collected store."""
+
     mirror = tmp_path / "mirror"
     _build_corpus(mirror)
     db = tmp_path / "live.sqlite"
     live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
 
     slot_b = _slot_id("b.jsonl")
-    doomed_session = _canonical_session_for_content(db, "of sess_b")
-    assert _event_ids_for_slot(db, slot_b)
-    sessions_before = len(_table(db, "canonical_sessions"))
+    before_ids = {row[0] for row in _event_ids_for_slot(db, slot_b)}
+    before_events = _slot_event_count(db, slot_b)
+    assert before_ids and before_events == len(before_ids)
+    # The last turn is collected, and is about to disappear upstream.
+    assert len(_rows(db, "SELECT event_id FROM ce_events WHERE content LIKE ?",
+                     ("%answer 4 of sess_b%",))) == 1
+
+    # The source is truncated in place: turns 3 and 4 are gone from the file...
+    _write(mirror, "b.jsonl", _codex_session("sess_b", 2))
+    assert "answer 4 of sess_b" not in (
+        mirror / FAMILY / "b.jsonl"
+    ).read_text(encoding="utf-8")
+
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert report["n_changed"] == 1
+
+    # ...but nothing previously collected disappears from the store.
+    assert {row[0] for row in _event_ids_for_slot(db, slot_b)} >= before_ids
+    assert _slot_event_count(db, slot_b) >= before_events
+    assert len(_rows(db, "SELECT event_id FROM ce_events WHERE content LIKE ?",
+                     ("%answer 4 of sess_b%",))) == 1
+    assert len(_rows(db, "SELECT canonical_message_id FROM canonical_messages "
+                         "WHERE content LIKE ?", ("%answer 4 of sess_b%",))) == 1
+
+
+def test_removed_slot_rows_are_retained_and_still_queryable(
+    tmp_path: Path,
+) -> None:
+    """A vanished source file is a state marker, not a deletion."""
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror)
+    db = tmp_path / "live.sqlite"
+    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+
+    slot_b = _slot_id("b.jsonl")
+    session_b = _canonical_session_for_content(db, "of sess_b")
+    events_before = _slot_event_count(db, slot_b)
+    sessions_before = _slot_session_count(db, slot_b)
+    canonical_sessions_before = len(_table(db, "canonical_sessions"))
+    messages_before = len(_rows(
+        db, "SELECT canonical_message_id FROM canonical_messages "
+            "WHERE canonical_session_id=?", (session_b,)))
+    assert events_before and sessions_before and messages_before
 
     (mirror / FAMILY / "b.jsonl").unlink()
     report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
 
     assert report["n_removed"] == 1
-    assert report["rows_pruned"] > 0 and report["rows_inserted"] == 0
-    assert report["touched_sessions"]
 
-    # The slot's ce rows are gone...
-    assert _event_ids_for_slot(db, slot_b) == []
-    assert _rows(
-        db, "SELECT session_id FROM ce_sessions WHERE artifact_id=?", (slot_b,)
-    ) == []
+    # Not one collected row of that slot was lost.
+    assert _slot_event_count(db, slot_b) == events_before
+    assert _slot_session_count(db, slot_b) == sessions_before
 
-    # ...its session is gone from the projection...
+    # The slot itself is retained but marked inactive, and so is its provenance
+    # row (ce_source_artifacts is never deleted).
     assert _rows(
-        db,
-        "SELECT canonical_session_id FROM canonical_sessions WHERE canonical_session_id=?",
-        (doomed_session,),
-    ) == []
-    assert _rows(
-        db,
-        "SELECT canonical_message_id FROM canonical_messages WHERE canonical_session_id=?",
-        (doomed_session,),
-    ) == []
-    assert len(_table(db, "canonical_sessions")) == sessions_before - 1
-
-    # ...the slot itself is retained but marked inactive, and so is its
-    # provenance row (ce_source_artifacts is never deleted).
-    slot = _rows(
-        db,
-        "SELECT active, content_hash FROM ce_live_slots WHERE slot_id=?",
-        (slot_b,),
-    )
-    assert slot and slot[0][0] == 0
+        db, "SELECT active FROM ce_live_slots WHERE slot_id=?", (slot_b,)
+    ) == [(0,)]
     assert _rows(
         db, "SELECT artifact_id FROM ce_source_artifacts WHERE artifact_id=?",
         (slot_b,),
     )
+    # The removal is recorded with its mirror path and when it happened.
+    removals = _removal_records(db)
+    assert [entry["mirror_path"] for entry in removals] == [
+        f"{FAMILY}{os.sep}b.jsonl"
+    ]
+    assert removals[0]["slot_id"] == slot_b
+    assert removals[0]["removed_at"]
 
-    # ...and the remaining rows are referentially clean.
+    # The session is still reachable through the compatibility projection.
+    assert len(_table(db, "canonical_sessions")) == canonical_sessions_before
+    assert _rows(
+        db,
+        "SELECT canonical_session_id FROM canonical_sessions "
+        "WHERE canonical_session_id=?",
+        (session_b,),
+    )
+    assert len(_rows(
+        db, "SELECT canonical_message_id FROM canonical_messages "
+            "WHERE canonical_session_id=?", (session_b,))) == messages_before
+
+    # And the store is still referentially clean.
     assert _rows(db, "PRAGMA foreign_key_check") == []
     assert _rows(db, "SELECT * FROM pragma_integrity_check") == [("ok",)]
 
 
-def test_removed_source_returning_is_re_added(tmp_path: Path) -> None:
-    """A re-appearing file reuses its slot id (marked inactive -> active)."""
+def test_dirty_event_keeps_its_old_value_in_ce_event_versions(
+    tmp_path: Path,
+) -> None:
+    """A rewritten body refreshes the row in place and archives the old value."""
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror)
+    db = tmp_path / "live.sqlite"
+    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert _rows(db, "SELECT COUNT(*) FROM ce_event_versions") == [(0,)]
+
+    _write(mirror, "b.jsonl", _codex_session("sess_b", 4, revised=True))
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+
+    assert report["n_changed"] == 1
+    assert report["rows_updated"] == 1 and report["rows_versioned"] == 1
+    assert report["rows_inserted"] == 0
+
+    # The main row carries the new value...
+    revised = _rows(
+        db,
+        "SELECT event_id, content FROM ce_events WHERE content LIKE ?",
+        ("%answer 1 of sess_b (revised)%",),
+    )
+    assert len(revised) == 1
+    event_id = revised[0][0]
+
+    # ...and the previous value is in the history, as version 0 of that event.
+    versions = _rows(
+        db,
+        "SELECT version_seq, content, superseded_at FROM ce_event_versions "
+        "WHERE event_id=? ORDER BY version_seq",
+        (event_id,),
+    )
+    assert [row[0] for row in versions] == [0]
+    assert versions[0][1] == "answer 1 of sess_b"  # the body written first
+    assert versions[0][2]
+    assert len(_rows(db, "SELECT 1 FROM ce_events WHERE content=?", ("answer 1 of sess_b",))) == 0
+
+    # A second rewrite appends version 1 (the first revision) and leaves the
+    # already-collected version 0 untouched.
+    _write(
+        mirror,
+        "b.jsonl",
+        _codex_session("sess_b", 4, revision="revised twice"),
+    )
+    second = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert second["rows_updated"] == 1 and second["rows_versioned"] == 1
+    assert len(_rows(
+        db, "SELECT event_id FROM ce_events WHERE content LIKE ?",
+        ("%answer 1 of sess_b (revised twice)%",))) == 1
+    versions = _rows(
+        db,
+        "SELECT version_seq, content FROM ce_event_versions WHERE event_id=? "
+        "ORDER BY version_seq",
+        (event_id,),
+    )
+    assert [row[0] for row in versions] == [0, 1]
+    assert [row[1] for row in versions] == [
+        "answer 1 of sess_b",
+        "answer 1 of sess_b (revised)",
+    ]
+
+
+def test_dirty_session_keeps_its_old_value_in_ce_session_versions(
+    tmp_path: Path,
+) -> None:
+    """The session row follows the same archive-then-update rule as events."""
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror)
+    db = tmp_path / "live.sqlite"
+    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert _rows(db, "SELECT COUNT(*) FROM ce_session_versions") == [(0,)]
+
+    slot_b = _slot_id("b.jsonl")
+    ended_before = _rows(
+        db, "SELECT session_id, ended_at FROM ce_sessions WHERE artifact_id=?",
+        (slot_b,),
+    )
+    assert len(ended_before) == 1
+    session_id, old_ended_at = ended_before[0]
+
+    # A turn is appended: the session row's end timestamp moves.
+    _write(mirror, "b.jsonl", _codex_session("sess_b", 5))
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+
+    assert report["n_changed"] == 1
+    assert report["rows_updated"] == 1 and report["rows_versioned"] == 1
+
+    new_ended_at = _rows(
+        db, "SELECT ended_at FROM ce_sessions WHERE session_id=?", (session_id,)
+    )[0][0]
+    assert new_ended_at != old_ended_at
+    versions = _rows(
+        db,
+        "SELECT version_seq, ended_at, superseded_at FROM ce_session_versions "
+        "WHERE session_id=? ORDER BY version_seq",
+        (session_id,),
+    )
+    assert [row[0] for row in versions] == [0]
+    assert versions[0][1] == old_ended_at
+    assert versions[0][2]
+
+
+def test_second_run_keeps_canonical_rowids_stable(tmp_path: Path) -> None:
+    """The projection inserts missing rows and refreshes changed ones in place.
+
+    ``retrieval/conversation_fts.py`` (:28-33) uses ``canonical_messages.rowid``
+    as its incremental cursor and relies on the authority table being append-only
+    with monotonic rowids. A DELETE + re-insert (or ``INSERT OR REPLACE``) would
+    move the rowids of rows a reader has already consumed, so the rowids are
+    measured directly here, before and after.
+    """
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror)
+    db = tmp_path / "live.sqlite"
+    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+
+    messages_before = _rowids(db, "canonical_messages", "canonical_message_id")
+    sessions_before = _rowids(db, "canonical_sessions", "canonical_session_id")
+    tools_before = _rowids(db, "canonical_tool_events", "canonical_tool_id")
+    assert messages_before and sessions_before
+
+    # A repeat run over unchanged sources writes nothing at all.
+    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert _rowids(db, "canonical_messages", "canonical_message_id") == messages_before
+    assert _rowids(db, "canonical_sessions", "canonical_session_id") == sessions_before
+
+    # An edit that keeps every native id and rewrites one body (a dirty row) must
+    # refresh in place: same rows, same rowids, new text.
+    _write(mirror, "b.jsonl", _codex_session("sess_b", 4, revised=True))
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert _rowids(db, "canonical_messages", "canonical_message_id") == messages_before
+    assert _rowids(db, "canonical_sessions", "canonical_session_id") == sessions_before
+    assert _rowids(db, "canonical_tool_events", "canonical_tool_id") == tools_before
+    assert report["rows_updated"] >= 1
+    # One projected message row changed and it was refreshed, not rewritten.
+    assert report["projection"]["inserted"] == 0
+    assert report["projection"]["updated"] == 1
+    assert len(_rows(
+        db, "SELECT canonical_message_id FROM canonical_messages "
+            "WHERE content LIKE ?", ("%answer 1 of sess_b (revised)%",))) == 1
+
+
+# -------------------------------------------------------------- 5. removal
+
+
+def test_removed_source_returning_reactivates_without_duplicates(
+    tmp_path: Path,
+) -> None:
+    """A re-appearing file reuses its slot id (inactive -> active), no dups."""
 
     mirror = tmp_path / "mirror"
     _build_corpus(mirror)
@@ -468,21 +732,34 @@ def test_removed_source_returning_is_re_added(tmp_path: Path) -> None:
 
     slot_b = _slot_id("b.jsonl")
     body = (mirror / FAMILY / "b.jsonl").read_text(encoding="utf-8")
+    events_before = _slot_event_count(db, slot_b)
+    session_b = _canonical_session_for_content(db, "of sess_b")
+    messages_before = len(_rows(
+        db, "SELECT canonical_message_id FROM canonical_messages "
+            "WHERE canonical_session_id=?", (session_b,)))
+
     (mirror / FAMILY / "b.jsonl").unlink()
     live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-    assert _event_ids_for_slot(db, slot_b) == []
+    assert _slot_event_count(db, slot_b) == events_before  # nothing removed
 
     _write(mirror, "b.jsonl", body)
     report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
 
     assert report["n_added"] == 1
-    assert _event_ids_for_slot(db, slot_b)  # same slot, rows restored
+    assert report["rows_inserted"] == 0  # every row was already collected
     assert _rows(
         db, "SELECT active FROM ce_live_slots WHERE slot_id=?", (slot_b,)
-    )[0][0] == 1
+    ) == [(1,)]
+    # Same slot, same rows, no second copy of anything.
+    assert _slot_event_count(db, slot_b) == events_before
+    assert _slot_session_count(db, slot_b) == 1
+    assert len(_rows(
+        db, "SELECT canonical_message_id FROM canonical_messages "
+            "WHERE canonical_session_id=?", (session_b,))) == messages_before
+    assert len(_table(db, "canonical_sessions")) == len(DEFAULT_FILES)
 
 
-# --------------------------------------------------------------- 5. dry run
+# --------------------------------------------------------------- 6. dry run
 
 
 def test_dry_run_reports_the_plan_and_writes_nothing(tmp_path: Path) -> None:
@@ -497,7 +774,8 @@ def test_dry_run_reports_the_plan_and_writes_nothing(tmp_path: Path) -> None:
 
     tables = (
         "ce_events", "ce_sessions", "ce_source_artifacts", "ce_live_slots",
-        "ce_live_sync_log", "canonical_sessions", "canonical_messages",
+        "ce_live_sync_log", "ce_event_versions", "ce_session_versions",
+        "canonical_sessions", "canonical_messages",
     )
     before_counts = _counts(db, tables)
     before_bytes = db.read_bytes()
@@ -512,7 +790,8 @@ def test_dry_run_reports_the_plan_and_writes_nothing(tmp_path: Path) -> None:
     assert plan["n_added"] == 1
     assert plan["n_removed"] == 0
     assert plan["n_unchanged"] == len(DEFAULT_FILES) - 1  # a, c, d; b and e moved
-    assert plan["rows_inserted"] == 0 and plan["rows_pruned"] == 0
+    assert plan["rows_inserted"] == 0
+    assert plan["rows_updated"] == 0 and plan["rows_versioned"] == 0
     assert plan["per_family"][FAMILY]["changed"] == 1
 
     assert _counts(db, tables) == before_counts
@@ -551,16 +830,16 @@ def test_dry_run_plan_lists_the_new_slot(tmp_path: Path) -> None:
     assert plan["per_family"] == {
         FAMILY: {
             "added": 1, "changed": 0, "removed": 0,
-            "rows_pruned": 0, "rows_inserted": 0,
+            "rows_inserted": 0, "rows_updated": 0, "rows_versioned": 0,
         }
     }
 
 
-# ------------------------------------------------- 6. session-scope query plans
+# ------------------------------------------------- 7. session-scope query plans
 #
-# The two projection tables are looked up and deleted by ``canonical_session_id``
-# (live-sync re-projection in ``live_sync._replace_*``, reads in
-# ``core.conversation_repository``), but their DDL declared no index on that
+# The two projection tables are looked up by ``canonical_session_id`` (reads in
+# ``core.conversation_repository``, and the activation/rollback path's
+# ``clear_compatibility_projection``), but their DDL declared no index on that
 # column, so every session paid one full-table SCAN (measured 44.8 ms messages /
 # 36.1 ms tool events on the 8 GB staging db). These tests pin the fix at the
 # seam that creates the tables (``compatibility_projection._ensure_tables``):
@@ -603,7 +882,9 @@ def test_projection_session_lookups_are_index_backed(tmp_path: Path) -> None:
             assert "SEARCH" in select_plan, (table, select_plan)
             assert index_name in select_plan, (table, select_plan)
 
-            # The write shape used by live-sync re-projection.
+            # The per-session delete shape used by the rollback owner
+            # (``clear_compatibility_projection``); the live path no longer
+            # deletes projection rows at all.
             delete = (
                 f"DELETE FROM {table} WHERE canonical_session_id IN (?,?,?)"
             )
@@ -615,83 +896,171 @@ def test_projection_session_lookups_are_index_backed(tmp_path: Path) -> None:
         con.close()
 
 
-# --------------------------------------- 7. relation-touch lookup query shape
+# --------------------------------- 8. slot-relation lookup query shape
 #
-# ``live_sync._relation_ids_touching`` answers "which relations have EITHER
-# endpoint in this id set" for the prune. Written as one ``... OR ...``
-# predicate, the planner used only the FIRST key column of one index
-# (``ix_ce_rel_gen_target (generation_id=?)``): every 400-id chunk scanned all
-# relation rows of the generation (measured 1.09 s / 400 ids on the staging db;
-# a single 223k-event slot implies ~557 chunks). The fix asks once per index, so
-# each predicate reaches its own second key column and the union of the two
-# result sets is exactly the old answer.
+# ``live_sync._slot_relation_ids`` answers "which relations have BOTH endpoints
+# inside this slot" and is called once per slot by ``_apply_slot`` (to report how
+# many relations that file newly contributed). Written as a two-JOIN form
+# (``ce_events`` joined twice), the
+# planner could only constrain the relation table by ``generation_id``
+# (``ix_ce_rel_gen_target (generation_id=?)``), so every slot enumerated ALL
+# relation rows of the generation and probed ``ce_events`` twice per row:
+# measured 6.7-9.7 s per slot on the 8 GB staging db — including for an empty
+# slot — which was ~88% of a live run's wall time. The fix drives the relation
+# scan with the slot's own event ids through ``ce_relations_generation_source``
+# and settles the far endpoint against that same id set.
 
-_EQUIV_GENERATION = "gen-equivalence"
-_EQUIV_OTHER_GENERATION = "gen-other"
+_SLOT_GEN = "gen-slot-rel"
+_SLOT_DECOY_GEN = "gen-slot-rel-decoy"
+_SLOT_A = "slot-art-a"
+_SLOT_B = "slot-art-b"
 
 
-def _relation_fixture(db: Path) -> None:
-    """source-hit / target-hit / both-hit / neither-hit + a foreign generation."""
+def _slot_relation_fixture(db: Path) -> None:
+    """Two slots in one generation, a cross-slot relation and a decoy generation."""
 
     create_v2_schema(db)
-    rows = [
-        (_EQUIV_GENERATION, "rel-1", "ev-1", "ev-2", "k"),        # source hit
-        (_EQUIV_GENERATION, "rel-2", "ev-3", "ev-4", "k"),        # target hit
-        (_EQUIV_GENERATION, "rel-3", "ev-5", "ev-6", "k"),        # neither
-        (_EQUIV_GENERATION, "rel-4", "ev-1", "ev-4", "k"),        # both ends
-        (_EQUIV_GENERATION, "rel-5", "ev-2", "ev-1", "k"),        # target hit
-        (_EQUIV_OTHER_GENERATION, "rel-6", "ev-1", "ev-4", "k"),  # other gen
-    ]
     con = sqlite3.connect(str(db))
     try:
+        con.execute("PRAGMA foreign_keys=ON")
+        con.executemany(
+            "INSERT INTO ce_source_artifacts (artifact_id, family, source_kind,"
+            " content_hash, capture_method, relative_path, byte_size)"
+            " VALUES (?,?,?,?,?,?,?)",
+            [(slot, FAMILY, "file", "h", "mirror-copy", f"{FAMILY}/{slot}", 1)
+             for slot in (_SLOT_A, _SLOT_B)],
+        )
+        con.executemany(
+            "INSERT INTO ce_event_generations (generation_id, status, created_at)"
+            " VALUES (?,?,?)",
+            [(gen, "staged", "2026-07-01T00:00:00Z")
+             for gen in (_SLOT_GEN, _SLOT_DECOY_GEN)],
+        )
+        sessions: list[tuple] = []
+        events: list[tuple] = []
+        for gen in (_SLOT_GEN, _SLOT_DECOY_GEN):
+            for slot, ids in (
+                (_SLOT_A, ("ev-a1", "ev-a2", "ev-a3")),
+                (_SLOT_B, ("ev-b1", "ev-b2")),
+            ):
+                session = f"sess-{gen}-{slot}"
+                sessions.append(
+                    (gen, session, FAMILY, "nat", None, None, slot,
+                     f"loc-{session}", "v1", "{}")
+                )
+                events += [
+                    (gen, eid, session, "message", slot, f"{session}/{eid}", None,
+                     "2026-07-01T00:00:00Z", ordinal, None, None, None, "v1", "{}")
+                    for ordinal, eid in enumerate(ids)
+                ]
+        con.executemany(
+            "INSERT INTO ce_sessions (generation_id, session_id, family,"
+            " native_session_id, started_at, ended_at, artifact_id,"
+            " native_locator, contract_version, fidelity_json)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)", sessions)
+        con.executemany(
+            "INSERT INTO ce_events (generation_id, event_id, session_id, kind,"
+            " artifact_id, native_locator, native_event_id, occurred_at, ordinal,"
+            " native_payload_ref, content, summary, contract_version, fidelity_json)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", events)
         con.executemany(
             "INSERT INTO ce_event_relations (generation_id, relation_id,"
-            " source_event_id, target_event_id, relation_kind)"
-            " VALUES (?,?,?,?,?)",
-            rows,
+            " source_event_id, target_event_id, relation_kind) VALUES (?,?,?,?,?)",
+            [
+                (_SLOT_GEN, "rel-a-1", "ev-a1", "ev-a2", "k"),      # inside A
+                (_SLOT_GEN, "rel-a-2", "ev-a2", "ev-a3", "k"),      # inside A
+                (_SLOT_GEN, "rel-cross", "ev-a1", "ev-b1", "k"),    # A -> B
+                (_SLOT_GEN, "rel-b-1", "ev-b1", "ev-b2", "k"),      # inside B
+                (_SLOT_DECOY_GEN, "rel-decoy", "ev-a1", "ev-a2", "k"),
+            ],
         )
         con.commit()
     finally:
         con.close()
 
 
-def test_relation_touch_lookup_is_equivalent_and_index_backed(
+def _slot_relation_ids_reference(
+    con: sqlite3.Connection, generation_id: str, slot_id: str
+) -> set[str]:
+    """The pre-optimisation two-JOIN form, kept as the equivalence oracle."""
+
+    return {
+        str(row[0])
+        for row in con.execute(
+            "SELECT r.relation_id FROM ce_event_relations r "
+            "JOIN ce_events a ON a.generation_id=r.generation_id "
+            "  AND a.event_id=r.source_event_id "
+            "JOIN ce_events b ON b.generation_id=r.generation_id "
+            "  AND b.event_id=r.target_event_id "
+            "WHERE r.generation_id=? AND a.artifact_id=? AND b.artifact_id=?",
+            (generation_id, slot_id, slot_id),
+        )
+    }
+
+
+def test_slot_relation_lookup_is_equivalent_and_index_backed(
     tmp_path: Path,
 ) -> None:
-    db = tmp_path / "relations.sqlite"
-    _relation_fixture(db)
+    db = tmp_path / "slot-relations.sqlite"
+    _slot_relation_fixture(db)
     con = _connect(db)
     try:
         traced: list[str] = []
         con.set_trace_callback(traced.append)
-        found = _relation_ids_touching(con, _EQUIV_GENERATION, {"ev-1", "ev-4"})
+        found = _slot_relation_ids(con, _SLOT_GEN, _SLOT_A)
         con.set_trace_callback(None)
 
-        # (a) Equivalence. Expected ids are spelled out independently here; the
-        # foreign generation's matching row must not leak in.
-        assert found == {"rel-1", "rel-2", "rel-4", "rel-5"}, sorted(found)
+        # (a) Independent expectation. Only the two relations fully inside slot A
+        # qualify: the A->B relation and the decoy generation must not leak in.
+        assert found == {"rel-a-1", "rel-a-2"}, sorted(found)
+        assert _slot_relation_ids_reference(con, _SLOT_GEN, _SLOT_A) == {
+            "rel-a-1", "rel-a-2"
+        }
 
-        # (b) Plan. Each predicate must reach the second key column of its own
-        # index; a single OR predicate cannot and degrades to ``(generation_id=?)``.
+        # (b) Equivalence with the pre-optimisation query, both slots.
+        assert found == _slot_relation_ids_reference(con, _SLOT_GEN, _SLOT_A)
+        assert _slot_relation_ids(con, _SLOT_GEN, _SLOT_B) == {"rel-b-1"}
+        # An empty slot answers the empty set (the old form still paid a full
+        # generation scan here).
+        assert _slot_relation_ids(con, _SLOT_GEN, "slot-art-absent") == set()
+
+        # (c) Semantics: every returned relation has BOTH endpoints in the slot.
+        endpoint_rows = _rows(
+            db,
+            "SELECT r.relation_id, a.artifact_id, b.artifact_id"
+            " FROM ce_event_relations r"
+            " JOIN ce_events a ON a.generation_id=r.generation_id"
+            "   AND a.event_id=r.source_event_id"
+            " JOIN ce_events b ON b.generation_id=r.generation_id"
+            "   AND b.event_id=r.target_event_id"
+            " WHERE r.generation_id=?",
+            (_SLOT_GEN,),
+        )
+        inside = {
+            rel
+            for rel, src_slot, tgt_slot in endpoint_rows
+            if (src_slot, tgt_slot) == (_SLOT_A, _SLOT_A)
+        }
+        assert inside == found, (sorted(inside), sorted(found))
+        assert "rel-cross" in {rel for rel, *_ in endpoint_rows}
+        assert "rel-cross" not in found
+
+        # (d) Plan. The relation scan must be reached through the slot's own
+        # event ids, and no step may enumerate the generation's relations on
+        # ``generation_id`` alone.
         selects = [
             sql for sql in traced if sql.lstrip().upper().startswith("SELECT")
         ]
+        assert selects, traced
         plans = [_plan_text(con, sql) for sql in selects]
-        by_source = [plan for plan in plans if "source_event_id=?" in plan]
-        by_target = [plan for plan in plans if "target_event_id=?" in plan]
-        assert by_source, plans
-        assert by_target, plans
+        joined = " | ".join(plans)
         assert (
-            "ce_relations_generation_source (generation_id=? AND source_event_id=?)"
-            in by_source[0]
-        ), by_source[0]
-        assert (
-            "ix_ce_rel_gen_target (generation_id=? AND target_event_id=?)"
-            in by_target[0]
-        ), by_target[0]
+            "ce_relations_generation_source"
+            " (generation_id=? AND source_event_id=?)" in joined
+        ), joined
         for plan in plans:
-            assert "SCAN" not in plan, plan
-        # (c) Shape: one statement per index.
-        assert len(selects) == 2, selects
+            assert "SCAN ce_event_relations" not in plan, plan
+            assert "ix_ce_rel_gen_target (generation_id=?)" not in plan, plan
+            assert "ce_relations_generation_source (generation_id=?)" not in plan, plan
     finally:
         con.close()

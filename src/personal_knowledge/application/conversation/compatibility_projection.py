@@ -12,8 +12,11 @@ This module owns ONLY event-to-legacy mapping:
     computes the lossy session/message/tool rows plus a deterministic
     :class:`ProjectionFingerprint` (generation lineage).
   - :func:`write_compatibility_projection` persists those rows inside the
-    caller's transaction; :func:`clear_compatibility_projection` restores the
-    prior projection during rollback.
+    caller's transaction (replacing what the projection owns);
+    :func:`upsert_compatibility_projection` is the incremental counterpart and
+    only ever inserts or updates (never deletes);
+    :func:`clear_compatibility_projection` restores the prior projection during
+    rollback.
   - :func:`compute_projection` is the pure mapping used by both.
 
 It never activates a generation and never touches ``ce_generation_authority``
@@ -68,6 +71,11 @@ EXCLUDED_KINDS: frozenset[EventKind] = frozenset(
 # 32766 (3.32+). Chunk well below both so a large delete can
 # never fail on arity.
 _PARAM_CHUNK = 400
+
+
+def _chunks(values: list, size: int = _PARAM_CHUNK):
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
 
 PROJECTED_TABLES: tuple[str, ...] = (
     "canonical_sessions",
@@ -608,6 +616,100 @@ def write_compatibility_projection(
     )
 
 
+def _upsert_rows(
+    con: sqlite3.Connection,
+    *,
+    table: str,
+    columns: tuple[str, ...],
+    rows: tuple[dict, ...],
+) -> tuple[int, int]:
+    """Insert the missing rows and refresh the changed ones in place.
+
+    ``columns[0]`` is the table's primary key. Rows whose values are identical
+    to what is stored are left untouched, so a re-projection of an unchanged
+    session writes nothing at all. Returns ``(inserted, updated)``.
+    """
+
+    if not rows:
+        return 0, 0
+    id_column = columns[0]
+    incoming = {
+        str(row[id_column]): tuple(row.get(column) for column in columns)
+        for row in rows
+    }
+    stored: dict[str, tuple] = {}
+    for chunk in _chunks(sorted(incoming)):
+        marks = ",".join("?" * len(chunk))
+        for row in con.execute(
+            f"SELECT {', '.join(columns)} FROM {table} "
+            f"WHERE {id_column} IN ({marks})",
+            chunk,
+        ):
+            stored[str(row[0])] = tuple(row)
+
+    to_insert = [row for row in incoming.values() if str(row[0]) not in stored]
+    to_update = [
+        row
+        for row_id, row in incoming.items()
+        if row_id in stored and stored[row_id] != row
+    ]
+    if to_insert:
+        con.executemany(
+            f"INSERT INTO {table} ({', '.join(columns)}) "
+            f"VALUES ({','.join('?' * len(columns))})",
+            to_insert,
+        )
+    if to_update:
+        assignments = ", ".join(f"{c}=?" for c in columns[1:])
+        con.executemany(
+            f"UPDATE {table} SET {assignments} WHERE {id_column}=?",
+            [(*row[1:], row[0]) for row in to_update],
+        )
+    return len(to_insert), len(to_update)
+
+
+def upsert_compatibility_projection(
+    con: sqlite3.Connection, report: CompatibilityProjectionReport
+) -> dict[str, dict[str, int]]:
+    """Persist the projected rows without ever deleting one (collection writer).
+
+    This is the writer used by the incremental live path. It inserts rows that
+    are absent and refreshes rows whose values changed with an ``UPDATE``:
+
+      - ``canonical_sessions`` / ``canonical_messages`` /
+        ``canonical_tool_events`` are read with a **monotonic rowid cursor** by
+        ``retrieval/conversation_fts.py``, so rewriting a row must not move its
+        rowid. ``INSERT OR REPLACE`` and delete-then-insert both do move it (and
+        can recycle a low rowid behind a reader's watermark); an ``UPDATE``
+        cannot.
+      - A row this projection no longer produces (the source disappeared, the
+        native id changed) is left exactly as collected. The store is a
+        collection, not a mirror of whatever the sources currently contain.
+
+    Projected ids are recorded in ``ce_projected_ids`` with ``INSERT OR IGNORE``
+    so the activation/rollback owner still knows which rows the projection wrote;
+    that table is never cleared here.
+    """
+
+    _ensure_tables(con)
+    counts: dict[str, dict[str, int]] = {}
+    for table, columns, rows in (
+        ("canonical_sessions", _SESSION_COLUMNS, report.sessions),
+        ("canonical_messages", _MESSAGE_COLUMNS, report.messages),
+        ("canonical_tool_events", _TOOL_COLUMNS, report.tools),
+    ):
+        inserted, updated = _upsert_rows(
+            con, table=table, columns=columns, rows=rows
+        )
+        counts[table] = {"inserted": inserted, "updated": updated}
+        if rows:
+            con.executemany(
+                "INSERT OR IGNORE INTO ce_projected_ids VALUES (?,?)",
+                [(table, str(row[columns[0]])) for row in rows],
+            )
+    return counts
+
+
 def clear_compatibility_projection(con: sqlite3.Connection) -> None:
     """Delete every row the current projection wrote (rollback owner only).
 
@@ -701,5 +803,6 @@ __all__ = [
     "build_compatibility_projection",
     "clear_compatibility_projection",
     "compute_projection",
+    "upsert_compatibility_projection",
     "write_compatibility_projection",
 ]
