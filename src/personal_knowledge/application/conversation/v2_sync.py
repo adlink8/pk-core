@@ -355,7 +355,10 @@ def shadow_conversation_generation(
 
     ``discovery_ledger`` is an optional discovery-layer accounting sink; when
     given, a metadata-only ``discovery`` block (counts + reason histogram,
-    never per-file paths) is added to the report before the digest is taken.
+    never per-file paths) is added to the report before the digest is taken,
+    together with a read-only ``accounting`` block comparing the ledger's
+    per-family claims with what the staged generation actually references
+    (measurement only: it is never part of ``report["gates"]``).
     """
     if not source_root.exists():
         raise FileNotFoundError(f"v2 source root missing: {source_root}")
@@ -405,10 +408,19 @@ def shadow_conversation_generation(
             "scanned_roots": discovery_ledger.scanned_roots,
             "candidates": discovery_ledger.candidates,
             "claimed": discovery_ledger.claimed,
+            # 按家族的认领分解（只有 family 名 + 计数）：一个 generation 是按
+            # family 分组成批的，总数对不上任何一批，分解才能对账。
+            "claimed_by_family": dict(discovery_ledger.claimed_by_family),
             "unclaimed": len(discovery_ledger.unclaimed),
             "unclaimed_by_reason": dict(account.dropped),
             "reconcile_passed": reconcile([account]).passed,
         }
+        # 只读测量（只记不拦，绝不进 gates）：发现层认领数 vs 该 generation 的
+        # ce_sessions 实际引用到的不同 artifact 数。真机数字先拿到手，是否升格
+        # 为门禁另案决定，所以这里只写报告、不改变任何流程结果。
+        report["accounting"] = _accounting_by_family(
+            db, generations, discovery_ledger.claimed_by_family
+        )
     report["report_digest"] = _report_digest(report)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
@@ -416,6 +428,87 @@ def shadow_conversation_generation(
         encoding="utf-8",
     )
     return report
+
+
+def _accounting_by_family(
+    db: Path,
+    generations: dict[str, dict],
+    claimed_by_family: dict[str, int],
+) -> dict:
+    """只读测量：发现层认领数 vs generation 实际引用到的 artifact 数。
+
+    **只记不拦**：结果永不进 ``report["gates"]``，也不影响 staging 或 activation
+    的任何一步。这一片的目的是先拿到真机数字，再决定是否升格为门禁。
+
+    **两侧口径不同，delta 的绝对值不是丢失量**：左值 ``claimed`` 数的是该
+    family 在发现层台账里认领的 **文件数**（台账未记则记 0，家族仍然保留，
+    不静默丢）；右值 ``referenced_artifacts`` 数的是该 generation 的
+    ``ce_sessions`` 里该 family 引用到的 **不同 ``artifact_id`` 数**
+    （``COUNT(DISTINCT artifact_id)``：同一 artifact 被多条会话引用只算一个）。
+    因此被认领、也被抓下来、但**没解析出任何会话**的文件（索引文件、只有元数据
+    的文件等）会算进左边而不在右边：``delta = claimed - referenced`` 为正是
+    **待查的问题**，不是"丢了 N 条"的结论。
+
+    要把它变成能拦的门禁判据，前提是**两侧同口径**——即先记录"每个 generation
+    暂存了哪些 artifact"，那是后续独立的一片，本次不做。
+
+    ``referenced_artifacts`` 为 ``None`` 表示右侧查询失败（库打不开或查询抛
+    ``sqlite3.Error``），此时 ``delta`` 也记 ``None``：查询不出来与真的是 0
+    必须可区分，不用 0 冒充。故 ``delta`` 可能为 ``null``，读的人需自行判空。
+
+    家族按属主归一（别名 ``vscode-copilot`` 不另立一行）。输出只有 family 名、
+    计数（或 ``null``），绝不包含正文 / 路径 / 凭据。
+    """
+    import sqlite3
+
+    def owner_of(name: str, entry: dict) -> str:
+        return entry.get("family") or name
+
+    generation_ids = {
+        owner_of(name, entry): entry.get("generation_id")
+        for name, entry in generations.items()
+    }
+    families = set(generation_ids) | set(claimed_by_family)
+
+    connection = None
+    if db.exists():
+        try:
+            connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        except sqlite3.Error:  # 只读测量不拦流程
+            connection = None
+    by_family: dict[str, dict] = {}
+    try:
+        for family in sorted(families):
+            claimed = int(claimed_by_family.get(family, 0))
+            generation_id = generation_ids.get(family)
+            # None = 查不出来（库打不开 / 查询抛错），与"真的是 0"区分开。
+            referenced: int | None
+            if not generation_id:
+                # 没有对应 generation：确实没有可引用的会话，这才是真的 0。
+                referenced = 0
+            elif connection is None:
+                referenced = None
+            else:
+                try:
+                    row = connection.execute(
+                        "SELECT COUNT(DISTINCT artifact_id) FROM ce_sessions "
+                        "WHERE generation_id = ? AND family = ?",
+                        (generation_id, family),
+                    ).fetchone()
+                    referenced = int(row[0])
+                except sqlite3.Error:
+                    # 只读测量失败记 None：不拦流程，也不让"查不出来"伪装成
+                    # 一个看起来真实的差额（delta 同记 None）。
+                    referenced = None
+            by_family[family] = {
+                "claimed": claimed,
+                "referenced_artifacts": referenced,
+                "delta": None if referenced is None else claimed - referenced,
+            }
+    finally:
+        if connection is not None:
+            connection.close()
+    return {"by_family": by_family}
 
 
 def _all_detected_names(by_family: dict[str, list[Path]]) -> set[str]:
@@ -938,6 +1031,8 @@ def native_dry_run_report(found, ledger=None) -> dict:
             "scanned_roots": ledger.scanned_roots,
             "candidates": ledger.candidates,
             "claimed": ledger.claimed,
+            # 与 shadow 路径同形：按家族的认领分解，只有 family 名 + 计数。
+            "claimed_by_family": dict(ledger.claimed_by_family),
             "unclaimed": len(ledger.unclaimed),
             "unclaimed_by_reason": dict(account.dropped),
             "reconcile_passed": reconcile([account]).passed,

@@ -248,12 +248,20 @@ class DiscoveryLedger:
     """Optional, read-only accounting sink for :func:`discover_client_sources`.
 
     Counts what discovery saw; never influences what discovery returns.
+
+    ``claimed_by_family`` decomposes ``claimed`` by *owning* family (aliases are
+    normalized via :func:`registry.resolve_family`), because a generation is
+    staged per family and the two numbers have to be comparable. The sum of the
+    decomposition is exactly ``claimed``: a claim is recorded under the same
+    global ``counted`` predicate that guards ``claimed``, so a file reachable
+    through two aliases or two nested roots is never counted twice.
     """
 
     scanned_roots: int = 0
     candidates: int = 0
     claimed: int = 0
     unclaimed: list[UnclaimedFile] = field(default_factory=list)
+    claimed_by_family: dict[str, int] = field(default_factory=dict)
 
 
 def _file_identity(path: Path) -> str:
@@ -356,6 +364,16 @@ def discover_client_sources(
                     matches.append(file_path)
                     if first_sighting:
                         ledger.claimed += 1
+                        # 族级分解走同一个 first_sighting / counted 判据，而不是
+                        # 另算一套：分解总和 == claimed 是硬约束，别名家族
+                        # （vscode-copilot → copilot）不能把同一批文件算两遍。
+                        # 归一到属主家族，才能跟按家族分组的 generation 对齐。
+                        # 此处 resolve_family 必不抛：上面的 detect_family 已经
+                        # 解析过一次同样的名字。
+                        owner = resolve_family(family)
+                        ledger.claimed_by_family[owner] = (
+                            ledger.claimed_by_family.get(owner, 0) + 1
+                        )
                 elif first_sighting:
                     ledger.unclaimed.append(
                         UnclaimedFile(

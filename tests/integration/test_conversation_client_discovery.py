@@ -573,3 +573,77 @@ def test_alias_family_sharing_one_root_is_counted_once_in_ledger(
     assert ledger.claimed == 1
     assert ledger.unclaimed == []
     assert ledger.candidates == ledger.claimed + len(ledger.unclaimed)
+
+
+def test_ledger_decomposes_claimed_by_family_under_the_same_dedup_rule(
+    tmp_path: Path,
+) -> None:
+    """认领数按属主家族分解，且分解总和恒等于 ``ledger.claimed``。
+
+    一个 generation 是按家族分组成批的，所以「发现层认领了 N 个文件」这句话
+    必须能拆到家族上，否则台账跟任何一批 generation 都对不上账。
+
+    场景里同时含两种「同一文件被列两次」：codex 的两个嵌套 root，以及
+    copilot / vscode-copilot 共享同一 root。分解若按各家族 ``found`` 列表求长度
+    （绕过全局 ``counted`` 判据），别名家族会把同一批文件各记一遍，总和 3 而
+    ``claimed`` 是 2 —— 这正是本条要拦住的。
+    """
+    from personal_knowledge.adapters.conversation_sources.discovery import (
+        DiscoveryLedger,
+    )
+
+    codex_root = tmp_path / "home" / ".codex"
+    codex_file = _write_codex_jsonl(codex_root, "s1.jsonl")
+    copilot_root = tmp_path / "home" / ".copilot"
+    (copilot_root / "session-state").mkdir(parents=True)
+    copilot_trace = copilot_root / "session-state" / "events.jsonl"
+    copilot_trace.write_text(
+        json.dumps({"type": "session.start", "id": "s1"}) + "\n", encoding="utf-8"
+    )
+    roots = {
+        # 后者嵌套前者：同一 jsonl 被列两次。
+        "codex": (codex_root / "sessions", codex_root),
+        # 别名与属主共享 root：同一批文件被列两次。
+        "copilot": (copilot_root,),
+        "vscode-copilot": (copilot_root,),
+    }
+
+    ledger = DiscoveryLedger()
+    found = discover_client_sources(roots, ledger=ledger)
+
+    # 返回值保持原样：别名键另有消费者，不许因为改台账而消失。
+    assert codex_file in found["codex"]
+    assert found["copilot"] == [copilot_trace]
+    assert found["vscode-copilot"] == [copilot_trace]
+
+    # 独立字面量：两个属主家族各认领 1 个文件（嵌套 / 别名都不翻倍）。
+    assert ledger.claimed == 2
+    assert ledger.claimed_by_family == {"codex": 1, "copilot": 1}
+    assert sum(ledger.claimed_by_family.values()) == ledger.claimed
+
+
+def test_ledger_claimed_by_family_sums_to_claimed_on_mixed_machine(
+    tmp_path: Path,
+) -> None:
+    """认领 / 未认领混在一批时，「分解总和 == 总数」仍成立。
+
+    未认领的文件不进分解（它们不是任何 generation 的输入），所以分母是
+    ``claimed`` 而不是 ``candidates``。
+    """
+    from personal_knowledge.adapters.conversation_sources.discovery import (
+        DiscoveryLedger,
+    )
+
+    codex_root = tmp_path / "home" / ".codex"
+    _write_codex_jsonl(codex_root, "s1.jsonl")
+    (codex_root / "config.toml").write_text("model = 'x'", encoding="utf-8")
+    roots = {"codex": (codex_root,)}
+
+    ledger = DiscoveryLedger()
+    discover_client_sources(roots, ledger=ledger)
+
+    assert ledger.candidates == 2
+    assert ledger.claimed == 1
+    assert len(ledger.unclaimed) == 1
+    assert ledger.claimed_by_family == {"codex": 1}
+    assert sum(ledger.claimed_by_family.values()) == ledger.claimed
