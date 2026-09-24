@@ -74,6 +74,7 @@ from personal_knowledge.application.conversation.live_sync import (
     _connect,
     live_sync_once,
 )
+from personal_knowledge.core.project_paths import AGENT_CONVERSATIONS_DB
 
 # --------------------------------------------------------------- constants
 
@@ -799,7 +800,8 @@ def add_conversation_watch_args(parser) -> None:  # noqa: ANN001 - argparse
         "--live-db",
         type=Path,
         default=None,
-        help="Live sync: live database (default: the --v2-db default)",
+        help="Live sync: live database (default: the authoritative conversation "
+             "store; the shadow staging db is never a default target)",
     )
     parser.add_argument(
         "--live-mirror",
@@ -815,11 +817,28 @@ def add_conversation_watch_args(parser) -> None:  # noqa: ANN001 - argparse
     )
 
 
+def live_targets(args) -> tuple[Path, Path]:  # noqa: ANN001 - argparse Namespace
+    """Resolve ``(mirror_root, db)`` for the live modes.
+
+    The mirror stays in the staging tree — that tree is the *collected corpus*
+    (client-file snapshots plus the content-addressed blob store beside it), not a
+    shadow copy of the store. The database does **not** stay there: the
+    incremental engine is the library's writer, so it targets the authoritative
+    conversation store. It used to default to ``--v2-db`` (the Phase 62 shadow
+    database, whose whole point was that v2 output never touched the authority);
+    that reason died with the manual-activation gate, and pointing at the shadow
+    db left the library frozen while fresh data piled up next door.
+    """
+
+    mirror_root = Path(args.live_mirror) if args.live_mirror else Path(args.v2_stage)
+    db = Path(args.live_db) if args.live_db else AGENT_CONVERSATIONS_DB
+    return mirror_root, db
+
+
 def cmd_conversations_live(args) -> int:  # noqa: ANN001 - argparse
     """CLI routing for the live-sync / watch modes (exit codes as elsewhere:
     0 success, 1 refused/failed, 2 internal)."""
-    mirror_root = Path(args.live_mirror) if args.live_mirror else Path(args.v2_stage)
-    db = Path(args.live_db) if args.live_db else Path(args.v2_db)
+    mirror_root, db = live_targets(args)
     generation_id = args.live_generation or DEFAULT_LIVE_GENERATION_ID
 
     if args.live_status:
@@ -881,6 +900,7 @@ __all__ = [
     "add_conversation_watch_args",
     "cmd_conversations_live",
     "live_status",
+    "live_targets",
     "run_watch",
     "scan_source_fingerprints",
 ]
