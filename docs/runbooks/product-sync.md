@@ -182,41 +182,24 @@ pk-sync conversations --v2-shadow --write --v2-source <source-root>
 # explicit shadow target:  --v2-db <path>
 ```
 
-Shadow output is metadata-only: 17-family counts/fidelity, artifact/generation
+Shadow 输出是元数据：17-family counts/fidelity, artifact/generation
 digests, compatibility parity, view counts, deterministic-gate counts, cost
 estimate, old-run supersession readiness, source fingerprints, exact rollback
-target. Never activates, never advances watermarks, never calls a provider.
+target。Shadow 这一步本身不激活、不推进 watermark、不调用 provider；是否合入由后续门禁决定（见下）。
 
-### Fidelity report and activation gate
+### 当前只有一条链：门禁过了自动合入
 
-`pk-sync conversations --event-v2-shadow --report ...` (62-07) produces the
-per-family fidelity evidence and the activation recommendation. Activation is
-permitted only after an explicit human approval recorded in
-62-07-SUMMARY/62-VALIDATION; `paid_calls=0` and every native-available session
-is captured or explicitly blocked.
+人工激活入口已退役：`--v2-activate` / `--v2-approval` / `--v2-families`
+三个 flag 连同「影子代 → 人工检查点 → 手动激活」的流程一起移除。现状是**只有一条链**——shadow 产出元数据报告后，命令级 fail-closed 门禁（未覆盖源、blocked/隐私族、未知族、覆盖率缺失、manifest 过期、校验和不符）全部通过即**自动合入**，不再有人工批准的检查点。
 
-### Activate / status / rollback
+`GenerationLifecycle` 的 stage/validate/activate/rollback 原语与
+`activate_conversation_generation` 保留，供自动合入调用，但不再从 CLI 可达。
 
 ```powershell
-# 1) stage into the live canonical DB (non-active)
-pk-sync conversations --v2-shadow --write --v2-source <source-root> `
-    --v2-db data/canonical/agent/structured/db/agent_conversations.sqlite
-
-# 2) activate the approved generation (delegates to event_generations only)
-pk-sync conversations --v2-activate <generation-id> --write `
-    --v2-db data/canonical/agent/structured/db/agent_conversations.sqlite
-
-# 3) health
+# 合入后健康检查
 pk-sync status --json
 pk-ku doctor --json
 rag-search stats --json
-python -m pytest -q tests/contract/test_conversation_v2_compatibility.py `
-    tests/integration/test_conversation_v2_sync.py
-
-# 4) rollback (clears the v2 projection rows + demotes authority; legacy kept)
-python -c "import sqlite3; from personal_knowledge.application.conversation.compatibility_projection import clear_compatibility_projection; \
-con=sqlite3.connect('data/canonical/agent/structured/db/agent_conversations.sqlite'); clear_compatibility_projection(con); \
-con.execute('UPDATE ce_generation_authority SET active=0 WHERE active=1'); con.commit(); con.close()"
 ```
 
 ### Partial-family interpretation
@@ -234,8 +217,9 @@ con.execute('UPDATE ce_generation_authority SET active=0 WHERE active=1'); con.c
 The two legacy message-level prepare runs (3,224 user + 21,263 assistant
 items) remain **audit-only/non-executable**; `pk-ku extract` refuses them
 (`LegacyRunSupersededError`). Any future paid semantic pilot requires a
-separate explicit user cost-approval checkpoint — the v2 activation approval
-does NOT authorize paid LLM extraction.
+separate explicit user cost-approval checkpoint — the retired v2 activation
+approval never authorized paid LLM extraction, and the automatic gate-driven
+merge does not either.
 
 ## Native client-directory discovery (Phase 62 seam, 不经过 AgentsView 中转)
 
@@ -251,9 +235,7 @@ pk-sync conversations --v2-native
 #    shadow 报告: data/staging/v2/report.json (metadata-only)
 #    大件（zcode 实时库快照 ~313MB）默认已覆盖（--v2-byte-limit 600MB）
 
-# 3) 人工确认后显式激活（永不自动激活，D-18）
-pk-sync conversations --v2-activate <generation-id> --write \
-    --v2-db data/canonical/agent/structured/db/agent_conversations.sqlite
+# 3) 不再有人工激活步骤：门禁通过后由自动合入发布（--v2-activate 已退役）
 ```
 
 ### 发现层（新增）

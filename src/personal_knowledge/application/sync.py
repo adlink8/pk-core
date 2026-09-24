@@ -214,7 +214,7 @@ def _cmd_conversations(write: bool, args) -> int:
         or getattr(args, "live_status", False)
     )
     if live_flags:
-        if (args.v2_dry_run or args.v2_shadow or args.v2_activate or
+        if (args.v2_dry_run or args.v2_shadow or
                 args.v2_native or args.v2_native_dry_run):
             print(
                 "[error] --live-* / --watch cannot be combined with a --v2-* mode",
@@ -227,10 +227,10 @@ def _cmd_conversations(write: bool, args) -> int:
 
         return cmd_conversations_live(args)
 
-    # Phase 62-04: explicit v2 dry-run / shadow / activation. These modes are
+    # Phase 62-04: explicit v2 dry-run / native / shadow. These modes are
     # opt-in and never change the default canonical service behavior (62-04
     # Task 3: default stays as-is until Plan 62-08).
-    if (args.v2_dry_run or args.v2_shadow or args.v2_activate or
+    if (args.v2_dry_run or args.v2_shadow or
             args.v2_native or args.v2_native_dry_run):
         from personal_knowledge.application.conversation.v2_sync import (
             cmd_conversations_v2,

@@ -33,7 +33,7 @@
 - 位置：`data/staging/v2/native/`，16 个 family 目录（antigravity / chatgpt / claude / codex / copilot / cursor / gemini / grok / kimi / kimi-work / mimo / opencode / pi / qoder / workbuddy / zcode），family 下按项目目录镜像源文件，并配 `.hashes.json` 哈希清单。
 - 规模（2026-08-29 实测）：**715 个 `.jsonl` 文件、共 381,659 行**（其中 codex 356 文件 / 209,510 行，claude 62 文件 / 20,881 行）。
   <!-- VERIFY: tmp/mvp_compression_report_v3.md:124 与历史口径称原始层"174,280 条"（约 17.4 万）；当日全量实测为 381,659 行，"174,280"的统计口径无法复现，引用时注意差异 -->
-- 只进不改：内容寻址暂存 + 哈希清单；同步默认 metadata-only shadow（不写 canonical），激活需人工 `--v2-activate` + 批准语（D-18）。
+- 只进不改：内容寻址暂存 + 哈希清单；同步默认 metadata-only shadow（不写 canonical），门禁全部通过后自动合入（人工 `--v2-activate` + 批准语入口已退役）。
 - 上游：各 family 工具的本地会话存储；其中 AgentView daemon 库 `%USERPROFILE%/.agentsview/sessions.db` 是 protected-external 只读源（`core/project_paths.py:98-101`）。
 
 ### ② 中间层结构化 canonical — `data/canonical/agent/structured/db/agent_conversations.sqlite`

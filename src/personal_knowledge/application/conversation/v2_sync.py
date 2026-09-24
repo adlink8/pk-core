@@ -1,13 +1,18 @@
-"""Phase 62-04: v2 conversation orchestration (dry-run / shadow / activation).
+"""Phase 62-04: v2 conversation orchestration (dry-run / native / shadow).
 
 The `pk-sync conversations --v2-*` seams (62-04 plan Task 3):
-:func:`probe_conversation_sources` (dry-run, metadata-only), 
+:func:`probe_conversation_sources` (dry-run, metadata-only) and
 :func:`shadow_conversation_generation` (capture + adapt + stage NON-active
-generations + metadata-only report), and :func:`activate_conversation_generation`
-(activates ONLY via :mod:`.event_generations`; fires a metadata-only post-commit
-delta only after success). :func:`add_conversations_v2_args` /
+generations + metadata-only report). :func:`add_conversations_v2_args` /
 :func:`cmd_conversations_v2` are the CLI surface consumed by
 :mod:`.application.sync`.
+
+The manual-activation CLI entry (``--v2-activate`` / ``--v2-approval`` /
+``--v2-families``) was retired (task 36): activation is now a gate-driven
+automatic merge, so no human checkpoint flag is exposed.
+:func:`activate_conversation_generation` and the
+:class:`~.event_generations.GenerationLifecycle` state machine are retained as
+primitives for that automatic merge to call, but are no longer CLI reachable.
 
 Command-level fail-closed gates run before the lifecycle: uncovered sources,
 blocked/privacy-gated families, unknown family, missing coverage, stale manifest
@@ -794,7 +799,12 @@ def activate_conversation_generation(
     publication_publisher=None,
     delta_publisher=None,
 ) -> dict:
-    """Explicit activation: delegates ONLY to the generation lifecycle.
+    """Activation primitive: delegates ONLY to the generation lifecycle.
+
+    CLI 入口已退役（人工激活由门禁自动合入取代），原语保留待接入自动合入。
+    The ``pk-sync conversations --v2-activate`` entry (with ``--v2-approval`` /
+    ``--v2-families``) was removed in task 36; this function stays as the seam
+    the automatic gate-driven merge will call.
 
     Command-level fail-closed gates (uncovered sources, blocked/privacy gate)
     run first; unknown family / missing coverage / stale manifest / checksum
@@ -964,13 +974,6 @@ def add_conversations_v2_args(parser: argparse.ArgumentParser) -> None:
              "generations plus a metadata-only report",
     )
     parser.add_argument(
-        "--v2-activate",
-        metavar="GENERATION_ID",
-        default=None,
-        help="Phase 62 v2: explicitly activate a staged generation (delegates "
-             "only to event_generations; default never activates)",
-    )
-    parser.add_argument(
         "--v2-source",
         type=Path,
         default=None,
@@ -994,17 +997,6 @@ def add_conversations_v2_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=Path("data") / "staging" / "v2" / "report.json",
         help="Phase 62 v2: metadata-only shadow report path",
-    )
-    parser.add_argument(
-        "--v2-families",
-        default=None,
-        help="Phase 62 v2: comma-separated expected adapter families for "
-             "activation (default: the generation's own family)",
-    )
-    parser.add_argument(
-        "--v2-approval",
-        default=None,
-        help="Exact local human checkpoint phrase required for v2 activation",
     )
 
 
@@ -1041,10 +1033,11 @@ def native_dry_run_report(found, ledger=None) -> dict:
 
 
 def cmd_conversations_v2(args) -> int:
-    """CLI routing for the explicit v2 modes (dry-run / shadow / activation).
+    """CLI routing for the explicit v2 modes (dry-run / native / shadow).
 
     Metadata-only outputs; writes only to the caller-supplied shadow database
-    (D-15/D-31, zero-paid)."""
+    (D-15/D-31, zero-paid). Activation is no longer a CLI mode (task 36); the
+    gate-driven merge owns it."""
     if args.v2_native_dry_run:
         from personal_knowledge.adapters.conversation_sources.discovery import (
             DiscoveryLedger,
@@ -1082,7 +1075,8 @@ def cmd_conversations_v2(args) -> int:
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         print(f"\n[native] metadata-only shadow report: {args.v2_report}")
-        print("[native] no generation activated; use --v2-activate explicitly.")
+        print("[native] no generation activated; the gate-driven merge handles "
+              "activation.")
         return 0
 
     if args.v2_dry_run:
@@ -1100,48 +1094,8 @@ def cmd_conversations_v2(args) -> int:
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         print(f"\n[shadow] metadata-only report: {args.v2_report}")
-        print("[shadow] no generation activated; use --v2-activate explicitly.")
-        return 0
-
-    if args.v2_activate:
-        if not args.v2_report.exists():
-            print(f"[error] v2 shadow report missing: {args.v2_report}")
-            return 1
-        try:
-            report = json.loads(args.v2_report.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            print(f"[error] cannot read v2 report: {exc}")
-            return 1
-        families = tuple(
-            f.strip() for f in (args.v2_families or "").split(",") if f.strip()
-        ) or None
-        try:
-            publication_publisher = None
-            from personal_knowledge.core.project_paths import (
-                AGENT_CONVERSATIONS_DB,
-                UNIFIED_DB,
-            )
-
-            if Path(args.v2_db).resolve() == AGENT_CONVERSATIONS_DB.resolve():
-                from personal_knowledge.application.serving.versions import (
-                    record_conversation_publications,
-                )
-
-                publication_publisher = lambda: record_conversation_publications(
-                    UNIFIED_DB, AGENT_CONVERSATIONS_DB
-                )
-            result = activate_conversation_generation(
-                db=args.v2_db,
-                generation_id=args.v2_activate,
-                report=report,
-                expected_adapter_families=tuple(families) if families else (),
-                approval=args.v2_approval,
-                publication_publisher=publication_publisher,
-            )
-        except Exception as exc:  # noqa: BLE001 - fail closed on the command line
-            print(f"[error] v2 activation blocked: {exc}")
-            return 1
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print("[shadow] no generation activated; the gate-driven merge handles "
+              "activation.")
         return 0
 
     print("[error] internal: unreachable v2 mode")

@@ -6,7 +6,7 @@
 #
 # 任务执行: pk-sync conversations --v2-native
 #   = discover 客户端目录 -> stage 新/变更文件 -> NON-active shadow (metadata-only)
-#   永不自动激活 (D-18: 激活需人工 --v2-activate + 批准语)。
+#   人工激活入口已退役（--v2-activate/--v2-approval/--v2-families）；门禁通过后由自动合入发布。
 param(
     [switch]$Unregister,
     [switch]$RunNow,
