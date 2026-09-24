@@ -25,9 +25,16 @@ from personal_knowledge.adapters.conversation_sources.snapshots import (
 )
 from personal_knowledge.application.conversation.compatibility_projection import (
     build_compatibility_projection,
+    clear_compatibility_projection,
     write_compatibility_projection,
 )
-from personal_knowledge.application.conversation.live_sync import live_sync_once
+from personal_knowledge.application.conversation.event_schema import (
+    create_v2_schema,
+)
+from personal_knowledge.application.conversation.live_sync import (
+    _relation_ids_touching,
+    live_sync_once,
+)
 from personal_knowledge.application.run_pipeline import shadow_conversation_generation
 
 FAMILY = "codex"
@@ -547,3 +554,144 @@ def test_dry_run_plan_lists_the_new_slot(tmp_path: Path) -> None:
             "rows_pruned": 0, "rows_inserted": 0,
         }
     }
+
+
+# ------------------------------------------------- 6. session-scope query plans
+#
+# The two projection tables are looked up and deleted by ``canonical_session_id``
+# (live-sync re-projection in ``live_sync._replace_*``, reads in
+# ``core.conversation_repository``), but their DDL declared no index on that
+# column, so every session paid one full-table SCAN (measured 44.8 ms messages /
+# 36.1 ms tool events on the 8 GB staging db). These tests pin the fix at the
+# seam that creates the tables (``compatibility_projection._ensure_tables``):
+# the session column must be index-backed, and the plans of the real query shapes
+# must stop scanning.
+
+_SESSION_INDEXES = {
+    "canonical_messages": "ix_canonical_messages_session",
+    "canonical_tool_events": "ix_canonical_tool_events_session",
+}
+
+
+def _plan_text(con: sqlite3.Connection, sql: str, params: tuple = ()) -> str:
+    return " | ".join(
+        str(row[3])
+        for row in con.execute("EXPLAIN QUERY PLAN " + sql, params)
+    )
+
+
+def test_projection_session_lookups_are_index_backed(tmp_path: Path) -> None:
+    db = tmp_path / "projected.sqlite"
+    con = _connect(db)
+    try:
+        # Public schema seam: clearing a fresh projection creates the tables.
+        clear_compatibility_projection(con)
+        con.commit()
+
+        for table, index_name in _SESSION_INDEXES.items():
+            names = {row[1] for row in con.execute(f"PRAGMA index_list({table})")}
+            assert index_name in names, (table, sorted(names))
+            key_columns = [
+                row[2] for row in con.execute(f"PRAGMA index_info({index_name})")
+            ]
+            assert key_columns[:1] == ["canonical_session_id"], key_columns
+
+            # The read shape used by consumers (``conversation_repository``).
+            select = f"SELECT 1 FROM {table} WHERE canonical_session_id=?"
+            select_plan = _plan_text(con, select, ("probe-session",))
+            assert "SCAN" not in select_plan, (table, select_plan)
+            assert "SEARCH" in select_plan, (table, select_plan)
+            assert index_name in select_plan, (table, select_plan)
+
+            # The write shape used by live-sync re-projection.
+            delete = (
+                f"DELETE FROM {table} WHERE canonical_session_id IN (?,?,?)"
+            )
+            delete_plan = _plan_text(con, delete, ("a", "b", "c"))
+            assert "SCAN" not in delete_plan, (table, delete_plan)
+            assert "SEARCH" in delete_plan, (table, delete_plan)
+            assert index_name in delete_plan, (table, delete_plan)
+    finally:
+        con.close()
+
+
+# --------------------------------------- 7. relation-touch lookup query shape
+#
+# ``live_sync._relation_ids_touching`` answers "which relations have EITHER
+# endpoint in this id set" for the prune. Written as one ``... OR ...``
+# predicate, the planner used only the FIRST key column of one index
+# (``ix_ce_rel_gen_target (generation_id=?)``): every 400-id chunk scanned all
+# relation rows of the generation (measured 1.09 s / 400 ids on the staging db;
+# a single 223k-event slot implies ~557 chunks). The fix asks once per index, so
+# each predicate reaches its own second key column and the union of the two
+# result sets is exactly the old answer.
+
+_EQUIV_GENERATION = "gen-equivalence"
+_EQUIV_OTHER_GENERATION = "gen-other"
+
+
+def _relation_fixture(db: Path) -> None:
+    """source-hit / target-hit / both-hit / neither-hit + a foreign generation."""
+
+    create_v2_schema(db)
+    rows = [
+        (_EQUIV_GENERATION, "rel-1", "ev-1", "ev-2", "k"),        # source hit
+        (_EQUIV_GENERATION, "rel-2", "ev-3", "ev-4", "k"),        # target hit
+        (_EQUIV_GENERATION, "rel-3", "ev-5", "ev-6", "k"),        # neither
+        (_EQUIV_GENERATION, "rel-4", "ev-1", "ev-4", "k"),        # both ends
+        (_EQUIV_GENERATION, "rel-5", "ev-2", "ev-1", "k"),        # target hit
+        (_EQUIV_OTHER_GENERATION, "rel-6", "ev-1", "ev-4", "k"),  # other gen
+    ]
+    con = sqlite3.connect(str(db))
+    try:
+        con.executemany(
+            "INSERT INTO ce_event_relations (generation_id, relation_id,"
+            " source_event_id, target_event_id, relation_kind)"
+            " VALUES (?,?,?,?,?)",
+            rows,
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_relation_touch_lookup_is_equivalent_and_index_backed(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "relations.sqlite"
+    _relation_fixture(db)
+    con = _connect(db)
+    try:
+        traced: list[str] = []
+        con.set_trace_callback(traced.append)
+        found = _relation_ids_touching(con, _EQUIV_GENERATION, {"ev-1", "ev-4"})
+        con.set_trace_callback(None)
+
+        # (a) Equivalence. Expected ids are spelled out independently here; the
+        # foreign generation's matching row must not leak in.
+        assert found == {"rel-1", "rel-2", "rel-4", "rel-5"}, sorted(found)
+
+        # (b) Plan. Each predicate must reach the second key column of its own
+        # index; a single OR predicate cannot and degrades to ``(generation_id=?)``.
+        selects = [
+            sql for sql in traced if sql.lstrip().upper().startswith("SELECT")
+        ]
+        plans = [_plan_text(con, sql) for sql in selects]
+        by_source = [plan for plan in plans if "source_event_id=?" in plan]
+        by_target = [plan for plan in plans if "target_event_id=?" in plan]
+        assert by_source, plans
+        assert by_target, plans
+        assert (
+            "ce_relations_generation_source (generation_id=? AND source_event_id=?)"
+            in by_source[0]
+        ), by_source[0]
+        assert (
+            "ix_ce_rel_gen_target (generation_id=? AND target_event_id=?)"
+            in by_target[0]
+        ), by_target[0]
+        for plan in plans:
+            assert "SCAN" not in plan, plan
+        # (c) Shape: one statement per index.
+        assert len(selects) == 2, selects
+    finally:
+        con.close()

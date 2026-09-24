@@ -677,6 +677,20 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
             call_index INTEGER, subagent_session_id TEXT, content_length INTEGER,
             timestamp TEXT)"""
     )
+    # Session-scope lookups/deletes (live-sync re-projection deletes by
+    # ``canonical_session_id IN (...)``; readers select one session at a time)
+    # would otherwise be one full-table SCAN per session — measured 44.8 ms
+    # (messages) + 36.1 ms (tool events) per session on the ~8 GB staging db.
+    # Declared here, in the module that owns these tables, and idempotent, so an
+    # existing database picks the indexes up on its next projection build.
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS ix_canonical_messages_session "
+        "ON canonical_messages(canonical_session_id)"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS ix_canonical_tool_events_session "
+        "ON canonical_tool_events(canonical_session_id)"
+    )
 
 
 __all__ = [

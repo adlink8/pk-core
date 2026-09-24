@@ -452,7 +452,15 @@ def _slot_relation_ids(
 def _relation_ids_touching(
     con: sqlite3.Connection, generation_id: str, event_ids: set[str]
 ) -> set[str]:
-    """Relation ids with an endpoint in ``event_ids`` (either side)."""
+    """Relation ids with an endpoint in ``event_ids`` (either side).
+
+    Asked as one ``... OR ...`` predicate, SQLite can only use the first key
+    column of a single index (``(generation_id=?)``), so each chunk scanned
+    every relation row of the generation. The two predicates are therefore
+    issued separately — one per index, ``ce_relations_generation_source`` and
+    ``ix_ce_rel_gen_target`` — and their union is exactly the old answer
+    (duplicates collapse in both forms, and in ``found``).
+    """
 
     found: set[str] = set()
     for chunk in _chunks(sorted(event_ids)):
@@ -461,9 +469,16 @@ def _relation_ids_touching(
             str(row[0])
             for row in con.execute(
                 "SELECT relation_id FROM ce_event_relations "
-                f"WHERE generation_id=? AND (source_event_id IN ({marks}) "
-                f"OR target_event_id IN ({marks}))",
-                (generation_id, *chunk, *chunk),
+                f"WHERE generation_id=? AND source_event_id IN ({marks})",
+                (generation_id, *chunk),
+            )
+        )
+        found.update(
+            str(row[0])
+            for row in con.execute(
+                "SELECT relation_id FROM ce_event_relations "
+                f"WHERE generation_id=? AND target_event_id IN ({marks})",
+                (generation_id, *chunk),
             )
         )
     return found
