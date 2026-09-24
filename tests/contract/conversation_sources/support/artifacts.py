@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 from personal_knowledge.adapters.conversation_sources.contracts import (
+    PROBE_CONTENT_HASH,
     SourceArtifact,
     SourceArtifactSet,
 )
@@ -85,6 +86,33 @@ def file_artifact(
 def single(artifact: SourceArtifact) -> SourceArtifactSet:
     """只有一个 artifact 的集合。"""
     return SourceArtifactSet((artifact,))
+
+
+def probe_file(
+    root: Path, name: str, raw: str | bytes, *, source_kind: str = "file"
+) -> tuple[SourceArtifact, Path]:
+    """把**畸形字节**写到 ``root/name``，并构造与发现链路同形的 probe artifact。
+
+    形状对齐两个生产构造点（``discovery._artifact_for`` 与
+    ``v2_sync._probe_artifact``）：``content_hash`` 是 probe 哨兵、``artifact_root``
+    指向该文件所在目录，探测器因此按 ``relative_path`` 解析路径 —— 而不是 blob
+    存储里的 ``content_hash[:32]``。用它是为了在契约层复现「探测器收到畸形文件」
+    这条真实路径，而不是只在 blob 布局上验证。
+    """
+    data = raw.encode("utf-8") if isinstance(raw, str) else raw
+    path = Path(root) / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    artifact = SourceArtifact(
+        artifact_id=name,
+        family="",
+        source_kind=source_kind,
+        content_hash=PROBE_CONTENT_HASH,
+        capture_method="probe",
+        relative_path=name,
+        byte_size=len(data),
+    )
+    return artifact, path.parent
 
 
 def captured_sqlite(

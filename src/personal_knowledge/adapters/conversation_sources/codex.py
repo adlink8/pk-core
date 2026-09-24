@@ -48,7 +48,7 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "codex"
-ADAPTER_VERSION = "1.6.0"
+ADAPTER_VERSION = "1.7.0"
 CONTRACT_VERSION = "2"
 
 _COMPLETE = {
@@ -162,7 +162,9 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
                 if not line:
                     continue
                 return '"type"' in line and '"session_meta"' in line
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError 覆盖 UnicodeDecodeError：非 UTF-8 字节的 rollout 必须判为
+        # 「不是我」，不得把解析异常抛给发现层（会被记成 probe_error）。
         return False
     return False
 

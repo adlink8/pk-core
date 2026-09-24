@@ -40,7 +40,7 @@ from personal_knowledge.core.conversation_events import (
     make_event_id,
 )
 
-ADAPTER_VERSION = "1.4.0"
+ADAPTER_VERSION = "1.5.0"
 
 # Round-4 audit fix: tool/reasoning payloads (kimi wire loop events and
 # workbuddy flat records) were classified but never carried as event content.
@@ -454,7 +454,9 @@ class _Family:
                     line = raw.strip()
                     if line and any(m in line for m in self.markers):
                         return True
-        except OSError:
+        except (OSError, ValueError):
+            # ValueError 覆盖 UnicodeDecodeError：非 UTF-8 字节的轨迹必须判为
+            # 「不是我」，不得把解析异常抛给发现层（会被记成 probe_error）。
             return False
         return False
 

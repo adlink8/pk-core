@@ -39,7 +39,9 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "grok"
-ADAPTER_VERSION = "1.2.0"
+# 1.3.0：detect 变为对畸形字节全函数（非 UTF-8 返回 False 而非抛），
+# 探测器行为变了 → capability digest 变。
+ADAPTER_VERSION = "1.3.0"
 CONTRACT_VERSION = "2"
 
 # Native ``chat_history.jsonl`` record type -> canonical event kind.
@@ -138,7 +140,9 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
         return False
     try:
         head = artifact_bytes_path(artifact_root, artifact).read_text(encoding="utf-8")[:16384]
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError 覆盖 UnicodeDecodeError：非 UTF-8 字节的 transcript 必须判为
+        # 「不是我」，不得把解析异常抛给发现层（会被记成 probe_error）。
         return False
     # Whitespace-stripped comparison: a JSON formatter emitting ``"type": "user"``
     # must not disqualify the transcript. The window is deliberately wider than a

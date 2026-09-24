@@ -433,6 +433,45 @@ def test_consumer_parity_failure_blocks_activation(live, _activate) -> None:
     assert life.authority_generation_id() == "gen-1"
 
 
+def test_in_transaction_activation_error_is_audited_under_its_own_reason(
+    live, _activate
+) -> None:
+    """事务内抛出的 GenerationActivationError 必须按自己的 reason 记账。
+
+    consumer_parity 是 ``_commit`` 开头、**事务之前**的检查，走到事务内那条
+    ``except GenerationActivationError`` 说明失败来自事务内部的
+    authority/projection/version 写入（或 gate）自己抛出的异常，与 parity 无关。
+    历史标签 ``"consumer_parity"`` 会把排障的人引向 parity，故审计理由必须是
+    异常自带的 reason。
+    """
+    db, life, gen_a, gen_b = live
+    reason = "publication_failed:RuntimeError"
+
+    def failing_authority_writer(con) -> None:
+        # 事务内部失败：writer 自己抛 GenerationActivationError（真实形状见 v2_sync）。
+        raise GenerationActivationError(
+            "publication binding failed inside the transaction",
+            generation_id="gen-2",
+            reason=reason,
+        )
+
+    hooks = ActivationHooks(authority_writer=failing_authority_writer)
+    with pytest.raises(GenerationActivationError):
+        _activate(life, "gen-2", digest=gen_b.dataset_digest, hooks=hooks)
+
+    with sqlite3.connect(db) as con:
+        rows = [
+            row[0]
+            for row in con.execute(
+                "SELECT reason FROM ce_activation_log "
+                "WHERE generation_id='gen-2' AND outcome='failure'"
+            )
+        ]
+    assert rows, "a failed activation must leave an audit record"
+    assert rows[-1] == reason
+    assert "consumer_parity" not in rows[-1]
+
+
 def test_gate_runs_inside_transaction_and_rejects_activation(live, _activate) -> None:
     """A published gate must observe the new (uncommitted) rows of the very
     activation it blocks.

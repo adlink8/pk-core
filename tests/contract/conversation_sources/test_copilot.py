@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from personal_knowledge.adapters.conversation_sources import registry
 from personal_knowledge.core.conversation_events import EventKind
 
@@ -66,3 +68,23 @@ def test_copilot_tool_payloads_keep_full_text(tmp_path):
     assert not artifacts.any_reason(result, "truncated"), (
         "content cap removed: no truncation disposition may be produced"
     )
+
+
+# 探测器是全函数：畸形文件必须判「不是我」，不得把解析异常抛给发现层。
+# 非 UTF-8 字节：写了一半/别的编码落地的轨迹（UnicodeDecodeError ⊂ ValueError）。
+# 非法 JSON：~/.copilot 下别的家族的合法配置（如 config.json）不是 JSON。
+# 期望值是独立字面量 False，不由被测代码同款算法重算。
+MALFORMED_COPILOT_BYTES = (
+    ("session.jsonl", b'\xff\xfe\x00{"type":"user"}'),
+    ("session.json", b'\xff\xfe\x00{"requests": []}'),
+    ("config.json", "{ this is not json"),
+    ("config.json", b"\x00\x01\x02\x03"),
+)
+
+
+@pytest.mark.parametrize("name,raw", MALFORMED_COPILOT_BYTES)
+def test_copilot_detector_rejects_malformed_bytes_without_raising(
+    tmp_path, name, raw
+):
+    artifact, root = artifacts.probe_file(tmp_path, name, raw)
+    assert registry.detect_family("copilot", artifact, artifact_root=root) is False

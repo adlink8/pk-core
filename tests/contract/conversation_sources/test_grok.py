@@ -1,4 +1,4 @@
-"""grok 家族（生产模块 ``grok``，ADAPTER_VERSION 1.2.0）适配契约。
+"""grok 家族（生产模块 ``grok``，ADAPTER_VERSION 1.3.0）适配契约。
 
 公开 seam 是 registry（``adapt_for`` / ``detect_family``）——生产代码只经它
 调用家族模块，所以断言也走同一入口，不直接摸 ``grok.adapt``。夹具来自
@@ -298,3 +298,21 @@ def test_events_jsonl_types_are_reason_events_not_dropped(tmp_path: Path) -> Non
         assert event.field_dispositions
         assert all((record.reason or "").strip() for record in event.field_dispositions)
         assert event.kind is not EventKind.UNKNOWN_NATIVE or native_type in artifacts.reasons(event)
+
+
+# ------------------------------------------- 探测器全函数（grok 的三个文件名）
+# 探测器是全函数：畸形文件判「不是我」，不得把解析异常抛给发现层（会被记成
+# probe_error）。grok 的 read_text 只被 except OSError 守着，非 UTF-8 字节会
+# 抛 UnicodeDecodeError（ValueError 子类），必须落回 False。
+# 三个文件名都要过文件名闸门，才真正摸到内容。期望值是独立字面量 False。
+NON_UTF8_TEXT = bytes([0xFF, 0xFE, 0x00]) + b"# Summary"
+UTF16_TEXT = "# Summary".encode("utf-16")
+
+
+@pytest.mark.parametrize(
+    "name", ["chat_history.jsonl", "summary.json", "summary.md"]
+)
+@pytest.mark.parametrize("raw", [NON_UTF8_TEXT, UTF16_TEXT])
+def test_grok_detector_rejects_malformed_bytes_without_raising(tmp_path, name, raw):
+    artifact, root = artifacts.probe_file(tmp_path, name, raw)
+    assert registry.detect_family("grok", artifact, artifact_root=root) is False

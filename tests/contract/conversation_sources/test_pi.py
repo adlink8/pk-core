@@ -1,4 +1,4 @@
-"""pi 家族适配器契约（模块 ``pi``，ADAPTER_VERSION 1.3.0）。
+"""pi 家族适配器契约（模块 ``pi``，ADAPTER_VERSION 1.4.0）。
 
 registry 是唯一的族级 seam：本文件只经 ``registry.adapt_for`` 调用适配器，
 不直接摸 ``pi.adapt``。
@@ -8,6 +8,8 @@ assistant / 带 image 块的 toolResult），正文全是合成句子。
 """
 
 from __future__ import annotations
+
+import pytest
 
 from personal_knowledge.adapters.conversation_sources import registry
 from personal_knowledge.core.conversation_events import EventKind
@@ -37,3 +39,19 @@ def test_pi_text_blocks_and_imageless_tool_result(tmp_path) -> None:
     for event in image_events:
         assert "qq" not in (event.content or "")
         assert "rr" not in (event.content or "")
+
+
+# 探测器是全函数：畸形文件判「不是我」，不得把解析异常抛给发现层（会被记成
+# probe_error）。非 UTF-8 / UTF-16 字节 = 写了一半或别的编码落地的会话。
+# 期望值是独立字面量 False。
+NON_UTF8_LINE = bytes([0xFF, 0xFE, 0x00]) + b'{"type":"conversation"}'
+UTF16_LINE = '{"type":"conversation"}'.encode("utf-16")
+
+
+@pytest.mark.parametrize(
+    "name,raw",
+    [("session.jsonl", NON_UTF8_LINE), ("session.jsonl", UTF16_LINE)],
+)
+def test_pi_detector_rejects_malformed_bytes_without_raising(tmp_path, name, raw):
+    artifact, root = artifacts.probe_file(tmp_path, name, raw)
+    assert registry.detect_family(FAMILY, artifact, artifact_root=root) is False

@@ -420,9 +420,13 @@ class GenerationLifecycle:
             publish = authority_publish(
                 self.db, apply, gates=hooks.gates, backup=True
             )
-        except GenerationActivationError:
+        except GenerationActivationError as exc:
+            # 事务**内部**失败（authority/projection/version 写入或 gate 自己抛的）。
+            # 不是 consumer_parity：parity 在 _commit 开头、事务之前就检查完，且它
+            # 自己会写 "consumer_parity:<reason>"；那条例外进不到这里。故按异常
+            # 自带的 reason 记账，让审计指向真实失败点。
             self._repo.record_attempt_log(
-                generation_id, "failure", "consumer_parity"
+                generation_id, "failure", exc.reason or "commit_blocked"
             )
             raise
         except Exception as exc:  # noqa: BLE001 - restore prior state, fail closed

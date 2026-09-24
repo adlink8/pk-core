@@ -44,7 +44,7 @@ from personal_knowledge.core.conversation_events import (
     make_event_id,
 )
 
-ADAPTER_VERSION = "1.6.0"
+ADAPTER_VERSION = "1.7.0"
 
 CONTRACT_VERSION = "2"
 
@@ -424,7 +424,9 @@ class _Family:
             return False
         try:
             lines = artifact_bytes_path(artifact_root, artifact).read_text(encoding="utf-8").splitlines()
-        except OSError:
+        except (OSError, ValueError):
+            # ValueError 覆盖 UnicodeDecodeError：非 UTF-8 字节的轨迹必须判为
+            # 「不是我」，不得把解析异常抛给发现层（会被记成 probe_error）。
             return False
         if self.dag_shape and not any('"uuid"' in l and '"parentUuid"' in l for l in lines):
             return False

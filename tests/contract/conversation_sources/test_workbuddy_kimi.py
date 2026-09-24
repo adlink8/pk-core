@@ -364,3 +364,23 @@ def test_workbuddy_oversized_bodies_are_kept_in_full(tmp_path):
     assert not artifacts.any_reason(result, "truncated"), (
         "content cap removed: no truncation disposition may be produced"
     )
+
+
+# ---------------------------------------- 探测器全函数（三家共用一份 detect）
+# 探测器是全函数：畸形文件判「不是我」，不得把解析异常抛给发现层（会被记成
+# probe_error）。非 UTF-8 / UTF-16 字节 = 写了一半或别的编码落地的轨迹。
+# 期望值是独立字面量 False。
+NON_UTF8_LINE = bytes([0xFF, 0xFE, 0x00]) + b'{"type":"session"}'
+UTF16_LINE = '{"type":"session"}'.encode("utf-16")
+
+
+@pytest.mark.parametrize("family", ["workbuddy", "kimi", "kimi-work"])
+@pytest.mark.parametrize(
+    "name,raw",
+    [("session.jsonl", NON_UTF8_LINE), ("session.jsonl", UTF16_LINE)],
+)
+def test_workbuddy_kimi_detector_rejects_malformed_bytes_without_raising(
+    tmp_path, family, name, raw
+):
+    artifact, root = artifacts.probe_file(tmp_path, name, raw)
+    assert registry.detect_family(family, artifact, artifact_root=root) is False

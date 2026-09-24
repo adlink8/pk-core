@@ -13,6 +13,8 @@ config / lifecycle 类记录与 last-prompt）。两家**共享**的 message 记
 
 from __future__ import annotations
 
+import pytest
+
 from personal_knowledge.adapters.conversation_sources import registry
 from personal_knowledge.core.conversation_events import EventKind
 from tests.contract.conversation_sources.support import artifacts
@@ -223,3 +225,23 @@ def test_oversized_bodies_are_kept_in_full(tmp_path):
     assert not artifacts.any_reason(result, "truncated"), (
         "content cap removed: no truncation disposition may be produced"
     )
+
+
+# ------------------------------------------------- 探测器全函数（两家都要）
+# 探测器是全函数：畸形文件判「不是我」，不得把解析异常抛给发现层（会被记成
+# probe_error）。非 UTF-8 / UTF-16 字节 = 写了一半或别的编码落地的轨迹。
+# 期望值是独立字面量 False。claude 与 qoder 共用同一份 detect，两家都要过。
+NON_UTF8_LINE = bytes([0xFF, 0xFE, 0x00]) + b'{"uuid":"u1","parentUuid":null}'
+UTF16_LINE = '{"uuid":"u1","parentUuid":null}'.encode("utf-16")
+
+
+@pytest.mark.parametrize("family", ["claude", "qoder"])
+@pytest.mark.parametrize(
+    "name,raw",
+    [("session.jsonl", NON_UTF8_LINE), ("session.jsonl", UTF16_LINE)],
+)
+def test_claude_qoder_detector_rejects_malformed_bytes_without_raising(
+    tmp_path, family, name, raw
+):
+    artifact, root = artifacts.probe_file(tmp_path, name, raw)
+    assert registry.detect_family(family, artifact, artifact_root=root) is False

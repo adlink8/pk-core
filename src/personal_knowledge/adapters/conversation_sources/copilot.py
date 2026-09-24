@@ -40,7 +40,9 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "copilot"
-ADAPTER_VERSION = "1.3.0"
+# 1.4.0：detect 变为对畸形字节全函数（非法 JSON / 非 UTF-8 返回 False 而非抛），
+# 探测器行为变了 → capability digest 变。
+ADAPTER_VERSION = "1.4.0"
 CONTRACT_VERSION = "2"
 
 # Round-4 audit fix: tool arguments/results were never stored as event content
@@ -164,7 +166,11 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
                     '"turn_start"' in line or '"tool_execution_start"' in line
                     or '"assistant.turn_start"' in line or '"session.start"' in line
                 )
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError 覆盖 json.JSONDecodeError 与 UnicodeDecodeError：一个不是
+        # JSON 的 .json（如 ~/.copilot/config.json 这类别的家族的配置）或非
+        # UTF-8 字节的轨迹都必须判为「不是我」，不能把解析异常抛给发现层
+        # （discovery 会把它记成 probe_error，误报成「探测器自己坏了」）。
         return False
     return False
 

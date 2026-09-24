@@ -1,4 +1,4 @@
-"""Grok 家族（生产模块 ``grok``，ADAPTER_VERSION 1.2.0）原生夹具 builder。
+"""Grok 家族（生产模块 ``grok``，ADAPTER_VERSION 1.3.0）原生夹具 builder。
 
 只构造合成 / 脱敏字节，正文全是假句子，不读权威库。测试文件经 registry
 seam 消费这些产物，所以这里不 import 任何测试文件。

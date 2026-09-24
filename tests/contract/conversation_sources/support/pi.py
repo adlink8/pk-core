@@ -1,4 +1,4 @@
-"""pi 家族原生夹具构建器（模块 ``pi``，ADAPTER_VERSION 1.3.0）。
+"""pi 家族原生夹具构建器（模块 ``pi``，ADAPTER_VERSION 1.4.0）。
 
 Pi 导出独立的 JSONL 事件流：``session`` 开场记录、``message`` 记录按 role 分
 （``user`` / ``assistant`` / ``toolResult``），工具结果的 ``content`` 里可以只有

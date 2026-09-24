@@ -53,7 +53,7 @@ from personal_knowledge.core.conversation_events import (
 )
 
 FAMILY = "pi"
-ADAPTER_VERSION = "1.3.0"
+ADAPTER_VERSION = "1.4.0"
 CONTRACT_VERSION = "2"
 
 _COMPLETE = {
@@ -169,7 +169,9 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
                 return '"type"' in line and (
                     '"conversation"' in line or '"session"' in line
                 )
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError 覆盖 UnicodeDecodeError：非 UTF-8 字节的轨迹必须判为
+        # 「不是我」，不得把解析异常抛给发现层（会被记成 probe_error）。
         return False
     return False
 
