@@ -151,5 +151,11 @@ tmp/
 .planning/tmp/
 scratch/
 
+# Local client config dropped at repo root (hooks/mcp keys, may hold tokens)
+.zcode/
+
+# Local tool scratch output (context-guard authoring set + install reports)
+output/
+
 # playwright CLI 本地缓存
 .playwright-cli/
