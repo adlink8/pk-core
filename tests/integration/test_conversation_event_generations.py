@@ -433,6 +433,73 @@ def test_consumer_parity_failure_blocks_activation(live, _activate) -> None:
     assert life.authority_generation_id() == "gen-1"
 
 
+def test_gate_runs_inside_transaction_and_rejects_activation(live, _activate) -> None:
+    """A published gate must observe the new (uncommitted) rows of the very
+    activation it blocks.
+
+    The gate records the active pointer it sees: it must be ``gen-2`` (the
+    generation being activated). A gate running outside the transaction would
+    see the prior ``gen-1`` instead. Blocking must then roll everything back to
+    the exact prior authority/projection/version-binding state.
+    """
+    db, life, gen_a, gen_b = live
+    before = _snapshot(db)
+    observed: dict = {}
+
+    def gate(con):
+        row = con.execute(
+            "SELECT generation_id FROM ce_generation_authority WHERE active=1"
+        ).fetchone()
+        observed["active_in_txn"] = row[0] if row else None
+        observed["binding_generations_in_txn"] = sorted(
+            r[0] for r in con.execute(
+                "SELECT generation_id FROM ce_activation_bindings"
+            )
+        )
+        observed["projection_message_rows_in_txn"] = con.execute(
+            "SELECT COUNT(*) FROM canonical_messages"
+        ).fetchone()[0]
+        return ["projection_row_shortfall:1"]
+
+    hooks = ActivationHooks(gates=(gate,))
+    with pytest.raises(GenerationActivationError) as excinfo:
+        _activate(life, "gen-2", digest=gen_b.dataset_digest, hooks=hooks)
+
+    # the gate really ran inside the transaction, over the new rows
+    assert observed["active_in_txn"] == "gen-2"
+    assert observed["binding_generations_in_txn"] == ["gen-2", "gen-2", "gen-2"]
+    assert observed["projection_message_rows_in_txn"] > 0
+    assert excinfo.value.reason == "gate_blocked:projection_row_shortfall:1"
+
+    # after the rollback every prior field is unchanged
+    assert _snapshot(db) == before
+    assert life.authority_generation_id() == "gen-1"
+    con = sqlite3.connect(str(db))
+    try:
+        assert dict(
+            (r[0], r[1]) for r in con.execute(
+                "SELECT kind, generation_id FROM ce_activation_bindings"
+            )
+        ) == {
+            "projection_version": "gen-1",
+            "projection_watermark": "gen-1",
+            "projection_fingerprint": "gen-1",
+        }
+    finally:
+        con.close()
+
+
+def test_gate_blocked_activation_leaves_no_backup_behind(live, _activate) -> None:
+    """A gate rejection is not a publish: the ~4 GB pre-publish snapshot must
+    not survive it."""
+    db, life, gen_a, gen_b = live
+    backup = db.with_name(f"{db.stem}.backup.sqlite")
+    hooks = ActivationHooks(gates=(lambda con: ["blocked_by_test_gate"],))
+    with pytest.raises(GenerationActivationError):
+        _activate(life, "gen-2", digest=gen_b.dataset_digest, hooks=hooks)
+    assert backup.exists() is False
+
+
 # ------------------------------------------- fault injection: post-authority
 
 def test_projection_write_failure_restores_exact_state(live, _activate) -> None:
@@ -492,6 +559,38 @@ def test_old_generation_rows_and_audit_preserved_after_failure(live, _activate) 
     outcomes = [o for _g, o in log]
     assert "success" in outcomes
     assert "failure" in outcomes
+
+
+def test_deactivate_clears_pointer_and_keeps_pre_state_snapshot(live, _activate) -> None:
+    """Deactivation now goes through the publish primitive: active pointer,
+    projection rows and version bindings are removed together, and the
+    pre-deactivate state is snapshotted to ``<db>.backup.sqlite``."""
+    db, life, gen_a, gen_b = live
+    backup = db.with_name(f"{db.stem}.backup.sqlite")
+
+    result = life.deactivate()
+
+    assert result == {"prior_generation_id": "gen-1", "active_generation_id": None}
+    assert life.authority_generation_id() is None
+    con = sqlite3.connect(str(db))
+    try:
+        assert con.execute("SELECT COUNT(*) FROM ce_activation_bindings").fetchone()[0] == 0
+        assert con.execute(
+            "SELECT COUNT(*) FROM ce_generation_authority WHERE active=1"
+        ).fetchone()[0] == 0
+    finally:
+        con.close()
+    # the snapshot is the pre-deactivate state, not an earlier activation's
+    # pre-state: gen-1 must still be active in it
+    assert backup.exists() is True
+    con = sqlite3.connect(str(backup))
+    try:
+        assert con.execute(
+            "SELECT generation_id FROM ce_generation_authority WHERE active=1"
+        ).fetchone() == ("gen-1",)
+        assert con.execute("SELECT COUNT(*) FROM ce_activation_bindings").fetchone()[0] == 3
+    finally:
+        con.close()
 
 
 def test_rollback_to_previous_generation(live, _activate) -> None:

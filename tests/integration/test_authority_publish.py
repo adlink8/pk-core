@@ -85,6 +85,28 @@ def test_apply_exception_rolls_back_and_propagates(tmp_path):
     assert _rows(db, "SELECT id, label FROM preexisting") == [(1, "alpha")]
 
 
+def test_apply_exception_leaves_no_backup_behind(tmp_path):
+    """A failed apply must not leave the pre-publish snapshot on disk.
+
+    The real authority DB is ~4 GB; orphaned backups on every failure would
+    fill the disk, so the exception path cleans up exactly like the blocked-gate
+    path does.
+    """
+    db = tmp_path / "authority.sqlite"
+    _seed(db)
+
+    def apply(con):
+        con.execute("CREATE TABLE doomed (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+        raise RuntimeError("apply failed")
+
+    with pytest.raises(RuntimeError, match="apply failed"):
+        authority_publish(db, apply, gates=[], backup=True)
+
+    assert (tmp_path / "authority.backup.sqlite").exists() is False
+    assert _table_exists(db, "doomed") is False
+    assert _rows(db, "SELECT id, label FROM preexisting") == [(1, "alpha")]
+
+
 def test_publish_keeps_backup_of_pre_publish_state(tmp_path):
     db = tmp_path / "authority.sqlite"
     _seed(db)

@@ -32,6 +32,13 @@ def _pre_publish_backup(db: Path) -> Path | None:
     return final
 
 
+def _discard_backup(backup_path: Path | None) -> None:
+    # An unpublished snapshot is leftover garbage: the DB still holds the
+    # pre-publish state, so keeping a full copy only wastes disk.
+    if backup_path is not None:
+        backup_path.unlink(missing_ok=True)
+
+
 def authority_publish(
     db: Path,
     apply: Callable[[sqlite3.Connection], None],
@@ -52,10 +59,20 @@ def authority_publish(
         if blocked_reasons:
             con.execute("ROLLBACK")
             # The DB is unchanged, so the snapshot is leftover garbage.
-            if backup_path is not None:
-                backup_path.unlink(missing_ok=True)
+            _discard_backup(backup_path)
             return PublishReport(published=False, blocked_reasons=blocked_reasons)
         con.execute("COMMIT")
         return PublishReport(published=True)
+    except BaseException:  # noqa: BLE001 - roll back, clean up, re-raise as-is
+        # apply (or a gate) failed: the transaction is still open, so roll it
+        # back explicitly. The caller classifies failures by the original
+        # exception type, so it must propagate unwrapped.
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            # e.g. the failure already aborted the transaction; nothing to undo.
+            pass
+        _discard_backup(backup_path)
+        raise
     finally:
         con.close()

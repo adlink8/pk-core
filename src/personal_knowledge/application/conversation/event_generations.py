@@ -30,8 +30,11 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
+from personal_knowledge.application.conversation.authority_publish import (
+    authority_publish,
+)
 from personal_knowledge.application.conversation.compatibility_projection import (
     CompatibilityProjectionError,
     CompatibilityProjectionReport,
@@ -72,6 +75,8 @@ class ActivationHooks:
     - ``authority_writer``: ``(con) -> None`` (writes the active pointer)
     - ``projection_writer``: ``(con, report) -> None``
     - ``version_binder``: ``(con, report) -> None``
+    - ``gates``: ``(con) -> Sequence[str]`` run inside the publish transaction
+      before commit; a non-empty reason list rejects the commit and rolls back
     """
 
     projection_builder: Callable[[], CompatibilityProjectionReport] | None = None
@@ -83,6 +88,7 @@ class ActivationHooks:
     version_binder: Callable[
         [sqlite3.Connection, CompatibilityProjectionReport], None
     ] | None = None
+    gates: tuple[Callable[[sqlite3.Connection], Sequence[str]], ...] = ()
 
 
 _BINDING_KINDS = ("projection_version", "projection_watermark", "projection_fingerprint")
@@ -344,22 +350,24 @@ class GenerationLifecycle:
         cleanup contract.
         """
         prior = self._repo.authority_generation_id()
-        con = sqlite3.connect(str(self.db))
-        try:
-            con.execute("BEGIN")
+
+        def apply(con: sqlite3.Connection) -> None:
             clear_compatibility_projection(con)
             con.execute("UPDATE ce_generation_authority SET active=0 WHERE active=1")
             con.execute("DELETE FROM ce_activation_bindings")
-            con.commit()
+
+        try:
+            # backup=True explicitly, for the same reason as _commit: the live
+            # authority DB is ~4 GB, and deactivation is a rare, reviewed
+            # operation. The publish primitive also tightens the lock here:
+            # BEGIN (deferred) becomes BEGIN IMMEDIATE (write lock).
+            authority_publish(self.db, apply, backup=True)
         except Exception as exc:  # noqa: BLE001 - fail closed with exact rollback
-            con.rollback()
             raise GenerationActivationError(
                 f"deactivation failed and prior state restored: {exc}",
                 generation_id=prior or "none",
                 reason=f"deactivation_failed:{type(exc).__name__}",
             ) from exc
-        finally:
-            con.close()
         return {"prior_generation_id": prior, "active_generation_id": None}
 
     # ---------------------------------------------------------- commit block
@@ -389,9 +397,13 @@ class GenerationLifecycle:
                 f"projection build failed: {exc}", generation_id=generation_id
             ) from exc
 
-        con = sqlite3.connect(str(self.db))
-        try:
-            con.execute("BEGIN IMMEDIATE")
+        delta_id: int | None = None
+
+        def apply(con: sqlite3.Connection) -> None:
+            # Same order as the historical hand-written transaction: read the
+            # prior authority row, rewrite authority/projection/version
+            # bindings, then append the delta inside this transaction.
+            nonlocal prior, delta_id
             prior_row = con.execute(
                 "SELECT generation_id FROM ce_generation_authority WHERE active=1"
             ).fetchone()
@@ -399,15 +411,21 @@ class GenerationLifecycle:
             self._run_commit(con, generation_id, report, hooks)
             from personal_knowledge.application.conversation.generation_delta import record_generation_delta
             delta_id = record_generation_delta(con, generation_id, prior)
-            con.commit()
+
+        try:
+            # backup=True explicitly: the live authority DB is ~4 GB at
+            # production scale, so each activation pays one full-DB online
+            # snapshot. Activation requires the human ACTIVATION_APPROVAL and is
+            # a rare operation, so the disk/time cost is accepted.
+            publish = authority_publish(
+                self.db, apply, gates=hooks.gates, backup=True
+            )
         except GenerationActivationError:
-            con.rollback()
             self._repo.record_attempt_log(
                 generation_id, "failure", "consumer_parity"
             )
             raise
         except Exception as exc:  # noqa: BLE001 - restore prior state, fail closed
-            con.rollback()
             self._repo.record_attempt_log(
                 generation_id, "failure",
                 f"commit_restored:{type(exc).__name__}",
@@ -417,8 +435,17 @@ class GenerationLifecycle:
                 generation_id=generation_id,
                 reason=f"commit_failed:{type(exc).__name__}",
             ) from exc
-        finally:
-            con.close()
+        if not publish.published:
+            # A gate blocked inside the transaction: it was already rolled back
+            # and the pre-publish snapshot discarded.
+            reason = ";".join(publish.blocked_reasons) or "gate_blocked"
+            self._repo.record_attempt_log(
+                generation_id, "failure", f"gate_blocked:{reason}"
+            )
+            raise GenerationActivationError(
+                f"activation blocked by gate: {reason}",
+                generation_id=generation_id, reason=f"gate_blocked:{reason}",
+            )
         self._repo.record_attempt_log(generation_id, "success")
         return {
             "generation_id": generation_id,
