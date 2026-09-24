@@ -578,15 +578,17 @@ def test_alias_family_sharing_one_root_is_counted_once_in_ledger(
 def test_ledger_decomposes_claimed_by_family_under_the_same_dedup_rule(
     tmp_path: Path,
 ) -> None:
-    """认领数按属主家族分解，且分解总和恒等于 ``ledger.claimed``。
+    """认领数按属主家族分解：该认领的家族拿到正确的数，未认领桶里没有它。
 
     一个 generation 是按家族分组成批的，所以「发现层认领了 N 个文件」这句话
     必须能拆到家族上，否则台账跟任何一批 generation 都对不上账。
 
     场景里同时含两种「同一文件被列两次」：codex 的两个嵌套 root，以及
     copilot / vscode-copilot 共享同一 root。分解若按各家族 ``found`` 列表求长度
-    （绕过全局 ``counted`` 判据），别名家族会把同一批文件各记一遍，总和 3 而
-    ``claimed`` 是 2 —— 这正是本条要拦住的。
+    （绕过全局去重），别名家族会把同一批文件各记一遍 —— copilot 会记 2 而不是
+    1。本条钉住的是「每个文件在 ``claimed`` 里只算一次、在分解里各归各的属主」，
+    不再断言分解总和恒等于 ``claimed``（跨家族重复时它本就不等，语义见
+    ``DiscoveryLedger`` docstring）。
     """
     from personal_knowledge.adapters.conversation_sources.discovery import (
         DiscoveryLedger,
@@ -619,16 +621,19 @@ def test_ledger_decomposes_claimed_by_family_under_the_same_dedup_rule(
     # 独立字面量：两个属主家族各认领 1 个文件（嵌套 / 别名都不翻倍）。
     assert ledger.claimed == 2
     assert ledger.claimed_by_family == {"codex": 1, "copilot": 1}
-    assert sum(ledger.claimed_by_family.values()) == ledger.claimed
+    assert ledger.unclaimed == []
+    assert ledger.candidates == ledger.claimed + len(ledger.unclaimed)
 
 
-def test_ledger_claimed_by_family_sums_to_claimed_on_mixed_machine(
+def test_ledger_claimed_by_family_matches_claimed_on_mixed_machine(
     tmp_path: Path,
 ) -> None:
-    """认领 / 未认领混在一批时，「分解总和 == 总数」仍成立。
+    """认领 / 未认领混在一批时，分解给到正确的家族。
 
     未认领的文件不进分解（它们不是任何 generation 的输入），所以分母是
-    ``claimed`` 而不是 ``candidates``。
+    ``claimed`` 而不是 ``candidates``。分解总和与 ``claimed`` 相等在本夹具
+    下成立（每个文件只被一个家族接受），但那是巧合而不是契约：语义见
+    ``DiscoveryLedger`` docstring（跨家族重复在分解侧各算一次）。
     """
     from personal_knowledge.adapters.conversation_sources.discovery import (
         DiscoveryLedger,
@@ -646,4 +651,69 @@ def test_ledger_claimed_by_family_sums_to_claimed_on_mixed_machine(
     assert ledger.claimed == 1
     assert len(ledger.unclaimed) == 1
     assert ledger.claimed_by_family == {"codex": 1}
-    assert sum(ledger.claimed_by_family.values()) == ledger.claimed
+    assert ledger.candidates == ledger.claimed + len(ledger.unclaimed)
+
+
+# --------------------- 跨家族嵌套 root：认领归属必须在走完所有家族后才定
+#
+# 真机实测（``pk-sync conversations --v2-native-dry-run``）：gemini 的 root
+# ``~/.gemini`` 里嵌着 antigravity 的 root ``~/.gemini/antigravity``（根表里
+# 唯一一对跨家族嵌套）。先走的 gemini 会走到 antigravity 的文件并拒收，后走的
+# antigravity 会接受它们。归属若在「第一次见到」时就定死，这批文件会被记进
+# gemini 的 ``not_this_family``，而真正认领它们的 antigravity 一个数都不加
+# ——而算术仍然闭合（candidates == claimed + len(unclaimed)），只有按家族比
+# 才暴露。
+
+
+def _write_antigravity_live_store(path: Path) -> Path:
+    """最小 antigravity live 库：带 ``trajectory_meta`` 表即被本族探测器接受。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            "CREATE TABLE trajectory_meta (trajectory_id TEXT, cascade_id TEXT)"
+        )
+        con.execute("INSERT INTO trajectory_meta VALUES ('t1','c1')")
+        con.commit()
+    finally:
+        con.close()
+    return path
+
+
+def test_nested_cross_family_root_is_claimed_by_the_accepting_family(
+    tmp_path: Path,
+) -> None:
+    """嵌套在 gemini root 里的 antigravity 文件：算 antigravity 认领，不进 unclaimed。"""
+    from personal_knowledge.adapters.conversation_sources.discovery import (
+        DiscoveryLedger,
+    )
+
+    gemini_root = tmp_path / "home" / ".gemini"
+    nested = gemini_root / "antigravity"
+    nested.mkdir(parents=True)
+    store = _write_antigravity_live_store(nested / "conversation_summaries.db")
+    # 对照：gemini 自己的会话文件仍由 gemini 认领（防止把 gemini 整体判死）。
+    session = gemini_root / "kept.json"
+    session.write_text(
+        json.dumps({"messages": []}), encoding="utf-8"
+    )
+
+    roots = {"gemini": (gemini_root,), "antigravity": (nested,)}
+
+    ledger = DiscoveryLedger()
+    found = discover_client_sources(roots, ledger=ledger)
+
+    # 返回值（抓取快照）：每个家族都照旧列出它探测器接受的文件。
+    assert found["antigravity"] == [store]
+    assert session in found["gemini"]
+
+    # 归属：两个不同文件各被一个家族接受。
+    assert ledger.claimed == 2
+    assert ledger.claimed_by_family == {"gemini": 1, "antigravity": 1}
+    # 合法跳过的桶必须干净：真正被别的家族认领的文件不许混进 not_this_family。
+    assert [Path(entry.path) for entry in ledger.unclaimed] == []
+    assert ledger.candidates == ledger.claimed + len(ledger.unclaimed)
+
+    # 台账只增可见性：不传 ledger 的结果逐比特一致。
+    plain = discover_client_sources(roots)
+    assert plain == found

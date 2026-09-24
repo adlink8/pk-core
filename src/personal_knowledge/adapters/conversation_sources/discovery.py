@@ -247,14 +247,38 @@ class UnclaimedFile:
 class DiscoveryLedger:
     """Optional, read-only accounting sink for :func:`discover_client_sources`.
 
-    Counts what discovery saw; never influences what discovery returns.
+    Counts what discovery saw; never influences what discovery returns. A
+    candidate is a *distinct* file (global dedup by resolved path), so a file
+    reachable through two aliases or two nested roots is one candidate.
 
-    ``claimed_by_family`` decomposes ``claimed`` by *owning* family (aliases are
-    normalized via :func:`registry.resolve_family`), because a generation is
-    staged per family and the two numbers have to be comparable. The sum of the
-    decomposition is exactly ``claimed``: a claim is recorded under the same
-    global ``counted`` predicate that guards ``claimed``, so a file reachable
-    through two aliases or two nested roots is never counted twice.
+    Claim vs unclaimed is decided **after every family has walked** — a file is
+    claimed iff *at least one* family detector accepted it (a file can only be
+    judged once the last family has had its turn: a root of family B may sit
+    inside a root of family A, as ``~/.gemini/antigravity`` does inside
+    ``~/.gemini``).
+
+    ``claimed`` is the number of distinct files accepted by >= 1 family.
+    ``unclaimed`` holds the files no family accepted, one entry each; its
+    ``family`` is the **first** family that walked the file and its ``reason``
+    is the code recorded at that first rejection — ``vanished`` and
+    ``probe_error`` are recorded where they happen, so they keep their priority
+    (a file recorded as vanished or erroring is never rewritten as
+    ``not_this_family``).
+
+    ``claimed_by_family`` decomposes by *owning* family (aliases normalized via
+    :func:`registry.resolve_family`; an alias never gets its own row) and counts
+    the distinct files **that family's** detector accepted, because a generation
+    is staged per family and the decomposition has to answer "how many files
+    will this family capture" (staging follows ``found[family]``).
+
+    Consequence: ``sum(claimed_by_family)`` is **not** guaranteed to equal
+    ``claimed``. A file accepted by two different families counts once in
+    ``claimed`` (global dedup) but once in each of their decompositions — on the
+    decomposition side that duplication is real, exactly as ``found`` reports it
+    for both families. (The earlier claim that the sum is exactly ``claimed``
+    was wrong; it happened to hold while only one family ever accepted a file.)
+    ``candidates == claimed + len(unclaimed)`` still holds: every candidate is
+    either accepted by someone or rejected by everyone.
     """
 
     scanned_roots: int = 0
@@ -315,20 +339,33 @@ def discover_client_sources(
     ``roots`` is None the default :data:`FAMILY_CLIENT_ROOTS` is used.
 
     ``ledger`` is a pure visibility sink: passing it records what was scanned
-    and what was dropped, without changing the returned mapping.
+    and what was dropped, without changing the returned mapping. Claim vs
+    unclaimed is judged only after every family has walked (see
+    :class:`DiscoveryLedger`): the detector verdicts are collected per file and
+    settled at the end, so a file rejected by a family whose root merely
+    encloses another family's root still lands under the family that accepted
+    it.
     """
     effective = roots if roots is not None else FAMILY_CLIENT_ROOTS
     found: dict[str, list[Path]] = {}
     # 台账按解析后的绝对路径全局去重：别名家族（vscode-copilot → copilot）与属主
     # 共享同一 root，同一批文件不能算两遍。返回值保持原样（别名键另有消费者）。
+    track = ledger is not None
     counted: set[str] = set()
+    # identity -> 该文件的第一次拒收记录（family / path / reason）。被任何家族接受
+    # 后即从「未认领」候选里出局，所以这里最多每个候选一条，与旧版同量级。
+    rejections: dict[str, UnclaimedFile] = {}
+    # 属主 family -> 该家族探测器接受的不同文件 identity。放 identity 而不是只放
+    # 计数，是为了让「同一个文件被两个家族接受」在分解侧各算一次（抓取按
+    # found[family] 走，跨家族重复在分解侧是真实存在的）。
+    accepted_by_owner: dict[str, set[str]] = {}
     for family, root_paths in effective.items():
         matches: list[Path] = []
         seen: set[str] = set()
         for root in root_paths:
             if not root.is_dir():
                 continue
-            if ledger is not None:
+            if track:
                 ledger.scanned_roots += 1
             for file_path in _walk(root, family=family):
                 identity = _file_identity(file_path)
@@ -339,15 +376,15 @@ def discover_client_sources(
                 seen.add(identity)
                 # A listed file is a candidate even if it dies before stat:
                 # candidates == claimed + len(unclaimed) must hold.
-                first_sighting = ledger is not None and identity not in counted
-                if first_sighting:
+                if track and identity not in counted:
                     counted.add(identity)
                     ledger.candidates += 1
                 artifact = _artifact_for(file_path)
                 if artifact is None:
-                    if first_sighting:
-                        ledger.unclaimed.append(
-                            UnclaimedFile(family, str(file_path), REASON_VANISHED)
+                    if track:
+                        rejections.setdefault(
+                            identity,
+                            UnclaimedFile(family, str(file_path), REASON_VANISHED),
                         )
                     continue
                 try:
@@ -355,32 +392,40 @@ def discover_client_sources(
                         family, artifact, artifact_root=file_path.parent
                     )
                 except Exception:  # noqa: BLE001 - a probe failure excludes the file
-                    if first_sighting:
-                        ledger.unclaimed.append(
-                            UnclaimedFile(family, str(file_path), REASON_PROBE_ERROR)
+                    if track:
+                        rejections.setdefault(
+                            identity,
+                            UnclaimedFile(family, str(file_path), REASON_PROBE_ERROR),
                         )
                     continue
                 if claimed:
                     matches.append(file_path)
-                    if first_sighting:
-                        ledger.claimed += 1
-                        # 族级分解走同一个 first_sighting / counted 判据，而不是
-                        # 另算一套：分解总和 == claimed 是硬约束，别名家族
-                        # （vscode-copilot → copilot）不能把同一批文件算两遍。
+                    if track:
                         # 归一到属主家族，才能跟按家族分组的 generation 对齐。
                         # 此处 resolve_family 必不抛：上面的 detect_family 已经
                         # 解析过一次同样的名字。
                         owner = resolve_family(family)
-                        ledger.claimed_by_family[owner] = (
-                            ledger.claimed_by_family.get(owner, 0) + 1
-                        )
-                elif first_sighting:
-                    ledger.unclaimed.append(
+                        accepted_by_owner.setdefault(owner, set()).add(identity)
+                elif track:
+                    rejections.setdefault(
+                        identity,
                         UnclaimedFile(
                             family, str(file_path), REASON_NOT_THIS_FAMILY
-                        )
+                        ),
                     )
         found[family] = sorted(matches)
+    if track:
+        accepted: set[str] = set()
+        for identities in accepted_by_owner.values():
+            accepted |= identities
+        ledger.claimed = len(accepted)
+        ledger.claimed_by_family = {
+            owner: len(identities)
+            for owner, identities in sorted(accepted_by_owner.items())
+        }
+        ledger.unclaimed = [
+            entry for identity, entry in rejections.items() if identity not in accepted
+        ]
     return found
 
 
