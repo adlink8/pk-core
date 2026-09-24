@@ -50,6 +50,10 @@ _ARTIFACT_DIR = "artifacts"
 _MANIFEST_NAME = "manifest.json"
 _STAGING_DIR = ".staging"
 
+# Capture never refuses a file for its size, so it must not hold one whole in
+# memory either: hashing and copying advance in lockstep on this block size.
+_STREAM_CHUNK_BYTES = 1 << 20
+
 
 class CaptureError(RuntimeError):
     """Capture failed closed; no formal artifact was published."""
@@ -57,7 +61,11 @@ class CaptureError(RuntimeError):
 
 @dataclass(frozen=True)
 class CapturePolicy:
-    """Limits and allowlist for one capture operation."""
+    """Limits and allowlist for one capture operation.
+
+    ``byte_limit`` is recorded for provenance only; ``count_limit`` is the
+    binding constraint (allowlist size). Capture never truncates for volume.
+    """
 
     byte_limit: int
     count_limit: int
@@ -114,10 +122,6 @@ class ReplayResult:
     mismatched: list[str]
 
 
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def make_slot_artifact_id(family: str, mirror_path: str) -> str:
     """Stable per-source-slot identity, constant across content changes.
 
@@ -130,8 +134,8 @@ def make_slot_artifact_id(family: str, mirror_path: str) -> str:
     ``mirror_path`` must be the stable source path relative to its source root
     (family-scoped, directory-qualified) — NOT a bare filename, so two files
     with the same name in different session directories stay distinct. The on-disk
-    blob store remains content-addressed (see :func:`_publish_blob`); only the
-    logical ``artifact_id`` changes.
+    blob store remains content-addressed (see :func:`_copy_stream_to_blob`); only
+    the logical ``artifact_id`` changes.
     """
     return hashlib.sha256(f"art|{family}|{mirror_path}".encode("utf-8")).hexdigest()
 
@@ -140,36 +144,57 @@ def _blob_root(dest_dir: Path) -> Path:
     return dest_dir / _ARTIFACT_DIR
 
 
-def _publish_blob(dest_dir: Path, data: bytes) -> str:
-    """Content-addressed, deduplicated blob publish. Returns the blob id.
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_STREAM_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    The returned id is ``content_hash[:32]`` -- the *blob* address, never the
-    logical ``artifact_id`` (which is now the stable per-slot identity). Every
-    path lookup in this module must go through this id / ``content_hash``.
+
+def _copy_stream_to_blob(source: Path, dest_dir: Path) -> tuple[str, str, int]:
+    """Chunked hash+copy of ``source`` into the content-addressed blob store.
+
+    Returns ``(blob_id, content_hash, byte_size)``. Never materialises the whole
+    file in memory: a capture that may not be refused for size must also not OOM
+    on size.
     """
-    content_hash = _sha256_bytes(data)
-    blob_id = content_hash[:32]
+    digest = hashlib.sha256()
+    size = 0
     blob_dir = _blob_root(dest_dir)
     blob_dir.mkdir(parents=True, exist_ok=True)
-    blob = blob_dir / blob_id
-    if not blob.exists():
-        # write atomically: temp + rename so a crash never leaves a partial blob
-        tmp = blob_dir / f".tmp-{uuid.uuid4().hex}"
-        tmp.write_bytes(data)
-        for attempt in range(4):
-            try:
-                os.replace(tmp, blob)
-                break
-            except PermissionError:
-                # Windows antivirus/indexers can briefly hold either path.
-                # Accept only a byte-identical winner; otherwise retry briefly.
-                if blob.exists() and _sha256_bytes(blob.read_bytes()) == content_hash:
-                    tmp.unlink(missing_ok=True)
-                    break
-                if attempt == 3:
-                    raise
-                time.sleep(0.05 * (attempt + 1))
-    return blob_id
+    tmp = blob_dir / f".tmp-{uuid.uuid4().hex}"
+    try:
+        with source.open("rb") as handle, tmp.open("wb") as out:
+            for chunk in iter(lambda: handle.read(_STREAM_CHUNK_BYTES), b""):
+                digest.update(chunk)
+                size += len(chunk)
+                out.write(chunk)
+        content_hash = digest.hexdigest()
+        blob_id = content_hash[:32]
+        blob = blob_dir / blob_id
+        if blob.exists():
+            tmp.unlink(missing_ok=True)
+        else:
+            _replace_blob(tmp, blob, content_hash)
+        return blob_id, content_hash, size
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _replace_blob(tmp: Path, blob: Path, content_hash: str) -> None:
+    for attempt in range(4):
+        try:
+            os.replace(tmp, blob)
+            return
+        except PermissionError:
+            # Windows antivirus/indexers can briefly hold either path.
+            # Accept only a byte-identical winner; otherwise retry briefly.
+            if blob.exists() and _sha256_path(blob) == content_hash:
+                return
+            if attempt == 3:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _resolve_relative(root: Path, relative: str) -> Path:
@@ -208,19 +233,12 @@ def _resolve_relative(root: Path, relative: str) -> Path:
     return candidate
 
 
-def _validate_file_for_capture(candidate: Path, relative: str, byte_limit: int) -> None:
+def _validate_file_for_capture(candidate: Path, relative: str) -> None:
+    """Existence/type gate only. Size never rejects: capture is not truncation."""
     if not candidate.exists():
         raise CaptureError(f"allowlisted file missing: {relative!r}")
     if not candidate.is_file():
         raise CaptureError(f"allowlisted path is not a file: {relative!r}")
-    try:
-        size = candidate.stat().st_size
-    except OSError as exc:  # pragma: no cover - defensive
-        raise CaptureError(f"cannot stat {relative!r}: {exc}") from exc
-    if size > byte_limit:
-        raise CaptureError(
-            f"file {relative!r} of {size} bytes exceeds byte_limit {byte_limit}"
-        )
 
 
 def capture_file(
@@ -236,7 +254,10 @@ def capture_file(
     """Immutable content-addressed capture of a single file.
 
     Raises :class:`CaptureError` before publishing anything on any validation
-    failure (symlink escape, missing file, byte/count limit).
+    failure (symlink escape, missing file, count limit).
+
+    ``byte_limit`` is accepted for caller compatibility only and never discards
+    a file: the allowlist decides *what* may be captured, size decides nothing.
 
     ``family`` + ``mirror_path`` are optional: when both are supplied the emitted
     ``artifact_id`` is the stable slot identity (:func:`make_slot_artifact_id`,
@@ -253,10 +274,9 @@ def capture_file(
         raise CaptureError(
             f"refusing to capture symlink/reparse/junction path {relative_path!r}"
         )
-    _validate_file_for_capture(source, relative_path, byte_limit)
+    _validate_file_for_capture(source, relative_path)
 
-    data = source.read_bytes()
-    blob_id = _publish_blob(dest_dir, data)
+    blob_id, content_hash, size = _copy_stream_to_blob(source, dest_dir)
     blob = _blob_root(dest_dir) / blob_id
     if family and mirror_path:
         artifact_id = make_slot_artifact_id(family, mirror_path)
@@ -266,10 +286,10 @@ def capture_file(
         artifact_id=artifact_id,
         family=family,  # set by the owning adapter; may be "" for legacy callers
         source_kind="file",
-        content_hash=_sha256_bytes(data),
+        content_hash=content_hash,
         capture_method="sha256",
         relative_path=relative_path,
-        byte_size=len(data),
+        byte_size=size,
     )
     return artifact, blob
 
@@ -288,6 +308,8 @@ def capture_directory(
 
     Validation happens for every requested path before any blob is published, so
     a single bad path fails the whole capture closed with no artifacts written.
+    ``byte_limit`` is accepted for caller compatibility only and never drops a
+    file; ``count_limit`` still bounds the allowlist size as before.
     """
     if not include_relative:
         raise CaptureError("directory capture requires at least one allowlisted path")
@@ -299,22 +321,16 @@ def capture_directory(
 
     # Phase 1: validate every requested path (no writes yet)
     candidates: list[tuple[str, Path]] = []
-    total_bytes = 0
     for relative in include_relative:
         candidate = _resolve_relative(source_dir, relative)
-        _validate_file_for_capture(candidate, relative, byte_limit)
-        total_bytes += candidate.stat().st_size
-        if total_bytes > byte_limit:
-            raise CaptureError(
-                f"directory capture exceeds byte_limit {byte_limit}"
-            )
+        _validate_file_for_capture(candidate, relative)
         candidates.append((relative, candidate))
 
-    # Phase 2: read and hash everything
+    # Phase 2: hash and copy in lockstep, one fixed-size chunk at a time (a file
+    # is never refused for size, so it must never be held whole in memory either)
     artifacts: list[SourceArtifact] = []
     for relative, candidate in candidates:
-        data = candidate.read_bytes()
-        blob_id = _publish_blob(dest_dir, data)
+        blob_id, content_hash, size = _copy_stream_to_blob(candidate, dest_dir)
         if family and mirror_path:
             artifact_id = make_slot_artifact_id(family, f"{mirror_path}/{relative}")
         else:
@@ -324,10 +340,10 @@ def capture_directory(
                 artifact_id=artifact_id,
                 family=family,
                 source_kind="file",
-                content_hash=_sha256_bytes(data),
+                content_hash=content_hash,
                 capture_method="sha256",
                 relative_path=relative,
-                byte_size=len(data),
+                byte_size=size,
             )
         )
 
@@ -380,6 +396,8 @@ def replay_manifest(manifest: CaptureManifest, blob_root: Path) -> ReplayResult:
 
     The blob store is content-addressed (named by ``content_hash[:32]``), so the
     blob is located via ``content_hash`` rather than the logical ``artifact_id``.
+    Blobs are hashed in fixed-size chunks: a blob may be large and must not be
+    read whole into memory.
     """
     missing: list[str] = []
     mismatched: list[str] = []
@@ -388,7 +406,7 @@ def replay_manifest(manifest: CaptureManifest, blob_root: Path) -> ReplayResult:
         if not blob.exists():
             missing.append(artifact.artifact_id)
             continue
-        if _sha256_bytes(blob.read_bytes()) != artifact.content_hash:
+        if _sha256_path(blob) != artifact.content_hash:
             mismatched.append(artifact.artifact_id)
     return ReplayResult(
         ok=not missing and not mismatched,
@@ -452,6 +470,9 @@ def capture_sqlite(
     staging copy so adjacent credential/account/token/auth tables are absent
     from the published artifact (D-08). Declared table/column capability is
     validated against the live schema and fails closed on drift.
+
+    ``byte_limit`` is accepted for caller compatibility only: a large live store
+    must not lose its whole family, and the allowlist is what bounds content.
     """
     if not allowed_tables:
         raise CaptureError("sqlite capture requires at least one allowed table")
@@ -472,17 +493,13 @@ def capture_sqlite(
     staging_dir = dest_dir / _STAGING_DIR
     staging_dir.mkdir(parents=True, exist_ok=True)
     staging = staging_dir / f"backup-{uuid.uuid4().hex}.sqlite"
+    filtered = staging_dir / f"filtered-{uuid.uuid4().hex}.sqlite"
     try:
-        schema_digest, filtered_bytes = _filtered_backup(
-            source, staging, allowed_tables, allowed_columns
+        schema_digest = _filtered_backup(
+            source, staging, filtered, allowed_tables, allowed_columns
         )
-        if len(filtered_bytes) > byte_limit:
-            raise CaptureError(
-                f"sqlite snapshot of {len(filtered_bytes)} bytes exceeds "
-                f"byte_limit {byte_limit}"
-            )
-        blob_id = _publish_blob(dest_dir, filtered_bytes)
-        filtered = _blob_root(dest_dir) / blob_id
+        blob_id, content_hash, size = _copy_stream_to_blob(filtered, dest_dir)
+        blob = _blob_root(dest_dir) / blob_id
         if family and mirror_path:
             artifact_id = make_slot_artifact_id(family, mirror_path)
         else:
@@ -499,16 +516,17 @@ def capture_sqlite(
             artifact_id=artifact_id,
             family=family,
             source_kind="sqlite",
-            content_hash=_sha256_bytes(filtered_bytes),
+            content_hash=content_hash,
             capture_method="sqlite_online_backup",
             relative_path=f"sqlite:{source.name}",
-            byte_size=len(filtered_bytes),
+            byte_size=size,
             schema_digest=schema_digest,
             privacy_dispositions=privacy,
         )
-        return artifact, filtered
+        return artifact, blob
     finally:
         _cleanup_staging(staging)
+        _cleanup_staging(filtered)
 
 
 def _validate_sqlite_capability(
@@ -545,14 +563,16 @@ def _validate_sqlite_capability(
 def _filtered_backup(
     source: Path,
     staging: Path,
+    filtered: Path,
     allowed_tables: tuple[str, ...],
     allowed_columns: dict[str, tuple[str, ...]],
-) -> tuple[str, bytes]:
+) -> str:
     """Online-backup then project only declared tables *and* columns.
 
     The initial online backup is the WAL-consistent read point.  A fresh
     sanitized database is then populated from that backup, avoiding residual
     pages and ensuring undeclared columns from an allowed table cannot leak.
+    Returns the schema digest; the caller owns ``filtered``'s lifetime.
     """
     src = _read_only_connect(source)
     dst = sqlite3.connect(str(staging))
@@ -563,7 +583,6 @@ def _filtered_backup(
         dst.close()
         src.close()
 
-    filtered = staging.with_name(f"filtered-{uuid.uuid4().hex}.sqlite")
     source_con = sqlite3.connect(str(staging))
     target_con = sqlite3.connect(str(filtered))
     try:
@@ -598,10 +617,7 @@ def _filtered_backup(
     finally:
         target_con.close()
         source_con.close()
-    try:
-        return schema_digest, filtered.read_bytes()
-    finally:
-        filtered.unlink(missing_ok=True)
+    return schema_digest
 
 
 def _cleanup_staging(staging: Path) -> None:
