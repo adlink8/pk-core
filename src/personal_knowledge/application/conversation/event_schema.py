@@ -22,6 +22,10 @@ Tables:
                                   ``ce_events`` rows: one row per *previous*
                                   value of an event, ``version_seq`` from 0
   - ``ce_session_versions``      — the same for superseded ``ce_sessions`` rows
+  - ``ce_relation_versions``     — the same for superseded ``ce_event_relations``
+                                  rows (keyed by ``relation_id``)
+  - ``ce_disposition_versions``  — the same for superseded ``ce_field_dispositions``
+                                  rows (keyed by ``event_id`` + ``field_name``)
   - ``ce_generation_authority``  — active-generation pointer (read-only here;
                                   activation owned by a later orchestration plan)
   - ``ce_live_slots``            — stable per-source-slot registry: ``slot_id``
@@ -50,6 +54,8 @@ V2_TABLES = (
     "ce_field_dispositions",
     "ce_event_versions",
     "ce_session_versions",
+    "ce_relation_versions",
+    "ce_disposition_versions",
     "ce_generation_authority",
     "ce_schema_meta",
     "ce_live_slots",
@@ -227,6 +233,35 @@ _DDL: tuple[str, ...] = (
         stop_reason        TEXT,
         superseded_at      TEXT NOT NULL,
         PRIMARY KEY (generation_id, session_id, version_seq)
+    )
+    """,
+    # The two *derived* row families carry history the same way: relations are
+    # keyed by ``relation_id`` and dispositions by ``(event_id, field_name)``,
+    # which is exactly their main table's key. Both keys are the full identity
+    # of a row, so "the same identity now holds a different value" is
+    # representable here and nowhere else (the main row can hold one value).
+    """
+    CREATE TABLE IF NOT EXISTS ce_relation_versions (
+        generation_id   TEXT NOT NULL,
+        relation_id     TEXT NOT NULL,
+        version_seq     INTEGER NOT NULL,
+        source_event_id TEXT NOT NULL,
+        target_event_id TEXT NOT NULL,
+        relation_kind   TEXT NOT NULL,
+        superseded_at   TEXT NOT NULL,
+        PRIMARY KEY (generation_id, relation_id, version_seq)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ce_disposition_versions (
+        generation_id TEXT NOT NULL,
+        event_id      TEXT NOT NULL,
+        field_name    TEXT NOT NULL,
+        version_seq   INTEGER NOT NULL,
+        disposition   TEXT NOT NULL,
+        reason        TEXT,
+        superseded_at TEXT NOT NULL,
+        PRIMARY KEY (generation_id, event_id, field_name, version_seq)
     )
     """,
     """

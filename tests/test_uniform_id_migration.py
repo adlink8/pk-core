@@ -543,18 +543,21 @@ def test_publish_guard_allows_fresh_and_published_dest(tmp_path):
     assert len(_table_rows(dest, "canonical_sessions")) == 1
 
 
-def test_content_merge_replaces_shifted_address(tmp_path):
-    """A re-captured message whose address shifted must replace, not duplicate.
+def test_shifted_address_is_retained_next_to_the_old_row(tmp_path):
+    """A re-captured message whose address shifted is kept, never replaced.
 
     An origin file that is rewritten (not appended) moves the physical line the
     address is derived from, so the same message arrives under a new id while
-    the row captured under the old id is still in the store. The publish must
-    supersede it by content.
+    the row captured under the old id is still in the store. The store is a
+    collection: the old row stays exactly as collected (same rowid, never
+    deleted) and the new row is inserted next to it. Superseding it by content
+    would DELETE the old row and recycle its rowid behind the monotonic rowid
+    cursor in ``retrieval/conversation_fts.py``.
     """
     from personal_knowledge.application.conversation.compatibility_projection import (
         CompatibilityProjectionReport,
         ProjectionFingerprint,
-        write_compatibility_projection,
+        upsert_compatibility_projection,
     )
 
     db = tmp_path / "auth.sqlite"
@@ -602,19 +605,22 @@ def test_content_merge_replaces_shifted_address(tmp_path):
         excluded=(),
         fingerprint=ProjectionFingerprint("gen-1", 0, 1, 0, "digest"),
     )
-    write_compatibility_projection(con, report)
+    upsert_compatibility_projection(con, report)
     rows = con.execute(
-        "SELECT canonical_message_id FROM canonical_messages").fetchall()
+        "SELECT canonical_message_id, rowid FROM canonical_messages"
+        " ORDER BY rowid").fetchall()
     con.close()
-    assert rows == [(new_id,)], rows
+    # the pre-existing row is retained with its rowid; the shifted one lands
+    # after it — nothing was deleted.
+    assert rows == [(old_id, 1), (new_id, 2)], rows
 
 
 def test_content_merge_keeps_genuinely_repeated_turns(tmp_path):
-    """Two identical user turns stay two rows (multiset, not set, semantics)."""
+    """Two identical user turns stay two rows (the writer never dedups by content)."""
     from personal_knowledge.application.conversation.compatibility_projection import (
         CompatibilityProjectionReport,
         ProjectionFingerprint,
-        write_compatibility_projection,
+        upsert_compatibility_projection,
     )
 
     db = tmp_path / "auth.sqlite"
@@ -654,7 +660,7 @@ def test_content_merge_keeps_genuinely_repeated_turns(tmp_path):
         excluded=(),
         fingerprint=ProjectionFingerprint("gen-1", 0, 2, 0, "digest"),
     )
-    write_compatibility_projection(con, report)
+    upsert_compatibility_projection(con, report)
     rows = con.execute(
         "SELECT canonical_message_id FROM canonical_messages"
         " ORDER BY canonical_message_id").fetchall()

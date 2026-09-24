@@ -40,7 +40,7 @@ from personal_knowledge.application.conversation.compatibility_projection import
     CompatibilityProjectionReport,
     build_compatibility_projection,
     clear_compatibility_projection,
-    write_compatibility_projection,
+    upsert_compatibility_projection,
 )
 from personal_knowledge.application.conversation.event_repository import (
     EventRepository,
@@ -506,8 +506,13 @@ class GenerationLifecycle:
     def _write_projection(
         self, con: sqlite3.Connection, report: CompatibilityProjectionReport
     ) -> None:
-        clear_compatibility_projection(con)
-        write_compatibility_projection(con, report)
+        # Append-only: an activation adds/refreshes its rows and never deletes
+        # what an earlier generation collected. Deleting (clear + rewrite, or
+        # INSERT OR REPLACE) would recycle canonical_* rowids behind the
+        # monotonic rowid cursor in retrieval/conversation_fts.py. Rollback and
+        # deactivation remain the only owners allowed to remove projection rows
+        # (clear_compatibility_projection).
+        upsert_compatibility_projection(con, report)
 
     def _bind_versions(
         self, con: sqlite3.Connection, generation_id: str,

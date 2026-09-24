@@ -31,19 +31,24 @@ Correctness notes
   a crash rolls back completely, so there is no recovery logic and no partial
   slot. The DB is never left half-migrated.
 * **Append-only.** No row of ``ce_sessions`` / ``ce_events`` /
-  ``ce_event_relations`` is ever deleted, for any reason, and no row is ever
-  rewritten with its previous value lost. A same id can still carry different
-  values (an edited message body keeps its native id and locator; a session
-  row's ``ended_at`` moves when a turn is appended), so the three buckets are:
+  ``ce_event_relations`` / ``ce_field_dispositions`` is ever deleted, for any
+  reason, and no row is ever rewritten with its previous value lost. A same id
+  can still carry different values (an edited message body keeps its native id
+  and locator; a session row's ``ended_at`` moves when a turn is appended; a
+  relation's kind is a derivation of the same two endpoints; a disposition's
+  verdict for one native field of one event can be re-decided), so the three
+  buckets are:
   - **stale ids** (the id is stored but the source no longer emits it: a
     truncated/edited file, a vanished source file, a deactivated slot) — the
     collected row is left exactly as it was captured;
   - **dirty ids** (the id is stored and its row values changed) — the row's
     *current* values are appended to ``ce_event_versions`` /
-    ``ce_session_versions`` (``version_seq`` from 0 per id, ``superseded_at`` =
-    now) and the main row is then refreshed **in place** with an ``UPDATE``.
-    ``INSERT OR IGNORE`` alone could not do that: it is a no-op for a present
-    id, which is how stale *content* used to survive unnoticed;
+    ``ce_session_versions`` / ``ce_relation_versions`` /
+    ``ce_disposition_versions`` (``version_seq`` from 0 per id,
+    ``superseded_at`` = now) and the main row is then refreshed **in place**
+    with an ``UPDATE``. ``INSERT OR IGNORE`` alone could not do that: it is a
+    no-op for a present id, which is how stale *content* used to survive
+    unnoticed;
   - **new ids** — ``INSERT OR IGNORE``.
   The only writes this engine performs are INSERT, UPDATE and state markers.
 * **No FK cascade to worry about.** Because nothing is deleted, the deletes once
@@ -65,7 +70,7 @@ Correctness notes
   ``ce_live_state['mirror_fingerprints']``, so an unchanged file is neither
   hashed nor parsed.
 * **Schema.** All DDL (including ``ce_live_slots`` / ``ce_live_state`` /
-  ``ce_live_sync_log``, the two ``*_versions`` history tables and the three
+  ``ce_live_sync_log``, the four ``*_versions`` history tables and the three
   supporting indexes) is owned by ``event_schema``; this module declares no DDL
   of its own.
 
@@ -80,14 +85,20 @@ Known limits (deliberate, documented rather than hidden)
   and handling are spelled out at ``_refresh_artifact_row``.
 * Rollback is the enclosing transaction, not a generation pointer: there is
   exactly one live generation, grown in place.
-* Derived rows are not history-carrying. ``ce_event_relations`` and
-  ``ce_field_dispositions`` have no ``*_versions`` companion, so a relation or
-  disposition that disappears from the source is retained as collected evidence,
-  and a *changed* one (same primary key, different values) keeps its first
-  captured values because both inserts are ``INSERT OR IGNORE``. Relation ids
-  are derived per code path (``rel-call:<event_id>`` &c.), which is why a
-  changed relation has not been observed in practice; a ``ce_relation_versions``
-  table would be the fix if it ever is.
+* Every row family now carries history: events, sessions, relations and
+  dispositions each archive the value they are about to replace in their
+  ``*_versions`` table (``ce_event_relations`` is keyed by ``relation_id`` and
+  ``ce_field_dispositions`` by ``(event_id, field_name)``, so both are archived
+  under exactly that key). A relation whose id survives but whose *kind*
+  changed has not been observed from a shipped adapter yet — relation ids are
+  derived per code path from the endpoints (``rel-dag:<child>:<parent>`` &c.),
+  and kind is derived from the same link — but the store no longer depends on
+  that: the same identity holding a different value is archived, not ignored.
+  One caveat to know about a *changed* relation: ``ce_event_relations`` keeps a
+  ``UNIQUE (generation_id, source_event_id, target_event_id, relation_kind)``,
+  so a kind flip that lands on a value another relation row already holds for
+  the same endpoints raises ``IntegrityError`` and rolls the whole apply back
+  (fail-closed, nothing lost) instead of silently keeping the old value.
 * Deactivating a slot records ``{slot_id, family, mirror_path, removed_at}`` in
   ``ce_live_state['removed_slots']`` (append-only) and in the run's
   ``ce_live_sync_log.detail``, so "which source disappeared and when" stays
@@ -386,9 +397,22 @@ _SESSION_COLUMNS = (
     "cwd", "git_branch", "model", "title", "stop_reason",
 )
 
+# The two derived row families. A relation carries no ``artifact_id`` (it is
+# identified by its id, and its slot by both endpoints); a disposition is
+# identified by ``(event_id, field_name)`` and belongs to the slot of that
+# event. Both column orders mirror ``event_repository._insert_relations`` /
+# ``_insert_events`` + ``_insert_dispositions``.
+_RELATION_COLUMNS = (
+    "relation_id", "source_event_id", "target_event_id", "relation_kind",
+)
+
+_DISPOSITION_COLUMNS = ("event_id", "field_name", "disposition", "reason")
+
 # The append-only history tables (``event_schema``): the main table's columns
 # with the version sequence spliced in after the primary key and
-# ``superseded_at`` appended, exactly the column order of their DDL.
+# ``superseded_at`` appended, exactly the column order of their DDL. A single
+# id column means a one-element key tuple at the generic primitives below; a
+# two-column key (dispositions) means a two-element one.
 _EVENT_VERSION_COLUMNS = (
     "generation_id", "event_id", "version_seq", *_EVENT_COLUMNS[1:],
     "superseded_at",
@@ -398,6 +422,21 @@ _SESSION_VERSION_COLUMNS = (
     "generation_id", "session_id", "version_seq", *_SESSION_COLUMNS[1:],
     "superseded_at",
 )
+
+_RELATION_VERSION_COLUMNS = (
+    "generation_id", "relation_id", "version_seq", *_RELATION_COLUMNS[1:],
+    "superseded_at",
+)
+
+_DISPOSITION_VERSION_COLUMNS = (
+    "generation_id", "event_id", "field_name", "version_seq",
+    *_DISPOSITION_COLUMNS[2:], "superseded_at",
+)
+
+_EVENT_KEY = ("event_id",)
+_SESSION_KEY = ("session_id",)
+_RELATION_KEY = ("relation_id",)
+_DISPOSITION_KEY = ("event_id", "field_name")
 
 
 def _new_event_sigs(result) -> dict[str, tuple]:
@@ -441,10 +480,69 @@ def _new_session_sigs(result) -> dict[str, tuple]:
     }
 
 
+def _new_relation_sigs(result) -> dict[str, tuple]:
+    return {
+        relation.relation_id: (
+            relation.source_event_id,
+            relation.target_event_id,
+            relation.relation_kind.value,
+        )
+        for relation in result.relations
+    }
+
+
+def _new_disposition_sigs(result) -> dict[tuple, tuple]:
+    """Freshly adapted disposition row signatures, keyed by ``(event_id, field_name)``.
+
+    Both write routes are mirrored, because both land in the same table: the
+    per-event dispositions (written by ``_insert_events``) and the
+    adaptation-level ones (``_insert_dispositions``), which fall back to the
+    generation's first event when the record carries no ``event_id``. The
+    per-event route wins on a duplicate key, exactly the order in which
+    ``_apply_slot`` runs the two ``INSERT OR IGNORE`` helpers — the fallback is
+    therefore applied with ``setdefault`` and never overwrites it.
+    """
+
+    sigs: dict[tuple, tuple] = {}
+    for event in result.events:
+        for disp in event.field_dispositions:
+            sigs[(str(event.event_id), disp.field_name)] = (
+                disp.disposition.value,
+                disp.reason,
+            )
+    if not result.field_dispositions:
+        return sigs
+    default_event_id = (
+        str(result.events[0].event_id) if result.events else None
+    )
+    for disp in result.field_dispositions:
+        event_id = getattr(disp, "event_id", None) or default_event_id
+        if event_id is None:
+            continue
+        sigs.setdefault(
+            (str(event_id), disp.field_name),
+            (disp.disposition.value, disp.reason),
+        )
+    return sigs
+
+
 def _read_slot_sigs(
     con: sqlite3.Connection, generation_id: str, slot_id: str
-) -> tuple[dict[str, tuple], dict[str, tuple]]:
-    """Read the slot's current event/session row signatures (keyed by id)."""
+) -> tuple[dict, dict, dict, dict]:
+    """Read every row signature this slot currently owns, keyed by identity.
+
+    One reader for the whole slot, because "what does the store hold for this
+    slot right now" is one question and each answer has to be compared against
+    the same file's fresh adaptation. The *scoping* differs per table and is
+    stated once here:
+
+    * ``ce_events`` / ``ce_sessions`` carry the slot's ``artifact_id``;
+    * ``ce_event_relations`` carries no ``artifact_id`` (a relation is
+      identified by its id, its owning slot by *both* endpoints), so the slot's
+      relation ids come from ``_slot_relation_ids`` and are then read back;
+    * ``ce_field_dispositions`` hangs off ``event_id``, so the slot's event ids
+      (just read above) select its rows.
+    """
 
     events = {
         str(row[0]): tuple(row[1:])
@@ -462,7 +560,45 @@ def _read_slot_sigs(
             (generation_id, slot_id),
         )
     }
-    return events, sessions
+    relations = _read_relation_sigs(
+        con, generation_id, _slot_relation_ids(con, generation_id, slot_id)
+    )
+    dispositions = _read_disposition_sigs(con, generation_id, set(events))
+    return events, sessions, relations, dispositions
+
+
+def _read_relation_sigs(
+    con: sqlite3.Connection, generation_id: str, relation_ids: set[str]
+) -> dict[str, tuple]:
+    """The stored signatures of ``relation_ids`` (keyed by ``relation_id``)."""
+
+    sigs: dict[str, tuple] = {}
+    for chunk in _chunks(sorted(relation_ids)):
+        marks = _placeholders(len(chunk))
+        for row in con.execute(
+            f"SELECT {', '.join(_RELATION_COLUMNS)} FROM ce_event_relations "
+            f"WHERE generation_id=? AND relation_id IN ({marks})",
+            (generation_id, *chunk),
+        ):
+            sigs[str(row[0])] = tuple(row[1:])
+    return sigs
+
+
+def _read_disposition_sigs(
+    con: sqlite3.Connection, generation_id: str, event_ids: set[str]
+) -> dict[tuple, tuple]:
+    """The stored dispositions of a slot's events, keyed ``(event_id, field_name)``."""
+
+    sigs: dict[tuple, tuple] = {}
+    for chunk in _chunks(sorted(event_ids)):
+        marks = _placeholders(len(chunk))
+        for row in con.execute(
+            f"SELECT {', '.join(_DISPOSITION_COLUMNS)} FROM ce_field_dispositions "
+            f"WHERE generation_id=? AND event_id IN ({marks})",
+            (generation_id, *chunk),
+        ):
+            sigs[(str(row[0]), str(row[1]))] = tuple(row[2:])
+    return sigs
 
 
 def _slot_relation_ids(
@@ -472,7 +608,9 @@ def _slot_relation_ids(
 
     Adapters are handed a single-artifact set, so every emitted relation is
     intra-file; this is therefore the complete relation set the slot currently
-    owns, obtained without a per-slot relation column.
+    owns, obtained without a per-slot relation column. It is the scoping step
+    ``_read_slot_sigs`` uses to read a slot's relation signatures and the
+    "how many relations did this file newly contribute" step of ``_apply_slot``.
 
     Written as a single SELECT joining ``ce_events`` twice, the plan could only
     constrain the relation scan by ``generation_id``
@@ -514,27 +652,34 @@ def _slot_relation_ids(
 def _next_version_seqs(
     con: sqlite3.Connection,
     table: str,
-    id_column: str,
+    key_columns: tuple[str, ...],
     generation_id: str,
-    ids: set[str],
-) -> dict[str, int]:
-    """``{id: next version_seq}`` — one past the highest archived version.
+    keys: set[tuple],
+) -> dict[tuple, int]:
+    """``{key: next version_seq}`` — one past the highest archived version.
 
-    Ids that were never archived get ``0``, so a history always starts at
-    version 0 and only ever grows. ``table`` / ``id_column`` are module
-    constants, never caller input.
+    A key is a tuple of the row's identifying column values: one element for
+    events / sessions / relations, ``(event_id, field_name)`` for dispositions,
+    i.e. exactly the main table's primary key. Keys that were never archived get
+    ``0``, so a history always starts at version 0 and only ever grows.
+    ``table`` / ``key_columns`` are module constants, never caller input.
     """
 
-    seqs: dict[str, int] = {}
-    for chunk in _chunks(sorted(ids)):
-        marks = _placeholders(len(chunk))
+    columns = ", ".join(key_columns)
+    arity = _placeholders(len(key_columns))
+    seqs: dict[tuple, int] = {}
+    for chunk in _chunks(sorted(keys)):
+        marks = ", ".join(f"({arity})" for _ in chunk)
+        params: list = [generation_id]
+        for key in chunk:
+            params.extend(key)
         for row in con.execute(
-            f"SELECT {id_column}, MAX(version_seq) FROM {table} "
-            f"WHERE generation_id=? AND {id_column} IN ({marks}) "
-            f"GROUP BY {id_column}",
-            (generation_id, *chunk),
+            f"SELECT {columns}, MAX(version_seq) FROM {table} "
+            f"WHERE generation_id=? AND ({columns}) IN (VALUES {marks}) "
+            f"GROUP BY {columns}",
+            params,
         ):
-            seqs[str(row[0])] = int(row[1]) + 1
+            seqs[tuple(str(value) for value in row[:-1])] = int(row[-1]) + 1
     return seqs
 
 
@@ -542,28 +687,28 @@ def _archive_rows(
     con: sqlite3.Connection,
     *,
     table: str,
-    id_column: str,
+    key_columns: tuple[str, ...],
     columns: tuple[str, ...],
     generation_id: str,
-    rows: dict[str, tuple],
+    rows: dict[tuple, tuple],
 ) -> int:
     """Append the *current* values of ``rows`` to an append-only history table.
 
-    ``rows`` maps id -> the stored non-key column tuple (the signature the slot
-    was read with). Nothing is overwritten: the version sequence continues where
-    the previous archive for that id stopped. Returns the number of rows
-    appended.
+    ``rows`` maps a row key to the stored non-key column tuple (the signature
+    the slot was read with). Nothing is overwritten: the version sequence
+    continues where the previous archive for that key stopped. Returns the
+    number of rows appended.
     """
 
     if not rows:
         return 0
     superseded_at = _now()
     seqs = _next_version_seqs(
-        con, table, id_column, generation_id, set(rows)
+        con, table, key_columns, generation_id, set(rows)
     )
     payload = [
-        (generation_id, row_id, seqs.get(row_id, 0), *rows[row_id], superseded_at)
-        for row_id in sorted(rows)
+        (generation_id, *key, seqs.get(key, 0), *rows[key], superseded_at)
+        for key in sorted(rows)
     ]
     con.executemany(
         f"INSERT INTO {table} ({', '.join(columns)}) "
@@ -577,10 +722,10 @@ def _update_rows(
     con: sqlite3.Connection,
     *,
     table: str,
-    id_column: str,
+    key_columns: tuple[str, ...],
     payload_columns: tuple[str, ...],
     generation_id: str,
-    rows: dict[str, tuple],
+    rows: dict[tuple, tuple],
 ) -> int:
     """Refresh the given rows **in place** (no INSERT, no DELETE).
 
@@ -593,12 +738,13 @@ def _update_rows(
     if not rows:
         return 0
     assignments = ", ".join(f"{column}=?" for column in payload_columns)
+    matches = " AND ".join(f"{column}=?" for column in key_columns)
     payload = [
-        (*rows[row_id], generation_id, row_id) for row_id in sorted(rows)
+        (*rows[key], generation_id, *key) for key in sorted(rows)
     ]
     con.executemany(
         f"UPDATE {table} SET {assignments} "
-        f"WHERE generation_id=? AND {id_column}=?",
+        f"WHERE generation_id=? AND {matches}",
         payload,
     )
     return len(payload)
@@ -622,9 +768,13 @@ def _apply_slot(
     family = result.family
     slot_id = artifact.artifact_id
 
-    old_events, old_sessions = _read_slot_sigs(con, generation_id, slot_id)
+    old_events, old_sessions, old_relations, old_dispositions = _read_slot_sigs(
+        con, generation_id, slot_id
+    )
     new_events = _new_event_sigs(result)
     new_sessions = _new_session_sigs(result)
+    new_relations = _new_relation_sigs(result)
+    new_dispositions = _new_disposition_sigs(result)
 
     # Three buckets, and no deletion anywhere:
     #   stale  — stored id, no longer emitted -> left exactly as collected
@@ -642,48 +792,84 @@ def _apply_slot(
         for sid in set(old_sessions) & set(new_sessions)
         if old_sessions[sid] != new_sessions[sid]
     }
+    dirty_relations = {
+        rid
+        for rid in set(old_relations) & set(new_relations)
+        if old_relations[rid] != new_relations[rid]
+    }
+    dirty_dispositions = {
+        key
+        for key in set(old_dispositions) & set(new_dispositions)
+        if old_dispositions[key] != new_dispositions[key]
+    }
 
     # 1) Keep what was collected: append the current values of every row that is
     #    about to be refreshed, so no value the store has ever seen is lost.
     rows_versioned = _archive_rows(
         con,
         table="ce_event_versions",
-        id_column="event_id",
+        key_columns=_EVENT_KEY,
         columns=_EVENT_VERSION_COLUMNS,
         generation_id=generation_id,
-        rows={eid: old_events[eid] for eid in dirty_events},
+        rows={(eid,): old_events[eid] for eid in dirty_events},
     ) + _archive_rows(
         con,
         table="ce_session_versions",
-        id_column="session_id",
+        key_columns=_SESSION_KEY,
         columns=_SESSION_VERSION_COLUMNS,
         generation_id=generation_id,
-        rows={sid: old_sessions[sid] for sid in dirty_sessions},
+        rows={(sid,): old_sessions[sid] for sid in dirty_sessions},
+    ) + _archive_rows(
+        con,
+        table="ce_relation_versions",
+        key_columns=_RELATION_KEY,
+        columns=_RELATION_VERSION_COLUMNS,
+        generation_id=generation_id,
+        rows={(rid,): old_relations[rid] for rid in dirty_relations},
+    ) + _archive_rows(
+        con,
+        table="ce_disposition_versions",
+        key_columns=_DISPOSITION_KEY,
+        columns=_DISPOSITION_VERSION_COLUMNS,
+        generation_id=generation_id,
+        rows={key: old_dispositions[key] for key in dirty_dispositions},
     )
 
     # 2) Refresh those rows in place (an UPDATE, never a delete + re-insert).
     rows_updated = _update_rows(
         con,
         table="ce_events",
-        id_column="event_id",
+        key_columns=_EVENT_KEY,
         payload_columns=_EVENT_COLUMNS[1:],
         generation_id=generation_id,
-        rows={eid: new_events[eid] for eid in dirty_events},
+        rows={(eid,): new_events[eid] for eid in dirty_events},
     ) + _update_rows(
         con,
         table="ce_sessions",
-        id_column="session_id",
+        key_columns=_SESSION_KEY,
         payload_columns=_SESSION_COLUMNS[1:],
         generation_id=generation_id,
-        rows={sid: new_sessions[sid] for sid in dirty_sessions},
+        rows={(sid,): new_sessions[sid] for sid in dirty_sessions},
+    ) + _update_rows(
+        con,
+        table="ce_event_relations",
+        key_columns=_RELATION_KEY,
+        payload_columns=_RELATION_COLUMNS[1:],
+        generation_id=generation_id,
+        rows={(rid,): new_relations[rid] for rid in dirty_relations},
+    ) + _update_rows(
+        con,
+        table="ce_field_dispositions",
+        key_columns=_DISPOSITION_KEY,
+        payload_columns=_DISPOSITION_COLUMNS[2:],
+        generation_id=generation_id,
+        rows={key: new_dispositions[key] for key in dirty_dispositions},
     )
 
-    old_relations = _slot_relation_ids(con, generation_id, slot_id)
-    new_relations = {r.relation_id for r in result.relations}
-    # Rows the store sees for the first time. Relations are derivations of events
-    # and carry no history table: a relation row that disappeared upstream is
-    # kept as collected evidence, and one whose id survived keeps its first
-    # captured values (``_insert_relations`` is INSERT OR IGNORE).
+    # Rows the store sees for the first time. A row that disappeared upstream is
+    # kept as collected evidence in every one of the four families; a row whose
+    # identity survived with different values has just been archived and
+    # refreshed above, never silently kept at its first captured value.
     new_event_ids = set(new_events)
     new_session_ids = set(new_sessions)
     old_event_ids = set(old_events)
@@ -691,7 +877,8 @@ def _apply_slot(
     rows_inserted = (
         len(new_event_ids - old_event_ids)
         + len(new_session_ids - old_session_ids)
-        + len(new_relations - old_relations)
+        + len(set(new_relations) - set(old_relations))
+        + len(set(new_dispositions) - set(old_dispositions))
     )
 
     gen = _generation_input(result)
@@ -719,7 +906,7 @@ def _apply_slot(
         "new_sessions": set(new_sessions),
         "new_event_ids": new_event_ids,
         "new_session_ids": new_session_ids,
-        "new_relation_ids": new_relations,
+        "new_relation_ids": set(new_relations),
     }
 
 

@@ -32,7 +32,7 @@ from personal_knowledge.adapters.conversation_sources.snapshots import (
 from personal_knowledge.application.conversation.compatibility_projection import (
     build_compatibility_projection,
     clear_compatibility_projection,
-    write_compatibility_projection,
+    upsert_compatibility_projection,
 )
 from personal_knowledge.application.conversation.event_schema import (
     create_v2_schema,
@@ -114,6 +114,126 @@ def _codex_session(
 
 def _write(mirror_root: Path, name: str, text: str) -> Path:
     family_dir = mirror_root / FAMILY
+    family_dir.mkdir(parents=True, exist_ok=True)
+    path = family_dir / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+# ---------------------------------------- second family, for derived-row history
+#
+# ``claude`` is the family where both *derived* row families are reachable from
+# one small file, and where each of them can hold a different value under the
+# same identity:
+#
+# * the ``parentUuid`` link is a relation whose id is derived from the two
+#   endpoints but whose *kind* is the record's ``isSidechain`` flag, so flipping
+#   that flag changes the kind while the relation id stays exactly the same;
+# * a ``thinking`` content block always carries a ``reasoning_content``
+#   disposition whose *value* flips between UNAVAILABLE (no plaintext) and
+#   MAPPED (plaintext), while the event id (built from the locator and the
+#   native id) does not move when only the text changes.
+
+CLAUDE = "claude"
+
+
+def _claude_session(
+    session_id: str, *, sidechain: bool = False, thinking: str | None = None
+) -> str:
+    """A minimal Claude/Qoder JSONL DAG: one user record and one assistant record.
+
+    The assistant record carries the ``parentUuid`` link (one relation per
+    content block) and one ``thinking`` block (one disposition), so a single
+    edit can move either derived row's value without touching any native id.
+    """
+
+    records = [
+        {
+            "type": "user",
+            "uuid": f"{session_id}-u1",
+            "parentUuid": None,
+            "sessionId": session_id,
+            "timestamp": "2026-07-01T10:00:00Z",
+            "stop_reason": None,
+            "message": {"role": "user", "content": f"question of {session_id}"},
+        },
+        {
+            "type": "assistant",
+            "uuid": f"{session_id}-u2",
+            "parentUuid": f"{session_id}-u1",
+            "isSidechain": sidechain,
+            "sessionId": session_id,
+            "timestamp": "2026-07-01T10:00:01Z",
+            "stop_reason": "end_turn",
+            "message": {
+                "role": "assistant",
+                "model": "claude-x",
+                "content": [
+                    {"type": "thinking"} if thinking is None
+                    else {"type": "thinking", "thinking": thinking},
+                    {"type": "text", "text": f"answer of {session_id}"},
+                ],
+            },
+        },
+    ]
+    return "\n".join(json.dumps(record) for record in records) + "\n"
+
+
+def _claude_user_only(session_id: str) -> str:
+    """The same file with the linked assistant record (and its block) removed."""
+
+    return json.dumps(
+        {
+            "type": "user",
+            "uuid": f"{session_id}-u1",
+            "parentUuid": None,
+            "sessionId": session_id,
+            "timestamp": "2026-07-01T10:00:00Z",
+            "stop_reason": None,
+            "message": {"role": "user", "content": f"question of {session_id}"},
+        }
+    ) + "\n"
+
+
+def _write_claude(mirror_root: Path, name: str, text: str) -> Path:
+    family_dir = mirror_root / CLAUDE
+    family_dir.mkdir(parents=True, exist_ok=True)
+    path = family_dir / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _claude_slot(name: str) -> str:
+    """The expected stable slot identity for ``claude/<name>``."""
+
+    return make_slot_artifact_id(CLAUDE, f"{CLAUDE}{os.sep}{name}")
+
+
+# ``gemini`` is the family that declares dispositions at the *adaptation* level
+# (no ``event_id`` on the record), which is the third route into
+# ``ce_field_dispositions`` and is attached to the generation's first event.
+
+GEMINI = "gemini"
+
+
+def _gemini_doc(*, usage: bool) -> str:
+    assistant: dict = {"role": "assistant", "content": "answer of gemini-doc"}
+    if usage:
+        assistant["input_tokens"] = 5
+    return json.dumps(
+        {
+            "session_id": "gemini-sess",
+            "model": "gemini-x",
+            "messages": [
+                {"role": "user", "content": "question of gemini-doc"},
+                assistant,
+            ],
+        }
+    )
+
+
+def _write_gemini(mirror_root: Path, name: str, text: str) -> Path:
+    family_dir = mirror_root / GEMINI
     family_dir.mkdir(parents=True, exist_ok=True)
     path = family_dir / name
     path.write_text(text, encoding="utf-8")
@@ -253,7 +373,9 @@ def _canonical_session_for_content(db: Path, marker: str) -> str:
     return found[0][0]
 
 
-def _full_rebuild_projection(mirror_root: Path, tmp_path: Path, tag: str) -> Path:
+def _full_rebuild_projection(
+    mirror_root: Path, tmp_path: Path, tag: str, *, family: str = FAMILY
+) -> Path:
     """Stage a complete fresh generation and project it (the oracle reference).
 
     Deliberately the *other* pipeline: ``shadow_conversation_generation``
@@ -269,12 +391,12 @@ def _full_rebuild_projection(mirror_root: Path, tmp_path: Path, tag: str) -> Pat
         artifact_store=tmp_path / f"ref-artifacts-{tag}",
         report_path=tmp_path / f"report-{tag}.json",
     )
-    entry = report["generations"][FAMILY]
+    entry = report["generations"][family]
     assert entry["status"] in ("full", "partial"), entry.get("reason")
     projection = build_compatibility_projection(ref_db, entry["generation_id"])
     con = _connect(ref_db)
     try:
-        write_compatibility_projection(con, projection)
+        upsert_compatibility_projection(con, projection)
         con.commit()
     finally:
         con.close()
@@ -360,6 +482,7 @@ def test_second_run_without_a_source_change_writes_nothing(tmp_path: Path) -> No
         "ce_events", "ce_sessions", "ce_event_relations", "ce_field_dispositions",
         "ce_source_artifacts", "ce_live_slots", "ce_live_sync_log",
         "ce_event_versions", "ce_session_versions",
+        "ce_relation_versions", "ce_disposition_versions",
         "canonical_sessions", "canonical_messages",
     )
     before = _counts(db, tables)
@@ -1064,3 +1187,360 @@ def test_slot_relation_lookup_is_equivalent_and_index_backed(
             assert "ce_relations_generation_source (generation_id=?)" not in plan, plan
     finally:
         con.close()
+
+
+# ----------------------------- 9. relation / disposition row history
+#
+# The same contract as events and sessions, for the two derived row families:
+# a relation and a disposition are identified by values that survive an edit
+# (``relation_id``; ``(event_id, field_name)``), so "the same identity now holds
+# a different value" has to be *archived* before the main row is refreshed in
+# place. ``INSERT OR IGNORE`` alone silently keeps the first captured value, so
+# every expectation below is measured on the database (which value the main row
+# holds, which values the history holds, how the version sequence grows) or on
+# a second, independent pipeline (the full rebuild), never on the engine's own
+# arithmetic.
+
+CLAUDE_FILE = "s.jsonl"
+
+
+def _relation_state(db: Path) -> list[tuple]:
+    return _rows(
+        db,
+        "SELECT relation_id, source_event_id, target_event_id, relation_kind "
+        "FROM ce_event_relations ORDER BY relation_id",
+    )
+
+
+def _relation_versions(db: Path, relation_id: str) -> list[tuple]:
+    return _rows(
+        db,
+        "SELECT version_seq, relation_kind, source_event_id, target_event_id, "
+        "superseded_at FROM ce_relation_versions WHERE relation_id=? "
+        "ORDER BY version_seq",
+        (relation_id,),
+    )
+
+
+def _disposition_state(db: Path, event_id: str, field_name: str) -> list[tuple]:
+    return _rows(
+        db,
+        "SELECT disposition, reason FROM ce_field_dispositions "
+        "WHERE event_id=? AND field_name=?",
+        (event_id, field_name),
+    )
+
+
+def _disposition_versions(
+    db: Path, event_id: str, field_name: str
+) -> list[tuple]:
+    return _rows(
+        db,
+        "SELECT version_seq, disposition, reason, superseded_at "
+        "FROM ce_disposition_versions WHERE event_id=? AND field_name=? "
+        "ORDER BY version_seq",
+        (event_id, field_name),
+    )
+
+
+def test_dirty_relation_keeps_its_old_value_in_ce_relation_versions(
+    tmp_path: Path,
+) -> None:
+    """A relation whose kind changes refreshes in place, old kind archived."""
+
+    mirror = tmp_path / "mirror"
+    _write_claude(mirror, CLAUDE_FILE, _claude_session("sess_s"))
+    db = tmp_path / "live.sqlite"
+    first = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert first["status"] == "ok"
+    assert _table(db, "ce_relation_versions") == []
+
+    before = _relation_state(db)
+    assert len(before) == 2  # one relation per assistant content block
+    assert {row[3] for row in before} == {"parent_child"}
+
+    # One flag flips. The link (and its relation id, derived from the two
+    # endpoints) is untouched; only the kind of that same link changes.
+    _write_claude(
+        mirror, CLAUDE_FILE, _claude_session("sess_s", sidechain=True)
+    )
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert report["n_changed"] == 1
+    assert report["rows_inserted"] == 0
+    assert report["rows_updated"] == 2 and report["rows_versioned"] == 2
+    # ...and no *event* row changed: this edit is about the derived row only.
+    assert _table(db, "ce_event_versions") == []
+
+    # The main rows now carry the new kind, under the same ids and endpoints.
+    after = _relation_state(db)
+    assert [row[0] for row in after] == [row[0] for row in before]
+    assert [(row[1], row[2]) for row in after] == [
+        (row[1], row[2]) for row in before
+    ]
+    assert {row[3] for row in after} == {"sidechain"}
+    assert _rows(
+        db, "SELECT 1 FROM ce_event_relations WHERE relation_kind='parent_child'"
+    ) == []
+
+    # The replaced kind is version 0 of that very relation id.
+    for relation_id, source_event_id, target_event_id, _kind in before:
+        versions = _relation_versions(db, relation_id)
+        assert [row[0] for row in versions] == [0]
+        assert versions[0][1] == "parent_child"
+        assert (versions[0][2], versions[0][3]) == (
+            source_event_id, target_event_id
+        )
+        assert versions[0][4]
+
+    # A second flip archives version 1 and leaves version 0 exactly as it was.
+    _write_claude(mirror, CLAUDE_FILE, _claude_session("sess_s"))
+    second = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert second["rows_inserted"] == 0
+    assert {row[3] for row in _relation_state(db)} == {"parent_child"}
+    for relation_id, *_rest in before:
+        versions = _relation_versions(db, relation_id)
+        assert [row[0] for row in versions] == [0, 1]
+        assert [row[1] for row in versions] == ["parent_child", "sidechain"]
+
+    assert _rows(db, "PRAGMA foreign_key_check") == []
+    assert _rows(db, "SELECT * FROM pragma_integrity_check") == [("ok",)]
+
+
+def test_dirty_disposition_keeps_its_old_value_in_ce_disposition_versions(
+    tmp_path: Path,
+) -> None:
+    """A re-decided disposition refreshes in place, old verdict archived."""
+
+    mirror = tmp_path / "mirror"
+    _write_claude(mirror, CLAUDE_FILE, _claude_session("sess_s"))
+    db = tmp_path / "live.sqlite"
+    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert _table(db, "ce_disposition_versions") == []
+
+    field = "reasoning_content"
+    stored = _rows(
+        db,
+        "SELECT event_id, disposition, reason FROM ce_field_dispositions "
+        "WHERE field_name=?",
+        (field,),
+    )
+    assert len(stored) == 1
+    event_id, old_value, old_reason = stored[0]
+    assert old_value == "unavailable"
+    assert old_reason
+
+    # The thinking block gains plaintext: the event id is built from the locator
+    # and the native block id, so it survives the edit; the verdict for that same
+    # (event, field) is re-decided.
+    _write_claude(
+        mirror, CLAUDE_FILE, _claude_session("sess_s", thinking="why sess_s")
+    )
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert report["rows_inserted"] == 0
+    # One dirty event (the reasoning body) and one dirty disposition.
+    assert report["rows_updated"] == 2 and report["rows_versioned"] == 2
+
+    assert _disposition_state(db, event_id, field) == [
+        ("mapped", "reasoning text mapped exactly to content")
+    ]
+    versions = _disposition_versions(db, event_id, field)
+    assert [row[0] for row in versions] == [0]
+    assert versions[0][1] == "unavailable"
+    assert versions[0][2] == old_reason
+    assert versions[0][3]
+
+    # Dropping the plaintext again re-decides it back: version 1 records the
+    # verdict that was current, version 0 stays as collected.
+    _write_claude(mirror, CLAUDE_FILE, _claude_session("sess_s"))
+    second = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert second["rows_inserted"] == 0
+    assert [row[0] for row in _disposition_state(db, event_id, field)] == [
+        "unavailable"
+    ]
+    versions = _disposition_versions(db, event_id, field)
+    assert [row[0] for row in versions] == [0, 1]
+    assert [row[1] for row in versions] == ["unavailable", "mapped"]
+
+
+def test_second_edit_appends_the_next_version_seq_for_both_derived_tables(
+    tmp_path: Path,
+) -> None:
+    """The version sequence continues past version 0; no archived row is touched."""
+
+    mirror = tmp_path / "mirror"
+    _write_claude(
+        mirror, CLAUDE_FILE, _claude_session("sess_s", sidechain=True)
+    )
+    db = tmp_path / "live.sqlite"
+    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+
+    field = "reasoning_content"
+    (event_id, _value, _reason) = _rows(
+        db,
+        "SELECT event_id, disposition, reason FROM ce_field_dispositions "
+        "WHERE field_name=?",
+        (field,),
+    )[0]
+    relation_ids = [row[0] for row in _relation_state(db)]
+    assert len(relation_ids) == 2
+
+    # First edit: both derived rows change value under their own identity.
+    _write_claude(
+        mirror,
+        CLAUDE_FILE,
+        _claude_session("sess_s", sidechain=False, thinking="first verdict"),
+    )
+    first = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert first["rows_versioned"] == 4  # 2 relations + 1 disposition + 1 event
+
+    version_zero = {
+        "relations": {
+            relation_id: _relation_versions(db, relation_id)
+            for relation_id in relation_ids
+        },
+        "disposition": _disposition_versions(db, event_id, field),
+    }
+    assert [row[0] for row in version_zero["disposition"]] == [0]
+    for relation_id in relation_ids:
+        assert [row[0] for row in version_zero["relations"][relation_id]] == [0]
+
+    # Second edit: both identities change value again, in the other direction.
+    _write_claude(
+        mirror, CLAUDE_FILE, _claude_session("sess_s", sidechain=True)
+    )
+    second = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert second["rows_inserted"] == 0
+    assert second["rows_versioned"] == 4
+
+    for relation_id in relation_ids:
+        versions = _relation_versions(db, relation_id)
+        assert [row[0] for row in versions] == [0, 1]
+        assert [row[1] for row in versions] == ["sidechain", "parent_child"]
+        # Version 0 is byte-for-byte what it was before the second edit.
+        assert versions[:1] == version_zero["relations"][relation_id]
+        assert len(versions) == len(set(versions)) == 2
+
+    versions = _disposition_versions(db, event_id, field)
+    assert [row[0] for row in versions] == [0, 1]
+    assert [row[1] for row in versions] == ["unavailable", "mapped"]
+    assert versions[:1] == version_zero["disposition"]
+    assert _rows(db, "SELECT * FROM pragma_integrity_check") == [("ok",)]
+
+
+def test_adaptation_level_disposition_is_keyed_like_the_full_rebuild(
+    tmp_path: Path,
+) -> None:
+    """The third write route (adaptation-level dispositions) is keyed identically.
+
+    ``ce_field_dispositions`` has two write routes: per-event dispositions and
+    the adaptation-level ones, which carry no ``event_id`` and are attached to
+    the generation's first event. The engine has to read a slot's stored rows
+    back under exactly the key that route writes them with, so this compares the
+    live store against a full rebuild of the same file (the independent pipeline)
+    row for row, then shows that a source which stops declaring the field leaves
+    the collected row in place instead of archiving over it.
+    """
+
+    mirror = tmp_path / "mirror"
+    _write_gemini(mirror, "g.json", _gemini_doc(usage=True))
+    db = tmp_path / "live.sqlite"
+    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+
+    live_rows = _rows(
+        db,
+        "SELECT event_id, field_name, disposition, reason "
+        "FROM ce_field_dispositions ORDER BY event_id, field_name",
+    )
+    assert live_rows and {row[1] for row in live_rows} == {"messages[*].usage"}
+
+    ref_db = _full_rebuild_projection(
+        mirror, tmp_path, "adaptation-disposition", family=GEMINI
+    )
+    assert _rows(
+        ref_db,
+        "SELECT event_id, field_name, disposition, reason "
+        "FROM ce_field_dispositions ORDER BY event_id, field_name",
+    ) == live_rows
+
+    # The document stops carrying the token fields: the declared disposition is
+    # gone from the source, so nothing is replaced and nothing is archived.
+    _write_gemini(mirror, "g.json", _gemini_doc(usage=False))
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert report["n_changed"] == 1
+    assert report["rows_inserted"] == 0
+    assert report["rows_updated"] == 0 and report["rows_versioned"] == 0
+    assert _table(db, "ce_disposition_versions") == []
+    assert _rows(
+        db,
+        "SELECT event_id, field_name, disposition, reason "
+        "FROM ce_field_dispositions ORDER BY event_id, field_name",
+    ) == live_rows
+
+
+def test_stale_relation_and_disposition_rows_are_retained(
+    tmp_path: Path,
+) -> None:
+    """A source that stops emitting them is not a reason to drop collected rows."""
+
+    mirror = tmp_path / "mirror"
+    _write_claude(
+        mirror, CLAUDE_FILE, _claude_session("sess_s", sidechain=True)
+    )
+    db = tmp_path / "live.sqlite"
+    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+
+    relations_before = _relation_state(db)
+    dispositions_before = _rows(
+        db,
+        "SELECT event_id, field_name, disposition, reason "
+        "FROM ce_field_dispositions ORDER BY event_id, field_name",
+    )
+    assert len(relations_before) == 2 and dispositions_before
+    disp_versions_before = _table(db, "ce_disposition_versions")
+    rel_versions_before = _table(db, "ce_relation_versions")
+
+    # The source is rewritten without the linked assistant record: the parent
+    # link and the reasoning block are gone from the file...
+    truncated = _claude_user_only("sess_s")
+    assert '"parentUuid": null' in truncated and '"thinking"' not in truncated
+    _write_claude(mirror, CLAUDE_FILE, truncated)
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert report["n_changed"] == 1
+    assert report["rows_inserted"] == 0
+
+    # ...and a fresh full rebuild of the same corpus confirms that: the rebuild
+    # (a second, independent pipeline) produces no derived rows at all.
+    ref_db = _full_rebuild_projection(
+        mirror, tmp_path, "stale-derived", family=CLAUDE
+    )
+    assert _table(ref_db, "ce_event_relations") == []
+    assert _table(ref_db, "ce_field_dispositions") == []
+    assert _rows(
+        ref_db, "SELECT 1 FROM ce_events WHERE content LIKE ?", ("%answer of%",)
+    ) == []
+
+    # Nothing was dropped and nothing was archived over: a stale row is not a
+    # replaced row, so the history tables stay exactly as they were.
+    assert _relation_state(db) == relations_before
+    assert _rows(
+        db,
+        "SELECT event_id, field_name, disposition, reason "
+        "FROM ce_field_dispositions ORDER BY event_id, field_name",
+    ) == dispositions_before
+    assert _table(db, "ce_relation_versions") == rel_versions_before
+    assert _table(db, "ce_disposition_versions") == disp_versions_before
+    stale_event_id, stale_field = dispositions_before[0][0], dispositions_before[0][1]
+    assert _disposition_state(db, stale_event_id, stale_field) == [
+        (dispositions_before[0][2], dispositions_before[0][3])
+    ]
+
+    # The collected rows are still reachable through the derived-table index the
+    # engine reads them with, and the store is still referentially clean.
+    con = _connect(db)
+    try:
+        assert _slot_relation_ids(
+            con, GENERATION, _claude_slot(CLAUDE_FILE)
+        ) == {row[0] for row in relations_before}
+    finally:
+        con.close()
+    assert _rows(db, "PRAGMA foreign_key_check") == []

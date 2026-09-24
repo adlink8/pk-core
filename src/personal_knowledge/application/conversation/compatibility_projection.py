@@ -11,12 +11,16 @@ This module owns ONLY event-to-legacy mapping:
   - :func:`build_compatibility_projection` reads the typed generation and
     computes the lossy session/message/tool rows plus a deterministic
     :class:`ProjectionFingerprint` (generation lineage).
-  - :func:`write_compatibility_projection` persists those rows inside the
-    caller's transaction (replacing what the projection owns);
-    :func:`upsert_compatibility_projection` is the incremental counterpart and
-    only ever inserts or updates (never deletes);
-    :func:`clear_compatibility_projection` restores the prior projection during
-    rollback.
+  - :func:`upsert_compatibility_projection` is the only writer: it persists
+    those rows inside the caller's transaction, inserting the missing ones and
+    refreshing the changed ones with an ``UPDATE``. It never deletes. Both the
+    incremental path and activation/rollback go through it, because the store is
+    a **collection**: a row the sources no longer produce stays exactly as
+    collected, and inserting, updating and deleting must all leave every other
+    row's ``rowid`` untouched (the rowid cursor in
+    ``retrieval/conversation_fts.py`` depends on it).
+  - :func:`clear_compatibility_projection` restores the pre-v2 state during a
+    rollback/deactivation (rollback owner only).
   - :func:`compute_projection` is the pure mapping used by both.
 
 It never activates a generation and never touches ``ce_generation_authority``
@@ -34,7 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -498,124 +502,6 @@ def build_compatibility_projection(
     return compute_projection(generation_id, sessions, events)
 
 
-def _message_content_key(row: tuple) -> tuple:
-    return tuple(row[2:])  # role, content_hash, content_length, timestamp
-
-
-def _tool_content_key(row: tuple) -> tuple:
-    return tuple(row[2:])  # source_kind, tool_name, content_length, ts, cat, status
-
-
-def _merge_by_content(
-    con: sqlite3.Connection,
-    table: str,
-    id_column: str,
-    key_columns: tuple[str, ...],
-    incoming: list[tuple],
-) -> int:
-    """Delete existing rows the incoming rows supersede by *content*.
-
-    An origin file that is rewritten rather than appended shifts the physical
-    positions the addresses are derived from, so the same message can arrive
-    under a new id while the row captured under its old id is still there.
-    Blindly inserting would duplicate the message; deleting by content key
-    replaces it instead. Multiset semantics: N incoming rows with a content key
-    replace N existing rows with that key, so genuinely repeated turns (two
-    identical user messages) survive as two rows.
-    """
-    if not incoming:
-        return 0
-    select_cols = ",".join((id_column,) + key_columns)
-    wanted: dict[tuple[str, tuple], int] = Counter(
-        (row[1], tuple(row[2:])) for row in incoming
-    )
-    by_session: dict[str, list[tuple]] = defaultdict(list)
-    for row in incoming:
-        by_session[row[1]].append(row)
-
-    deleted = 0
-    for session_id, rows in by_session.items():
-        existing = con.execute(
-            f"SELECT {select_cols} FROM {table} WHERE canonical_session_id=?",
-            (session_id,),
-        ).fetchall()
-        if not existing:
-            continue
-        to_delete: list[str] = []
-        for existing_row in existing:
-            key = tuple(existing_row[1:])
-            if wanted.get((session_id, key), 0) > 0:
-                wanted[(session_id, key)] -= 1
-                to_delete.append(existing_row[0])
-        for start in range(0, len(to_delete), _PARAM_CHUNK):
-            chunk = to_delete[start:start + _PARAM_CHUNK]
-            marks = ",".join("?" * len(chunk))
-            cursor = con.execute(
-                f"DELETE FROM {table} WHERE {id_column} IN ({marks})", chunk)
-            deleted += max(cursor.rowcount, 0)
-    return deleted
-
-
-def write_compatibility_projection(
-    con: sqlite3.Connection, report: CompatibilityProjectionReport
-) -> None:
-    """Write the projected rows into the three compatibility tables.
-
-    Runs inside the caller's transaction so an activation/rollback owner can
-    commit or restore atomically with the authority pointer. Table DDL is
-    ensured idempotently (the live canonical DB already has these tables).
-
-    The projected ids are also recorded in ``ce_projected_ids`` so that
-    :func:`clear_compatibility_projection` can delete exactly what this
-    projection wrote. Prefix-based deletion used to work (``v2|%``); with
-    origin-derived ids the projection's rows are indistinguishable by prefix
-    from the migrated rows around them, so the owned set is recorded instead.
-    """
-    _ensure_tables(con)
-    if report.sessions:
-        con.executemany(
-            "INSERT OR REPLACE INTO canonical_sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [_row_for_insert(r, _SESSION_COLUMNS) for r in report.sessions],
-        )
-    if report.messages:
-        # supersede by content before inserting (see _merge_by_content)
-        _merge_by_content(
-            con, "canonical_messages", "canonical_message_id",
-            ("role", "content_hash", "content_length", "timestamp"),
-            [(r["canonical_message_id"], r["canonical_session_id"], r["role"],
-              r["content_hash"], r["content_length"], r["timestamp"])
-             for r in report.messages],
-        )
-        con.executemany(
-            "INSERT OR REPLACE INTO canonical_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [_row_for_insert(r, _MESSAGE_COLUMNS) for r in report.messages],
-        )
-    if report.tools:
-        _merge_by_content(
-            con, "canonical_tool_events", "canonical_tool_id",
-            ("source_kind", "tool_name", "content_length", "timestamp",
-             "category", "status"),
-            [(r["canonical_tool_id"], r["canonical_session_id"],
-              r["source_kind"], r["tool_name"], r["content_length"],
-              r["timestamp"], r["category"], r["status"])
-             for r in report.tools],
-        )
-        con.executemany(
-            "INSERT OR REPLACE INTO canonical_tool_events VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            [_row_for_insert(r, _TOOL_COLUMNS) for r in report.tools],
-        )
-    con.execute("DELETE FROM ce_projected_ids")
-    con.executemany(
-        "INSERT OR IGNORE INTO ce_projected_ids VALUES (?,?)",
-        [("canonical_sessions", r["canonical_session_id"])
-         for r in report.sessions]
-        + [("canonical_messages", r["canonical_message_id"])
-           for r in report.messages]
-        + [("canonical_tool_events", r["canonical_tool_id"])
-           for r in report.tools],
-    )
-
-
 def _upsert_rows(
     con: sqlite3.Connection,
     *,
@@ -673,8 +559,9 @@ def upsert_compatibility_projection(
 ) -> dict[str, dict[str, int]]:
     """Persist the projected rows without ever deleting one (collection writer).
 
-    This is the writer used by the incremental live path. It inserts rows that
-    are absent and refreshes rows whose values changed with an ``UPDATE``:
+    This is the **only** projection writer: the incremental live path and the
+    activation/rollback path both go through it. It inserts rows that are absent
+    and refreshes rows whose values changed with an ``UPDATE``:
 
       - ``canonical_sessions`` / ``canonical_messages`` /
         ``canonical_tool_events`` are read with a **monotonic rowid cursor** by
@@ -711,13 +598,18 @@ def upsert_compatibility_projection(
 
 
 def clear_compatibility_projection(con: sqlite3.Connection) -> None:
-    """Delete every row the current projection wrote (rollback owner only).
+    """Delete every row the projection ever wrote (rollback owner only).
 
-    Deletes ONLY rows recorded in ``ce_projected_ids`` by the last
-    :func:`write_compatibility_projection`, so rows this projection never
-    wrote — migrated rows, snapshot rows, anything else in the store — are
+    Deletes ONLY rows recorded in ``ce_projected_ids``, so rows the projection
+    never wrote — migrated rows, snapshot rows, anything else in the store — are
     preserved. Activation must never discard the product's existing canonical
     conversation data (D-18/D-19). Never deletes the tables themselves (D-19).
+
+    ``ce_projected_ids`` is an append-only ownership ledger: every writer records
+    the ids it wrote with ``INSERT OR IGNORE`` and never clears the ledger, so a
+    row that was written once and is now retained as part of the collection is
+    still reported as owned here. That is the correct set for deactivation, which
+    removes the whole projection rather than one round of it.
     """
     _ensure_tables(con)
     owned = con.execute(
@@ -738,10 +630,6 @@ def clear_compatibility_projection(con: sqlite3.Connection) -> None:
             con.execute(f"DELETE FROM {table_name} WHERE {column} IN ({marks})",
                         chunk)
     con.execute("DELETE FROM ce_projected_ids")
-
-
-def _row_for_insert(row: dict, columns: tuple[str, ...]) -> tuple:
-    return tuple(row.get(c) for c in columns)
 
 
 def _ensure_tables(con: sqlite3.Connection) -> None:
@@ -779,9 +667,9 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
             call_index INTEGER, subagent_session_id TEXT, content_length INTEGER,
             timestamp TEXT)"""
     )
-    # Session-scope lookups/deletes (live-sync re-projection deletes by
-    # ``canonical_session_id IN (...)``; readers select one session at a time)
-    # would otherwise be one full-table SCAN per session — measured 44.8 ms
+    # Session-scope lookups/deletes (readers select one session at a time; the
+    # rollback owner deletes by ``canonical_session_id IN (...)``) would
+    # otherwise be one full-table SCAN per session — measured 44.8 ms
     # (messages) + 36.1 ms (tool events) per session on the ~8 GB staging db.
     # Declared here, in the module that owns these tables, and idempotent, so an
     # existing database picks the indexes up on its next projection build.
@@ -804,5 +692,4 @@ __all__ = [
     "clear_compatibility_projection",
     "compute_projection",
     "upsert_compatibility_projection",
-    "write_compatibility_projection",
 ]
