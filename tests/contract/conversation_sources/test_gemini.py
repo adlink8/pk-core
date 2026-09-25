@@ -1,4 +1,4 @@
-"""Gemini 适配器契约（family ``gemini``，ADAPTER_VERSION 1.1.0）。
+"""Gemini 适配器契约（family ``gemini``，ADAPTER_VERSION 1.2.0）。
 
 公开 seam 只有 registry：``registry.adapt_for`` / ``registry.detect_family``；
 发现侧用 ``discovery.discover_client_sources``。生产代码不直接摸族模块函数。
@@ -13,11 +13,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from personal_knowledge.adapters.conversation_sources import registry
 from personal_knowledge.adapters.conversation_sources.discovery import (
     discover_client_sources,
 )
-from personal_knowledge.core.conversation_events import EventKind
+from personal_knowledge.adapters.conversation_sources import gemini as gemini_module
+from personal_knowledge.core.conversation_events import EventContractError, EventKind
 from tests.contract.conversation_sources.support import artifacts
 from tests.contract.conversation_sources.support import gemini as fixtures
 
@@ -118,3 +121,144 @@ def test_discovery_keeps_only_gemini_tmp_session_files(tmp_path: Path) -> None:
     codex_found = discover_client_sources(roots={"codex": (codex_root,)})
     assert visible in codex_found["codex"]
     assert hidden not in codex_found["codex"]
+
+
+# --------------------------------------------------------- 批次 B 回归补测
+
+# 独立字面量期望值（不由被测代码同款算法重算）：
+#   1745308979000 ms -> 2025-04-22T08:02:59Z
+#   1745308980000 ms -> 2025-04-22T08:03:00Z
+#   1745308981000 ms == 1745308981 s -> 2025-04-22T08:03:01Z
+#   2026-04-22T09:23:03+02:00        -> 2026-04-22T07:23:03Z
+def test_gemini_timestamps_normalize_to_utc_z(tmp_path: Path) -> None:
+    document = fixtures.messages_document(
+        [
+            # 原生 epoch 毫秒 int
+            {"id": "u1", "type": "user", "content": [{"text": USER_TEXT}],
+             "timestamp": 1745308980000},
+            # 数字串毫秒
+            {"id": "g1", "type": "gemini", "content": ASSISTANT_TEXT,
+             "timestamp": "1745308981000"},
+            # 10 位秒级纪元（normalize_timestamp 覆盖不了，需本文件预处理）
+            {"id": "u2", "type": "user", "content": [{"text": "second"}],
+             "timestamp": 1745308981},
+            # 带时区偏移的 ISO
+            {"id": "g2", "type": "gemini", "content": "third",
+             "timestamp": "2026-04-22T09:23:03+02:00"},
+        ],
+        session_id="s-ts",
+        created_at=1745308979000,
+    )
+    result = _adapt_gemini(tmp_path, document)
+
+    by_native = {
+        event.provenance.native_event_id: event for event in result.events
+    }
+    assert by_native["u1"].occurred_at == "2025-04-22T08:03:00Z"
+    assert by_native["g1"].occurred_at == "2025-04-22T08:03:01Z"
+    assert by_native["u2"].occurred_at == "2025-04-22T08:03:01Z"
+    assert by_native["g2"].occurred_at == "2026-04-22T07:23:03Z"
+    # 会话生命线事件的 created_at 同样归一，不得把裸毫秒 int 透传入库。
+    lifecycle = artifacts.event_with(result, EventKind.SESSION_LIFECYCLE)
+    assert lifecycle.occurred_at == "2025-04-22T08:02:59Z"
+
+
+def test_gemini_title_skips_system_placeholder_blocks(tmp_path: Path) -> None:
+    document = fixtures.messages_document(
+        [
+            {"id": "u1", "type": "user",
+             "content": [{"text": "<INSTRUCTIONS>你是一个编码代理</INSTRUCTIONS>\nAGENTS.md 约定"}]},
+            fixtures.user_message(USER_TEXT, native_id="u2"),
+        ],
+        session_id="s-title",
+    )
+    result = _adapt_gemini(tmp_path, document)
+    assert result.sessions, "有 sessionId 必须产出会话"
+    assert result.sessions[0].title == USER_TEXT
+
+
+def test_gemini_fallback_ids_stable_when_mid_file_message_inserted(tmp_path: Path) -> None:
+    """无原生 id 的消息：中部补一条消息不许让后续兜底 id 全部轮换。"""
+
+    def build(root: Path, extra: list[dict]):
+        messages = [
+            {"type": "user", "content": [{"text": "alpha"}],
+             "timestamp": "2026-04-22T07:23:00Z"},
+            *extra,
+            {"type": "user", "content": [{"text": "beta"}],
+             "timestamp": "2026-04-22T07:23:05Z"},
+        ]
+        document = fixtures.messages_document(messages, session_id="s-ids")
+        artifact = fixtures.write_document(root, document)
+        return registry.adapt_for(
+            "gemini", artifacts.single(artifact), artifact_root=root,
+        )
+
+    base = build(tmp_path / "base", [])
+    with_extra = build(tmp_path / "extra", [
+        {"type": "user", "content": [{"text": "inserted"}],
+         "timestamp": "2026-04-22T07:23:02Z"},
+    ])
+
+    def native_ids(result):
+        return {
+            event.content: event.provenance.native_event_id
+            for event in result.events
+            if event.kind is EventKind.USER_MESSAGE
+        }
+
+    base_ids = native_ids(base)
+    assert set(base_ids) == {"alpha", "beta"}
+    # 中部插入只新增自己的 id，alpha/beta 的兜底 id 原样不动（路径无关、
+    # 位置无关）。
+    for text, native_id in base_ids.items():
+        assert native_ids(with_extra)[text] == native_id
+        assert native_id.startswith("msg-") and native_id[:5] != "msg-0"
+
+
+def test_gemini_duplicate_identical_messages_get_distinct_ids(tmp_path: Path) -> None:
+    document = fixtures.messages_document(
+        [
+            {"type": "user", "content": [{"text": "same"}],
+             "timestamp": "2026-04-22T07:23:00Z"},
+            {"type": "user", "content": [{"text": "same"}],
+             "timestamp": "2026-04-22T07:23:00Z"},
+        ],
+        session_id="s-dup",
+    )
+    result = _adapt_gemini(tmp_path, document)
+    ids = [
+        event.provenance.native_event_id
+        for event in result.events if event.kind is EventKind.USER_MESSAGE
+    ]
+    assert len(ids) == 2 and len(set(ids)) == 2, ids
+
+
+def test_gemini_unknown_content_dict_gets_disposition_not_repr(tmp_path: Path) -> None:
+    document = fixtures.messages_document(
+        [{"id": "u1", "type": "user", "content": {"weird": {"nested": [1, 2]}}}],
+        session_id="s-dict",
+    )
+    result = _adapt_gemini(tmp_path, document)
+    user = artifacts.event_with(result, EventKind.USER_MESSAGE)
+    # Python repr 不许落盘成正文。
+    assert user.content is None
+    assert "'weird'" not in (user.summary or "")
+    assert "without a known text field" in artifacts.reasons(user)
+    assert "weird" in artifacts.reasons(user)
+
+
+def test_gemini_oversized_document_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """超 max_bytes：adapt 报错、detect 判「不是我」，都不许整读进内存。"""
+    monkeypatch.setattr(gemini_module, "MAX_JSON_BYTES", 64)
+    document = fixtures.messages_document(
+        [fixtures.user_message(USER_TEXT)], session_id="s-big",
+    )
+    artifact = fixtures.write_document(tmp_path, document)
+    with pytest.raises(EventContractError):
+        registry.adapt_for(
+            "gemini", artifacts.single(artifact), artifact_root=tmp_path,
+        )
+    assert registry.detect_family("gemini", artifact, artifact_root=tmp_path) is False

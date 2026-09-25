@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from dataclasses import replace as _replace
 from pathlib import Path
+import hashlib
 import json
+import re
 
 from personal_knowledge.adapters.conversation_sources.contracts import (
     AdaptationResult,
@@ -20,8 +22,8 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     SourceArtifactSet,
     artifact_bytes_path,
 )
-from personal_knowledge.adapters.conversation_sources.jsonl_stream import (
-    iter_jsonl_lines,
+from personal_knowledge.adapters.conversation_sources.time_utils import (
+    normalize_timestamp,
 )
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
@@ -42,7 +44,11 @@ from personal_knowledge.core.conversation_events import (
 FAMILY = "copilot"
 # 1.4.0：detect 变为对畸形字节全函数（非法 JSON / 非 UTF-8 返回 False 而非抛），
 # 探测器行为变了 → capability digest 变。
-ADAPTER_VERSION = "1.4.0"
+# 1.5.0：时间戳全走 normalize_timestamp；无原生 session id 的伪会话键改为
+# 「uuid 词干 / 全路径确定性键」；_session_ended_at 取最后一个 shutdown；
+# 同 tool id 重复记录保留首对并告警；.json 导出的非文本 response part 显式
+# 告警；_load_records 单次读取。
+ADAPTER_VERSION = "1.5.0"
 CONTRACT_VERSION = "2"
 
 # Round-4 audit fix: tool arguments/results were never stored as event content
@@ -50,6 +56,29 @@ CONTRACT_VERSION = "2"
 # the model that tool.execution_complete records still carry.
 # Tool input/output are event *content* (the body), so they are never capped;
 # only navigation summaries stay bounded.
+
+# uuid 形态的文件名词干本身就是逐会话键（vscode 以会话 uuid 命名轨迹文件）。
+_UUID_STEM_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _session_fallback_key(relative_path: str | None) -> str:
+    """无原生 session id 时的伪会话键（对齐 claude 修复思路）。
+
+    uuid 形态的词干直接用词干；其余词干（如 ``events``）会被同目录每个
+    会话共享，把无关会话熔接到一个伪键上——改用完整 relative_path 的
+    sha256 确定性键（内容寻址捕获下 relative_path 稳定，重抓不漂移；
+    逐字路径不进键，路径分隔符统一后跨平台稳定）。
+    """
+    stem = Path(relative_path or "").stem
+    if _UUID_STEM_RE.match(stem):
+        return stem
+    digest = hashlib.sha256(
+        (relative_path or "").replace("\\", "/").encode("utf-8")
+    ).hexdigest()[:16]
+    return f"path:{digest}"
 
 
 def _payload_str(value) -> str | None:
@@ -298,7 +327,7 @@ def _reasoning_event(record: dict, artifact, *, session_id, locator) -> TypedEve
         artifact, session_id=session_id, kind=EventKind.REASONING,
         locator=f"{locator}#reasoning",
         native_id=f"{native_id}#reasoning" if native_id else None,
-        occurred_at=record.get("timestamp"), content=text, summary=text[:2048],
+        occurred_at=normalize_timestamp(record.get("timestamp")), content=text, summary=text[:2048],
         native_session=sid,
         field_dispositions=(FieldDispositionRecord(
             "reasoningText", FieldDisposition.MAPPED,
@@ -309,7 +338,7 @@ def _reasoning_event(record: dict, artifact, *, session_id, locator) -> TypedEve
 
 def _adapt_record(record: dict, artifact, *, session_id, locator) -> TypedEvent | None:
     kind = _KINDS.get(record.get("type"))
-    ts = record.get("timestamp")
+    ts = normalize_timestamp(record.get("timestamp"))
     data = record.get("data") if isinstance(record.get("data"), dict) else record
     sid = record.get("session_id") or data.get("sessionId")
     native_id = (
@@ -407,7 +436,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             f"{FAMILY} adapter requires exactly one artifact, got {len(artifact_set.artifacts)}"
         )
     artifact = artifact_set.artifacts[0]
-    records, malformed = _load_records(
+    records, malformed, flatten_warnings = _load_records(
         artifact_root / artifact.content_hash[:32], artifact.relative_path
     )
 
@@ -416,10 +445,12 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     events: list[TypedEvent] = []
     relations: list[EventRelation] = []
     warnings: list[str] = []
+    warnings.extend(flatten_warnings)
     if malformed:
         warnings.append(f"{malformed} malformed/native-corrupt record(s) skipped")
     tool_starts: dict[str, TypedEvent] = {}
     tool_ends: dict[str, TypedEvent] = {}
+    duplicate_tool_ids = 0
     native_session = next((
         r.get("session_id")
         or ((r.get("data") or {}).get("sessionId") if isinstance(r.get("data"), dict) else None)
@@ -427,7 +458,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         if r.get("session_id") or (
             isinstance(r.get("data"), dict) and (r.get("data") or {}).get("sessionId")
         )
-    ), Path(artifact.relative_path).stem)
+    ), _session_fallback_key(artifact.relative_path))
 
     for lineno, record in enumerate(records, start=1):
         locator = f"{artifact.relative_path}#L{lineno}"
@@ -447,9 +478,21 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         if not tool_id:
             continue
         if ev.kind is EventKind.TOOL_CALL:
-            tool_starts[tool_id] = ev
+            if tool_id in tool_starts:
+                # 同 id 的第二条 start 会静默覆盖首对；保留首对并计数告警。
+                duplicate_tool_ids += 1
+            else:
+                tool_starts[tool_id] = ev
         elif ev.kind is EventKind.TOOL_RESULT:
-            tool_ends[tool_id] = ev
+            if tool_id in tool_ends:
+                duplicate_tool_ids += 1
+            else:
+                tool_ends[tool_id] = ev
+
+    if duplicate_tool_ids:
+        warnings.append(
+            f"{duplicate_tool_ids} duplicate tool id record(s); kept the first pair"
+        )
 
     for tool_id, start in tool_starts.items():
         end = tool_ends.get(tool_id)
@@ -507,23 +550,41 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     )
 
 
-def _load_records(path: Path, relative_path: str) -> tuple[list[dict], int]:
+def _load_records(path: Path, relative_path: str) -> tuple[list[dict], int, list[str]]:
+    """Parse one trace file into pseudo-records.
+
+    Returns ``(records, malformed_count, warnings)``. The JSONL branch reads
+    the file exactly once: parse and non-blank counting share one pass
+    (the old second ``read_text`` full-file re-read is gone).
+    """
     if Path(relative_path).suffix.lower() == ".jsonl":
-        values = list(iter_jsonl_lines(path, strict=False))
-        nonblank = sum(1 for line in path.read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines() if line.strip("\x00 \t\r\n"))
-        return values, max(0, nonblank - len(values))
+        records: list[dict] = []
+        nonblank = 0
+        with path.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line:
+                    continue
+                nonblank += 1
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    records.append(obj)
+        return records, max(0, nonblank - len(records)), []
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise EventContractError(f"{FAMILY} JSON artifact unreadable: {exc}") from exc
     if not isinstance(doc, dict) or not isinstance(doc.get("requests"), list):
         raise EventContractError(f"{FAMILY} JSON export has no requests list")
-    sid = str(doc.get("sessionId") or Path(relative_path).stem)
-    records: list[dict] = [{
+    sid = str(doc.get("sessionId") or _session_fallback_key(relative_path))
+    flatten_warnings: list[str] = []
+    records = [{
         "type": "session.start", "id": sid,
-        "timestamp": doc.get("creationDate"), "data": {"sessionId": sid},
+        "timestamp": normalize_timestamp(doc.get("creationDate")),
+        "data": {"sessionId": sid},
     }]
     for index, request in enumerate(doc["requests"]):
         if not isinstance(request, dict):
@@ -534,25 +595,37 @@ def _load_records(path: Path, relative_path: str) -> tuple[list[dict], int]:
         request_id = str(request.get("requestId") or f"request-{index}")
         records.append({
             "type": "user.message", "id": request_id,
-            "timestamp": request.get("timestamp"),
+            "timestamp": normalize_timestamp(request.get("timestamp")),
             "data": {"sessionId": sid, "messageId": request_id, "content": message},
         })
         response_parts = request.get("response")
         text_parts: list[str] = []
+        dropped_parts = 0
         if isinstance(response_parts, list):
             for part in response_parts:
-                if isinstance(part, dict) and isinstance(part.get("value"), str):
+                if isinstance(part, str) and part:
+                    text_parts.append(part)
+                elif isinstance(part, dict) and isinstance(part.get("value"), str) and part["value"]:
                     text_parts.append(part["value"])
+                elif part is not None:
+                    # 非文本块（progress/工具卡片/数字等）过去被静默丢掉；
+                    # 现在显式计数告警，缺口点名而不是无声消失。
+                    dropped_parts += 1
+        if dropped_parts:
+            flatten_warnings.append(
+                f"{dropped_parts} non-text response part(s) dropped flattening "
+                f"request {request_id}"
+            )
         response_id = str(request.get("responseId") or f"{request_id}:response")
         records.append({
             "type": "assistant.message", "id": response_id,
-            "timestamp": request.get("timestamp"),
+            "timestamp": normalize_timestamp(request.get("timestamp")),
             "data": {
                 "sessionId": sid, "messageId": response_id,
                 "content": "\n".join(text_parts),
             },
         })
-    return records, 0
+    return records, 0, flatten_warnings
 
 
 def _record_data(record: dict) -> dict:
@@ -619,19 +692,25 @@ def _session_started_at(records: list[dict]) -> str | None:
     """started_at = the session.start record timestamp (creation time)."""
     for record in records:
         if record.get("type") == "session.start" and record.get("timestamp"):
-            return str(record["timestamp"])
+            return normalize_timestamp(record["timestamp"])
     return None
 
 
 def _session_ended_at(records: list[dict]) -> str | None:
-    """ended_at = last session.shutdown timestamp, else last trace timestamp."""
-    last: str | None = None
+    """ended_at = the LAST session.shutdown timestamp, else last trace timestamp.
+
+    修复：旧实现命中第一个 shutdown 就 return；shutdown 后恢复再关闭的
+    会话会把 ended_at 取早，与 docstring 一直声称的 last 相矛盾。
+    """
+    last_shutdown: str | None = None
+    last_any: str | None = None
     for record in records:
-        if record.get("type") == "session.shutdown" and record.get("timestamp"):
-            return str(record["timestamp"])
-        if record.get("timestamp"):
-            last = str(record["timestamp"])
-    return last
+        ts = normalize_timestamp(record.get("timestamp"))
+        if ts:
+            last_any = ts
+        if record.get("type") == "session.shutdown" and ts:
+            last_shutdown = ts
+    return last_shutdown or last_any
 
 
 def _first_user_content(records: list[dict]) -> str | None:
