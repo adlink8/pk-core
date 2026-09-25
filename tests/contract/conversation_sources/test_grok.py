@@ -316,3 +316,17 @@ UTF16_TEXT = "# Summary".encode("utf-16")
 def test_grok_detector_rejects_malformed_bytes_without_raising(tmp_path, name, raw):
     artifact, root = artifacts.probe_file(tmp_path, name, raw)
     assert registry.detect_family("grok", artifact, artifact_root=root) is False
+
+
+def test_grok_rejects_agentsview_reconcile_scratch_db(tmp_path):
+    """AgentView 的 reconcile 临时库与 chatgpt 共享同一子串锚点。
+
+    两家都用 ``sessions.db`` / ``agentsview`` 判定 AgentView 兼容行，那对
+    AgentView 自己的临时库是误判（它只有 ``candidates`` 表）。锚点是共享的，
+    排除规则也必须共享，否则同一批文件在两家之间认领口径不一致。
+    """
+    name = ".agentsview-reconcile-629221015.db"
+    artifact, root = artifacts.probe_file(
+        tmp_path, name, b"", source_kind="sqlite"
+    )
+    assert registry.detect_family("grok", artifact, artifact_root=root) is False

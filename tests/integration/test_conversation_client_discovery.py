@@ -394,6 +394,69 @@ def test_real_codex_archived_root_registered():
     assert any(r.endswith(".codex/archived_sessions") for r in roots)
 
 
+# ----------------------------------------- chatgpt 的发现根（AgentsView 兼容通道）
+#
+# 本机没有 ChatGPT 原生导出目录，所以 chatgpt 一直是空根 —— 适配器、允许清单、
+# 探测器都在，但没有任何源喂给它，整族 0 条。唯一的本地锚点是 AgentView 的
+# 只读库 ``~/.agentsview/sessions.db``（``chatgpt.detect`` 认的就是
+# ``sessions.db`` / agentsview 形态的 sqlite）。发现层必须把它注册成 chatgpt
+# 的根，否则这条兼容观测通道永远不会被走。
+
+
+class TestChatgptDiscoveryRoot:
+    def test_default_roots_include_agentsview_store(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        (home / ".agentsview").mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: home)
+        # ``FAMILY_CLIENT_ROOTS`` 是 import 期算出来的常量，只看真实 home；
+        # 这里必须重算默认根才能观察 monkeypatch 后的 home。
+        roots = {str(r) for r in discovery._default_roots()["chatgpt"]}
+        assert str((home / ".agentsview").resolve()) in roots
+
+    def test_real_agentsview_store_is_claimed_as_chatgpt(self, tmp_path):
+        """注册成根之后，真实 AgentsView 库必须被 chatgpt 探测器认领。"""
+        home = tmp_path / "home"
+        store = home / ".agentsview" / "sessions.db"
+        store.parent.mkdir(parents=True)
+        con = sqlite3.connect(store)
+        try:
+            con.execute(
+                "CREATE TABLE sessions (id TEXT, agent TEXT, started_at TEXT, "
+                "ended_at TEXT, deleted_at TEXT, file_path TEXT)"
+            )
+            con.execute(
+                "CREATE TABLE messages (id TEXT, session_id TEXT, ordinal INTEGER, "
+                "role TEXT, content TEXT, timestamp TEXT, is_system INTEGER, "
+                "is_sidechain INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO sessions VALUES ('c1','chatgpt','2026-01-01T00:00:00Z',"
+                "NULL,NULL,NULL)"
+            )
+            con.execute(
+                "INSERT INTO messages VALUES "
+                "('m1','c1',1,'user','hi','2026-01-01T00:00:01Z',0,0)"
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        found = discover_client_sources(
+            roots={"chatgpt": (store.parent,)},
+        )
+        assert found["chatgpt"] == [store]
+
+
+@pytest.mark.skipif(
+    not (Path.home() / ".agentsview" / "sessions.db").is_file(),
+    reason="本机没有 ~/.agentsview/sessions.db 真实 AgentsView 库",
+)
+def test_real_agentsview_root_registered():
+    # 真实环境佐证：AgentsView 库目录是已注册的 chatgpt 根。
+    roots = {r.as_posix() for r in FAMILY_CLIENT_ROOTS.get("chatgpt", ())}
+    assert any(r.endswith(".agentsview") for r in roots)
+
+
 # ------------------------------------------------- unclaimed-file discovery ledger
 #
 # 台账只增加可见性：认领结果必须与不传 ledger 时逐比特一致。

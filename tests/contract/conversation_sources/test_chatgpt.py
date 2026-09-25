@@ -57,6 +57,21 @@ def test_detect_binds_to_agentsview(tmp_path):
     assert registry.detect_family("chatgpt", artifact, artifact_root=root) is True
 
 
+def test_detect_rejects_agentsview_reconcile_scratch_db(tmp_path):
+    """AgentView 自己的 reconcile 临时库带 store 前缀，但不是会话库。
+
+    真机 ``~/.agentsview/`` 里除了 store 还有 ``.agentsview-reconcile-<pid>.db``
+    （只有一张 ``candidates`` 表）。按子串锚点它们会被认领，于是 chatgpt 的
+    发现层认领数虚报成 3（真实是 1），然后在抓取阶段以
+    ``sqlite_snapshot:KeyError`` 失败 —— 数据不错，但台账在撒谎。
+    """
+    name = ".agentsview-reconcile-3235378876.db"
+    artifact, root = artifacts.probe_file(
+        tmp_path, name, b"", source_kind="sqlite"
+    )
+    assert registry.detect_family("chatgpt", artifact, artifact_root=root) is False
+
+
 def test_native_reconstruction_unavailable(pathless):
     """兼容观测通道不冒充原生重建：保真度停在 partial 并留下警告。"""
     result = pathless

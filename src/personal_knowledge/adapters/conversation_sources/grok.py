@@ -21,6 +21,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
 )
 from personal_knowledge.adapters.conversation_sources.agentsview_pathless import (
     adapt_pathless_observation,
+    is_agentsview_store,
 )
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
@@ -130,8 +131,7 @@ def capability() -> CapabilityDescriptor:
 def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
     """True when the artifact set contains the Grok summary marker."""
     if artifact.source_kind == "sqlite":
-        relative = (artifact.relative_path or "").lower()
-        return "sessions.db" in relative or "agentsview" in relative
+        return is_agentsview_store(artifact.relative_path)
     if artifact.source_kind != "file":
         return False
     if Path(artifact.relative_path).name not in (

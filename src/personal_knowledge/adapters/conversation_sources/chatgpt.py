@@ -12,6 +12,9 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from personal_knowledge.adapters.conversation_sources.agentsview_pathless import (
+    is_agentsview_store,
+)
 from personal_knowledge.adapters.conversation_sources.contracts import (
     AdaptationResult,
     CapabilityDescriptor,
@@ -92,9 +95,8 @@ def capability() -> CapabilityDescriptor:
 
 
 def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
-    relative = (artifact.relative_path or "").lower()
-    return artifact.source_kind == "sqlite" and (
-        "sessions.db" in relative or "agentsview" in relative
+    return artifact.source_kind == "sqlite" and is_agentsview_store(
+        artifact.relative_path
     )
 
 

@@ -28,6 +28,28 @@ from personal_knowledge.core.conversation_events import (
     make_event_id,
 )
 
+#: AgentView's own reconcile scratch databases carry the store's name prefix but
+#: are not conversation stores: they hold a single ``candidates`` table.
+_RECONCILE_SCRATCH_PREFIX = ".agentsview-reconcile-"
+
+
+def is_agentsview_store(relative_path: str | None) -> bool:
+    """True for the AgentView store / export shapes a family may claim.
+
+    The anchor is the file's *name*, shared by every family that reads this
+    compatibility channel, so it lives here rather than being spelled out once
+    per detector: the live store (``sessions.db``), a managed export
+    (``agentsview_normalized.sqlite``), or a staged copy that keeps
+    ``agentsview`` in its name. The tool's own reconcile scratch DBs match that
+    prefix while holding nothing but a ``candidates`` table, so they are rejected
+    here instead of being claimed and then failing at snapshot time.
+    """
+
+    relative = (relative_path or "").lower()
+    if Path(relative).name.startswith(_RECONCILE_SCRATCH_PREFIX):
+        return False
+    return "sessions.db" in relative or "agentsview" in relative
+
 _MESSAGE_KINDS = {
     "user": EventKind.USER_MESSAGE,
     "assistant": EventKind.ASSISTANT_MESSAGE,

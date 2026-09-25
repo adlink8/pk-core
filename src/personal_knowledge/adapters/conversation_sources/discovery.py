@@ -132,7 +132,11 @@ def _default_roots() -> dict[str, tuple[Path, ...]]:
 
     Patterns follow Phase 62 adapter native-shape knowledge (62-RESEARCH
     format matrix) and the machine-local layout observed on this host.
-    chatgpt has no native directory (manual zip import) and is not listed.
+    chatgpt has no native export directory; its only local anchor is the
+    AgentView read-only store, which is the declared pathless compatibility
+    channel for this family. Registering that root is what feeds the
+    otherwise-idle chatgpt adapter (it was an empty root, so the whole family
+    contributed zero events).
     """
     home = str(Path.home()).replace("\\", "/")
     candidates: dict[str, tuple[str, ...]] = {
@@ -158,8 +162,11 @@ def _default_roots() -> dict[str, tuple[Path, ...]]:
         "antigravity": (f"{home}/.antigravity", f"{home}/.gemini/antigravity"),
         "grok": (f"{home}/.grok/sessions",),
         "cursor": (f"{home}/.cursor/projects", f"{home}/.cursor"),
-        # chatgpt has no native directory: manual zip import only (empty roots).
-        "chatgpt": (),
+        # No native ChatGPT export directory exists. The AgentView read-only
+        # store is the declared pathless compatibility channel (adapter reads
+        # only ``sessions``/``messages`` through the allowlisted WAL-safe
+        # snapshot; the store itself is never written to or relocated).
+        "chatgpt": (f"{home}/.agentsview",),
     }
     roots: dict[str, tuple[Path, ...]] = {}
     for family, patterns in candidates.items():
