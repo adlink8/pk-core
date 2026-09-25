@@ -24,6 +24,8 @@ malformed lines fail closed or report bounded partial fidelity.
 
 from __future__ import annotations
 
+import codecs
+import json
 from pathlib import Path
 
 from personal_knowledge.adapters.conversation_sources.contracts import (
@@ -33,8 +35,8 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     SourceArtifactSet,
     artifact_bytes_path,
 )
-from personal_knowledge.adapters.conversation_sources.jsonl_stream import (
-    iter_jsonl_lines,
+from personal_knowledge.adapters.conversation_sources.time_utils import (
+    normalize_timestamp,
 )
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
@@ -55,6 +57,19 @@ from personal_knowledge.core.conversation_events import (
 FAMILY = "pi"
 ADAPTER_VERSION = "1.4.0"
 CONTRACT_VERSION = "2"
+
+# P2 detect: probe the head of the file in bounded chunks instead of judging
+# from only the first line (the first record of a real export can itself be
+# tens of KB — a user prompt with injected instructions — so a fixed first-line
+# probe missed real Pi files). Chunked, incremental decode, with a scan cap so
+# the probe stays O(cap) no matter the file size.
+_DETECT_WINDOW_BYTES = 16_384
+_DETECT_SCAN_LIMIT = 262_144
+
+
+def _ts(value):
+    """Native timestamp -> canonical UTC ISO-8601 ``Z`` (None/垃圾原样保序)."""
+    return normalize_timestamp(value)
 
 _COMPLETE = {
     FidelityDimension.SOURCE_AVAILABILITY: FidelityLevel.COMPLETE,
@@ -157,23 +172,55 @@ def capability() -> CapabilityDescriptor:
 
 
 def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
-    """Probe the first non-blank line for a Pi conversation record."""
+    """Bounded chunked probe for a Pi conversation/session record.
+
+    The first record of a real export can be tens of KB, so the probe scans
+    line by line over 16K chunks up to a total cap instead of trusting a
+    single fixed first line. A line carrying ``"type"`` plus a
+    ``"conversation"`` / ``"session"`` marker identifies the family.
+    """
     if not (artifact.relative_path or "").lower().endswith(".jsonl"):
         return False
     try:
-        with artifact_bytes_path(artifact_root, artifact).open("r", encoding="utf-8") as h:
-            for raw in h:
-                line = raw.strip()
-                if not line:
-                    continue
-                return '"type"' in line and (
-                    '"conversation"' in line or '"session"' in line
-                )
+        with artifact_bytes_path(artifact_root, artifact).open("rb") as fh:
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            carry = ""
+            scanned = 0
+            eof = False
+            while scanned < _DETECT_SCAN_LIMIT and not eof:
+                chunk = fh.read(_DETECT_WINDOW_BYTES)
+                if not chunk:
+                    eof = True
+                    break
+                scanned += len(chunk)
+                try:
+                    text = decoder.decode(chunk)
+                except UnicodeDecodeError:
+                    # 非 UTF-8 字节的轨迹必须判为「不是我」，不得把解析异常
+                    # 抛给发现层（会被记成 probe_error）。
+                    return False
+                text = carry + text
+                *lines, carry = text.split("\n")
+                if any(_looks_like_pi_line(line) for line in lines):
+                    return True
+            if eof:
+                # 文件在扫描上限内结束：末个未换行的残行与增量解码器的缓冲
+                # 都要参与判定；flush 报错说明编码真的坏了。
+                try:
+                    carry += decoder.decode(b"", final=True)
+                except UnicodeDecodeError:
+                    return False
+                if _looks_like_pi_line(carry):
+                    return True
     except (OSError, ValueError):
         # ValueError 覆盖 UnicodeDecodeError：非 UTF-8 字节的轨迹必须判为
         # 「不是我」，不得把解析异常抛给发现层（会被记成 probe_error）。
         return False
     return False
+
+
+def _looks_like_pi_line(line: str) -> bool:
+    return '"type"' in line and ('"conversation"' in line or '"session"' in line)
 
 def _event(artifact, *, session_id, kind, locator, native_id=None, occurred_at=None,
            content=None, summary=None, fidelity=None, native_session=None,
@@ -203,7 +250,7 @@ def _adapt_record(record: dict, artifact, *, session_id, locator, native_session
     not collapsed into unknown_native.
     """
     kind = record.get("type")
-    ts = record.get("timestamp")
+    ts = _ts(record.get("timestamp"))
     mid = record.get("message_id")
     if kind == "conversation":
         return [_event(artifact, session_id=session_id, kind=EventKind.SESSION_LIFECYCLE,
@@ -279,11 +326,12 @@ def _adapt_message(record, artifact, *, session_id, locator, native_session) -> 
     """
     message = record.get("message") if isinstance(record.get("message"), dict) else {}
     role = message.get("role")
+    occurred_at = _ts(record.get("timestamp"))
     if role == "toolResult":
         tool_name = message.get("toolName")
         result_event = _event(
             artifact, session_id=session_id, kind=EventKind.TOOL_RESULT,
-            locator=locator, native_id=record.get("id"), occurred_at=record.get("timestamp"),
+            locator=locator, native_id=record.get("id"), occurred_at=occurred_at,
             content=_message_text(message.get("content")),
             summary=f"tool_result {tool_name}" if tool_name else None,
             fidelity=_fidelity(
@@ -293,7 +341,7 @@ def _adapt_message(record, artifact, *, session_id, locator, native_session) -> 
         )
         return [result_event, *_image_block_events(
             message.get("content"), artifact, session_id=session_id, locator=locator,
-            native_id=record.get("id"), occurred_at=record.get("timestamp"),
+            native_id=record.get("id"), occurred_at=occurred_at,
             native_session=native_session,
         )]
     if role == "user":
@@ -306,7 +354,7 @@ def _adapt_message(record, artifact, *, session_id, locator, native_session) -> 
         message_kind = EventKind.UNKNOWN_NATIVE
     primary = _event(
         artifact, session_id=session_id, kind=message_kind,
-        locator=locator, native_id=record.get("id"), occurred_at=record.get("timestamp"),
+        locator=locator, native_id=record.get("id"), occurred_at=occurred_at,
         content=(_message_text(message.get("content"))
                  if message_kind is not EventKind.UNKNOWN_NATIVE else None),
         fidelity=(None if message_kind is not EventKind.UNKNOWN_NATIVE else _fidelity(
@@ -330,8 +378,9 @@ def _adapt_message(record, artifact, *, session_id, locator, native_session) -> 
                 continue
             block_events.append(_event(
                 artifact, session_id=session_id, kind=EventKind.REASONING,
-                locator=block_locator, native_id=record.get("id"), occurred_at=record.get("timestamp"),
-                content=str(thinking)[:2048] or None,
+                locator=block_locator, native_id=record.get("id"), occurred_at=occurred_at,
+                # P1-18: reasoning 是事件正文，正文不设上限——全量保留。
+                content=str(thinking) or None,
                 summary=str(thinking)[:256] or None,
                 fidelity=_fidelity(
                     STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
@@ -344,7 +393,7 @@ def _adapt_message(record, artifact, *, session_id, locator, native_session) -> 
             block_events.append(_event(
                 artifact, session_id=session_id, kind=EventKind.TOOL_CALL,
                 locator=block_locator, native_id=block.get("id") or record.get("id"),
-                occurred_at=record.get("timestamp"), content=tool_text,
+                occurred_at=occurred_at, content=tool_text,
                 summary=f"tool_call {name}" if name else "tool_call",
                 fidelity=_fidelity(
                     STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
@@ -391,13 +440,16 @@ def _image_block_events(blocks, artifact, *, session_id, locator, native_id, occ
 
 
 def _tool_call_text(block: dict) -> str | None:
-    """A readable rendering of a toolCall content block (name + arguments)."""
+    """A readable rendering of a toolCall content block (name + arguments).
+
+    P1-18: the arguments are event content — rendered in full, never capped.
+    """
     name = block.get("name")
     text = str(name) if name else "tool_call"
     args = block.get("arguments")
     if args is not None:
         rendered = str(args)
-        text = f"{text} {rendered[:512]}"
+        text = f"{text} {rendered}"
     return text or None
 
 
@@ -408,13 +460,30 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             f"{FAMILY} adapter requires exactly one artifact, got {len(artifact_set.artifacts)}"
         )
     artifact = artifact_set.artifacts[0]
-    records = list(iter_jsonl_lines(artifact_root / artifact.content_hash[:32]))
+    # P2: 一行坏 JSON 不再炸掉整个会话——坏行计数进 warnings，好行照常
+    # 适配（容错语义，与 copilot 的 strict=False 用法对齐）。
+    records: list[dict] = []
+    bad_lines = 0
+    with (artifact_root / artifact.content_hash[:32]).open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except ValueError:
+                bad_lines += 1
+                continue
+            if isinstance(value, dict):
+                records.append(value)
 
     session_id = make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION,
                                None, kind=EventKind.SESSION_LIFECYCLE, native_locator="session")
     events: list[TypedEvent] = []
     relations: list[EventRelation] = []
     warnings: list[str] = []
+    if bad_lines:
+        warnings.append(f"{bad_lines} malformed JSONL line(s) skipped")
     field_dispositions: list[FieldDispositionRecord] = []
     native_session = next(
         (r.get("conversation_id") for r in records if r.get("conversation_id")),
@@ -450,6 +519,10 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             summary=usage_summary, native_session=native_session,
         ))
     event_order = [ev for _, ev in aligned]
+    # P2: compaction 关系定位用 dict 索引，替代 O(n²) 的 list.index。
+    order_index: dict[str, int] = {
+        ev.event_id: idx for idx, (_rec, ev) in enumerate(aligned)
+    }
 
     for record, ev in aligned:
         if record.get("type") != "compaction":
@@ -459,7 +532,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         if target is None:
             # Boundary cannot be located precisely: fall back to the nearest
             # preceding event as the retained source and say so explicitly.
-            idx = event_order.index(ev)
+            idx = order_index.get(ev.event_id, 0)
             predecessor = event_order[idx - 1] if idx > 0 else None
             if predecessor is not None:
                 relations.append(EventRelation(
@@ -478,7 +551,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             continue
         # The last event in the compacted range is the stream predecessor of
         # the first kept entry.
-        idx = event_order.index(target)
+        idx = order_index.get(target.event_id, 0)
         if idx > 0:
             last_compacted = event_order[idx - 1]
             relations.append(EventRelation(
@@ -511,8 +584,11 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     ) or {}
     # Session-context timestamps: started_at prefers the native conversation /
     # session record timestamp; ended_at is the last event record's timestamp.
-    session_ts = context.get("timestamp") or context.get("created_at")
-    event_timestamps = [rec.get("timestamp") for rec in records if rec.get("timestamp")]
+    session_ts = _ts(context.get("timestamp") or context.get("created_at"))
+    event_timestamps = [
+        t for t in (_ts(rec.get("timestamp")) for rec in records if rec.get("timestamp"))
+        if t
+    ]
     model = context.get("model")
     for record in records:
         if record.get("type") == "model_change" and record.get("modelId"):

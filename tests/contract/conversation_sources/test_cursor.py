@@ -237,3 +237,182 @@ def test_cursor_single_thread_sqlite_session_id_shape_stable(tmp_path):
     )
     assert result.sessions[0].session_id == expected
     assert all(e.session_id == expected for e in result.events)
+
+
+# --------------------------------------------------------------- P1-7 回归
+
+_UUID_STEM = "123e4567-e89b-12d3-a456-426614174000"
+
+
+def _adapt_cursor_rows(tmp_path, rows, *, relative_path):
+    src = cursor_fixtures.write_cursor_transcript(tmp_path / "source", rows, relative_path=relative_path)
+    artifact, root = artifacts.captured_file(
+        src, tmp_path / "capture", relative_path=relative_path,
+        byte_limit=1_000_000, count_limit=1,
+    )
+    return registry.adapt_for("cursor", artifacts.single(artifact), artifact_root=root)
+
+
+def test_cursor_jsonl_uuid_stem_keeps_native_session_key(tmp_path):
+    # 导出文件名是 uuid 时，词干仍是原生会话键。
+    relative = f"projects/fixture/agent-transcripts/{_UUID_STEM}/{_UUID_STEM}.jsonl"
+    result = _adapt_cursor_rows(
+        tmp_path,
+        [{"role": "user", "message": {"content": "fixture-cursor-uuid-stem"}}],
+        relative_path=relative,
+    )
+    assert len(result.sessions) == 1
+    assert result.sessions[0].native_session_id == _UUID_STEM
+
+
+def test_cursor_jsonl_non_uuid_stem_uses_deterministic_path_key(tmp_path):
+    # P1-7 回归：``transcript copy`` 这类非 uuid 词干不得成为伪会话键；
+    # 改用确定性全路径键，不同文件不再共享同一个伪会话。
+    relative = "projects/fixture/agent-transcripts/abc/transcript copy.jsonl"
+    result = _adapt_cursor_rows(
+        tmp_path,
+        [{"role": "user", "message": {"content": "fixture-cursor-renamed"}}],
+        relative_path=relative,
+    )
+    assert len(result.sessions) == 1
+    assert result.sessions[0].native_session_id == "cursor-path:" + relative
+    assert result.sessions[0].native_session_id != "transcript copy"
+
+
+def test_cursor_jsonl_timestamps_normalized_to_utc_z(tmp_path):
+    # P2 回归：jsonl timestamp（ISO 带时区偏移 / epoch 毫秒）统一归一化。
+    result = _adapt_cursor_rows(
+        tmp_path,
+        [
+            {"role": "user", "message": {"content": "fixture-cursor-ts-a"},
+             "timestamp": "2026-07-01T18:00:00+08:00"},
+            {"role": "assistant", "message": {"content": "fixture-cursor-ts-b"},
+             "timestamp": 1782900000123},
+        ],
+        relative_path=cursor_fixtures.JSONL_RELATIVE_PATH,
+    )
+    session = result.sessions[0]
+    assert session.started_at == "2026-07-01T10:00:00Z"
+    assert session.ended_at == "2026-07-01T10:00:00.123Z"
+
+
+def test_cursor_jsonl_tool_result_blocks_surface_as_tool_result_events(tmp_path):
+    # P2 回归：assistant content 里的 tool_result 块必须留下 TOOL_RESULT
+    # 事件，结果正文全量进 content（不静默丢弃、不设上限）。
+    long_payload = "fixture-cursor-tool-result-" + "x" * 3_000
+    result = _adapt_cursor_rows(
+        tmp_path,
+        [
+            {"role": "user", "message": {"content": "fixture-cursor-tool-result-prompt"}},
+            {
+                "role": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_result", "content": [
+                            {"type": "text", "text": long_payload},
+                        ]},
+                    ],
+                },
+            },
+        ],
+        relative_path=cursor_fixtures.JSONL_RELATIVE_PATH,
+    )
+    tool_results = [e for e in result.events if e.kind is EventKind.TOOL_RESULT]
+    assert tool_results, "tool_result block was silently dropped"
+    assert tool_results[0].content == long_payload
+
+
+def test_cursor_jsonl_title_skips_placeholder_first_message(tmp_path):
+    # P2 回归：占位首条用户消息（New Chat 等）不得成为会话标题。
+    result = _adapt_cursor_rows(
+        tmp_path,
+        [
+            {"role": "user", "message": {"content": "New Chat"}},
+            {"role": "user", "message": {"content": "fixture-cursor-real-question"}},
+        ],
+        relative_path=cursor_fixtures.JSONL_RELATIVE_PATH,
+    )
+    assert result.sessions[0].title == "fixture-cursor-real-question"
+
+
+def test_cursor_jsonl_project_cwd_restores_escaped_windows_path(tmp_path):
+    # P2 回归：projects/<escaped-project>/agent-transcripts/... 里被转义成
+    # 连接号的项目目录要还原成 Windows 路径，而不是拿会话 id 目录充数。
+    result = _adapt_cursor_rows(
+        tmp_path,
+        [{"role": "user", "message": {"content": "fixture-cursor-cwd"}}],
+        relative_path="projects/c-Users-li-Desktop-fixtureproj/agent-transcripts/abc/abc.jsonl",
+    )
+    assert result.sessions[0].cwd == "C:\\Users\\li\\Desktop\\fixtureproj"
+
+
+def test_cursor_sqlite_timestamps_normalized_to_utc_z(tmp_path):
+    # P2 回归：sqlite created_at（epoch 毫秒）全走 normalize_timestamp。
+    db = tmp_path / "cursor-millis.db"
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, created_at TEXT);
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY, role TEXT, content TEXT, created_at TEXT
+            );
+            """
+        )
+        con.execute("INSERT INTO threads VALUES ('t1', 'millis', 1782900000000)")
+        con.execute("INSERT INTO messages VALUES ('m1', 'user', 'millis-a', 1782900000123)")
+        con.commit()
+    finally:
+        con.close()
+    artifact, root = artifacts.captured_sqlite(
+        db, tmp_path,
+        allowed_tables=cursor_fixtures.SQLITE_TABLES,
+        allowed_columns=cursor_fixtures.SQLITE_COLUMNS,
+        byte_limit=1_000_000, count_limit=4,
+    )
+    result = registry.adapt_for("cursor", artifacts.single(artifact), artifact_root=root)
+    session = result.sessions[0]
+    assert session.started_at == "2026-07-01T10:00:00Z"
+    assert session.ended_at == "2026-07-01T10:00:00.123Z"
+    lifecycle = next(e for e in result.events if e.kind is EventKind.SESSION_LIFECYCLE)
+    assert lifecycle.occurred_at == "2026-07-01T10:00:00Z"
+    message = next(e for e in result.events if e.kind is EventKind.USER_MESSAGE)
+    assert message.occurred_at == "2026-07-01T10:00:00.123Z"
+
+
+def test_cursor_sqlite_no_id_message_locator_is_content_deterministic(tmp_path):
+    # P2 回归：无 id 列的消息 locator 不用 len(events)（随事件发射漂移），
+    # 改为内容确定性哈希——重复行不撞 event id，重复适配身份稳定。
+    db = tmp_path / "cursor-no-id.db"
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, created_at TEXT);
+            CREATE TABLE messages (role TEXT, content TEXT, created_at TEXT);
+            """
+        )
+        con.execute("INSERT INTO threads VALUES ('t1', 'no-id', '2026-07-01T10:00:00Z')")
+        con.execute("INSERT INTO messages VALUES ('user', 'no-id-dup', '2026-07-01T10:00:01Z')")
+        con.execute("INSERT INTO messages VALUES ('user', 'no-id-dup', '2026-07-01T10:00:01Z')")
+        con.commit()
+    finally:
+        con.close()
+    artifact, root = artifacts.captured_sqlite(
+        db, tmp_path,
+        allowed_tables=cursor_fixtures.SQLITE_TABLES,
+        # 这张夹具库的 messages 表故意没有 id 列：声明与实际 schema 一致。
+        allowed_columns={
+            "threads": ("id", "title", "created_at"),
+            "messages": ("role", "content", "created_at"),
+        },
+        byte_limit=1_000_000, count_limit=4,
+    )
+    result = registry.adapt_for("cursor", artifacts.single(artifact), artifact_root=root)
+    messages = [e for e in result.events if e.kind is EventKind.USER_MESSAGE]
+    assert len(messages) == 2
+    assert len({e.event_id for e in messages}) == 2, "duplicate rows must not collide"
+    assert all("#message:sha256:" in e.provenance.native_locator for e in messages)
+    re_result = registry.adapt_for("cursor", artifacts.single(artifact), artifact_root=root)
+    re_messages = [e for e in re_result.events if e.kind is EventKind.USER_MESSAGE]
+    assert [e.event_id for e in re_messages] == [e.event_id for e in messages]

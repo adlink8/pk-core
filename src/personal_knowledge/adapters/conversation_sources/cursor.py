@@ -9,6 +9,8 @@ single observed family is represented without inventing native semantics.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import sqlite3
 import json
 from pathlib import Path, PurePosixPath
@@ -19,6 +21,9 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     SourceArtifact,
     SourceArtifactSet,
     artifact_bytes_path,
+)
+from personal_knowledge.adapters.conversation_sources.time_utils import (
+    normalize_timestamp,
 )
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
@@ -35,6 +40,35 @@ from personal_knowledge.core.conversation_events import (
 FAMILY = "cursor"
 ADAPTER_VERSION = "1.0.0"
 CONTRACT_VERSION = "2"
+
+# P1-7: a bare uuid stem is a native session id (Cursor names its
+# agent-transcript exports ``<session-uuid>.jsonl``); anything else must not
+# become one — non-uuid stems fall back to a deterministic full-path key.
+_UUID_STEM_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _path_session_key(relative_path: str) -> str:
+    """P1-7: 会话键兜底 — 文件名词干只在它是合法会话 id 形态时使用。
+
+    Cursor 的 agent-transcripts 导出文件名是 uuid（即原生会话 id），词干可
+    直接当 native_session 键；但导出副本 / 重命名文件（``session copy.jsonl``、
+    ``transcript.jsonl``）的词干不是会话 id，用词干会让不同文件的不同会话撞
+    到同一个伪会话键。此时改用确定性全路径键（与 grok.py 的
+    ``grok-path:<relative_path>`` 模式一致）。
+    """
+    normalized = (relative_path or "").replace("\\", "/")
+    stem = Path(normalized).stem
+    if _UUID_STEM_RE.match(stem):
+        return stem
+    return f"{FAMILY}-path:{normalized}"
+
+
+def _ts(value):
+    """Native timestamp -> canonical UTC ISO-8601 ``Z`` (None/垃圾原样保序)."""
+    return normalize_timestamp(value)
 
 # Versioned schema probes: supported stores carry thread/session tables.
 SUPPORTED_PROBES: dict[str, tuple[str, ...]] = {
@@ -64,6 +98,7 @@ def capability() -> CapabilityDescriptor:
         family=FAMILY, adapter_version=ADAPTER_VERSION, contract_version=CONTRACT_VERSION,
         supported_event_kinds=(EventKind.SESSION_LIFECYCLE, EventKind.USER_MESSAGE,
                                EventKind.ASSISTANT_MESSAGE, EventKind.TOOL_CALL,
+                               EventKind.TOOL_RESULT,
                                EventKind.TURN_BOUNDARY, EventKind.USAGE,
                                EventKind.UNKNOWN_NATIVE),
         supported_relation_kinds=(),
@@ -163,7 +198,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     for thread in threads:
         tid = str(thread["id"] if "id" in thread.keys() else thread[0])
         created_at = (
-            thread["created_at"]
+            _ts(thread["created_at"])
             if "created_at" in thread.keys() and thread["created_at"] is not None
             else None
         )
@@ -187,7 +222,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 buckets[str(linked)].append(message)
                 continue
         created = (
-            message["created_at"]
+            _ts(message["created_at"])
             if "created_at" in message.keys() and message["created_at"] is not None
             else None
         )
@@ -223,7 +258,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             )
         locator = f"{artifact.relative_path}#thread:{tid}"
         thread_timestamps = [
-            m["created_at"] for m in thread_messages
+            _ts(m["created_at"]) for m in thread_messages
             if "created_at" in m.keys() and m["created_at"] is not None
         ]
         sessions.append(AdaptedSession(
@@ -235,7 +270,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             ),
             fidelity=_fidelity(), native_session_id=tid,
             started_at=(
-                thread["created_at"]
+                _ts(thread["created_at"])
                 if "created_at" in thread.keys() and thread["created_at"] is not None
                 else None
             ),
@@ -250,17 +285,33 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 contract_version=CONTRACT_VERSION,
             ),
             fidelity=_fidelity(),
-            occurred_at=thread["created_at"] if "created_at" in thread.keys() else None,
+            occurred_at=_ts(thread["created_at"]) if "created_at" in thread.keys() else None,
             summary=str(thread["title"] if "title" in thread.keys() else "")[:256] or None,
         ))
 
-        for message in thread_messages:
+        for row_no, message in enumerate(thread_messages, start=1):
             if "role" not in message.keys():
                 continue
             role = message["role"]
             kind = EventKind.USER_MESSAGE if role == "user" else (
                 EventKind.ASSISTANT_MESSAGE if role in ("assistant", "model") else None)
-            locator = f"{artifact.relative_path}#message:{message['id'] if 'id' in message.keys() else len(events)}"
+            # 无原生 id 的消息：locator 不能用 len(events)（它随事件发射模式
+            # 漂移——早前行多发一个 tool 块，后面所有消息的身份都会变），改用
+            # 内容确定性哈希（归属 thread + role + content + created_at），
+            # 行序仅用于区分完全相同的重复行，保证 event id 唯一。
+            if "id" in message.keys():
+                message_locator = f"{artifact.relative_path}#message:{message['id']}"
+            else:
+                digest_source = "\x1f".join((
+                    tid,
+                    str(message["role"]),
+                    "" if message["content"] is None else str(message["content"]),
+                    "" if not ("created_at" in message.keys()) else str(message["created_at"]),
+                    str(row_no),
+                ))
+                digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:16]
+                message_locator = f"{artifact.relative_path}#message:sha256:{digest}"
+            locator = message_locator
             if kind is None:
                 events.append(TypedEvent(
                     event_id=make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION, locator,
@@ -288,7 +339,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                     contract_version=CONTRACT_VERSION,
                 ),
                 fidelity=_fidelity(),
-                occurred_at=message["created_at"] if "created_at" in message.keys() else None,
+                occurred_at=_ts(message["created_at"]) if "created_at" in message.keys() else None,
                 content=(
                     None if "content" not in message.keys() or message["content"] is None
                     else str(message["content"])
@@ -347,14 +398,35 @@ def _usage_event(artifact, *, row, nested_usage=None, native_session, session_id
     )
 
 
+def _unescape_project_dir(name: str | None) -> str | None:
+    """Restore a Cursor project dir name escaped like ``c-Users-li-Desktop-app``
+    back to a Windows path (``C:\\Users\\li\\Desktop\\app``); any other shape
+    is returned as-is rather than guessed at."""
+    if not name or len(name) < 3 or name[1] != "-" or not name[0].isalpha():
+        return name
+    parts = name.split("-")
+    if len(parts) >= 2 and len(parts[0]) == 1 and parts[0].isalpha():
+        return parts[0].upper() + ":\\" + "\\".join(parts[1:])
+    return name
+
+
 def _jsonl_project_cwd(relative_path):
-    """Restore the Cursor project dir name encoded in the transcript path."""
+    """Restore the working directory encoded in the Cursor transcript path.
+
+    Real transcripts live at ``projects/<proj>/agent-transcripts/<id>/<id>.jsonl``:
+    the project dir is the segment *before* ``agent-transcripts`` (the segment
+    after it is the per-session id dir, not a cwd). The native project dir is
+    escaped like ``c-Users-li-Desktop-app`` (the working path with each
+    separator escaped to a dash); a drive-prefix-shaped name is restored to a
+    Windows path (``C:\\Users\\li\\Desktop\\app``), anything else is returned
+    as-is rather than guessed at.
+    """
     parts = PurePosixPath(relative_path.replace("\\", "/")).parts
     for i, part in enumerate(parts):
-        if part == "agent-transcripts" and (i + 1) < len(parts):
-            return parts[i + 1]
+        if part == "agent-transcripts" and i > 0:
+            return _unescape_project_dir(parts[i - 1])
     parent = PurePosixPath(relative_path.replace("\\", "/")).parent
-    return parent.name or None
+    return _unescape_project_dir(parent.name or None)
 
 
 def _first_model(rows):
@@ -399,20 +471,22 @@ def _tool_input_text(block: dict) -> str | None:
 
 
 def _content_parts(source_content):
-    """Plain text plus tool_use blocks from a Cursor message body.
+    """Plain text plus tool_use / tool_result blocks from a Cursor message body.
 
     String content stays a string. A list of ``{type: text, text: ...}``
-    blocks becomes the joined text, not ``str(list)``. ``tool_use`` blocks
-    are returned separately so they can become tool events.
+    blocks becomes the joined text, not ``str(list)``. ``tool_use`` and
+    ``tool_result`` blocks are returned separately so they can become tool
+    events instead of vanishing silently.
     """
     if source_content is None:
-        return None, []
+        return None, [], []
     if isinstance(source_content, str):
-        return source_content, []
+        return source_content, [], []
     if not isinstance(source_content, list):
-        return str(source_content), []
+        return str(source_content), [], []
     texts: list[str] = []
     tools: list[dict] = []
+    tool_results: list[dict] = []
     for block in source_content:
         if isinstance(block, str):
             texts.append(block)
@@ -422,22 +496,72 @@ def _content_parts(source_content):
         if block.get("type") == "tool_use":
             tools.append(block)
             continue
+        if block.get("type") == "tool_result":
+            tool_results.append(block)
+            continue
         raw = block.get("text")
         if raw is not None and block.get("type") in (None, "text"):
             texts.append(str(raw))
     text = "\n".join(part for part in texts if part != "")
-    return text, tools
+    return text, tools, tool_results
+
+
+def _tool_result_text(block: dict) -> str | None:
+    """Full tool_result payload as text (content is never capped)."""
+    raw = block.get("content")
+    if raw is None:
+        raw = block.get("text")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw or None
+    if isinstance(raw, list):
+        texts: list[str] = []
+        for item in raw:
+            if isinstance(item, str):
+                texts.append(item)
+            elif isinstance(item, dict) and item.get("text") is not None:
+                texts.append(str(item["text"]))
+        return "\n".join(part for part in texts if part) or None
+    try:
+        return json.dumps(raw, ensure_ascii=False, sort_keys=True) or None
+    except (TypeError, ValueError):
+        return str(raw) or None
+
+
+# P2 title: system-injected / placeholder first-user texts that must never
+# become the session title (tag-wrapped injections, AGENTS.md preambles and
+# the unnamed-session placeholders Cursor itself renders).
+_TITLE_PLACEHOLDERS = frozenset({
+    "new chat", "new thread", "untitled", "new conversation",
+    "新对话", "新会话", "未命名",
+})
+
+
+def _is_title_placeholder(text: str) -> bool:
+    """True when a candidate title is scaffolding, not real user dialogue."""
+    if not isinstance(text, str):
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped.startswith("<"):
+        return True
+    lowered = stripped[:120].lower()
+    if lowered in _TITLE_PLACEHOLDERS:
+        return True
+    return "agents.md" in lowered or "instructions for" in lowered
 
 
 def _first_user_message(rows):
-    """Use the first user message as the session title (bounded)."""
+    """Use the first real user message as the session title (bounded)."""
     for row in rows:
         if row.get("role") != "user":
             continue
         message = row.get("message")
         content = message.get("content") if isinstance(message, dict) else message
-        text, _tools = _content_parts(content)
-        if isinstance(text, str) and text.strip():
+        text, _tools, _results = _content_parts(content)
+        if isinstance(text, str) and text.strip() and not _is_title_placeholder(text):
             return text.strip()[:256]
     return None
 
@@ -455,7 +579,7 @@ def _adapt_jsonl(artifact: SourceArtifact, *, artifact_root: Path) -> Adaptation
     except (OSError, ValueError) as exc:
         raise EventContractError(f"{FAMILY} JSONL artifact unreadable: {exc}") from exc
 
-    native_session = Path(artifact.relative_path).stem
+    native_session = _path_session_key(artifact.relative_path)
     session_id = make_event_id(
         FAMILY, artifact.artifact_id, CONTRACT_VERSION, native_session,
         kind=EventKind.SESSION_LIFECYCLE,
@@ -492,7 +616,7 @@ def _adapt_jsonl(artifact: SourceArtifact, *, artifact_root: Path) -> Adaptation
             source_content = message.get("content")
         else:
             source_content = message
-        exact_content, tool_blocks = _content_parts(source_content)
+        exact_content, tool_blocks, tool_result_blocks = _content_parts(source_content)
         is_message = kind in (EventKind.USER_MESSAGE, EventKind.ASSISTANT_MESSAGE)
         raw_error = row.get("error")
         if raw_error is None and isinstance(message, dict):
@@ -558,6 +682,34 @@ def _adapt_jsonl(artifact: SourceArtifact, *, artifact_root: Path) -> Adaptation
                     summary=str(block.get("name") or "tool_use")[:256] or None,
                     native_payload_ref=f"{artifact.artifact_id}:{tool_locator}",
                 ))
+            # P2: tool_result 块不能无声消失——每个块留一个 TOOL_RESULT 事件，
+            # 结果正文全量进 content（正文不设上限）。
+            for result_index, block in enumerate(tool_result_blocks, start=1):
+                result_locator = f"{locator}#tool_result:{result_index}"
+                events.append(TypedEvent(
+                    event_id=make_event_id(
+                        FAMILY, artifact.artifact_id, CONTRACT_VERSION, None,
+                        kind=EventKind.TOOL_RESULT, session_id=session_id,
+                        native_locator=result_locator,
+                    ),
+                    session_id=session_id, kind=EventKind.TOOL_RESULT,
+                    provenance=Provenance(
+                        artifact_id=artifact.artifact_id,
+                        artifact_hash=artifact.content_hash,
+                        native_locator=result_locator,
+                        native_session_id=native_session,
+                        contract_version=CONTRACT_VERSION,
+                    ),
+                    fidelity=_fidelity(
+                        RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
+                        COMPACTION_VISIBILITY=FidelityLevel.UNKNOWN,
+                        NATIVE_ID_STABILITY=FidelityLevel.PARTIAL,
+                    ),
+                    ordinal=index,
+                    content=_tool_result_text(block),
+                    summary="tool_result",
+                    native_payload_ref=f"{artifact.artifact_id}:{result_locator}",
+                ))
         usage = row.get("usage")
         if isinstance(usage, dict) or isinstance(usage, (int, float)) or any(
             k in row for k in ("input_tokens", "output_tokens", "prompt_tokens",
@@ -584,7 +736,10 @@ def _adapt_jsonl(artifact: SourceArtifact, *, artifact_root: Path) -> Adaptation
             warnings=warnings + ("empty transcript: no messages, session skipped",),
         )
     project_cwd = _jsonl_project_cwd(artifact.relative_path)
-    row_timestamps = [r.get("timestamp") for r in rows if r.get("timestamp")]
+    row_timestamps = [
+        _ts(r.get("timestamp")) for r in rows if r.get("timestamp")
+    ]
+    row_timestamps = [t for t in row_timestamps if t]
     return AdaptationResult(
         family=FAMILY, adapter_version="1.1.0",
         contract_version=CONTRACT_VERSION, artifacts=(artifact,),
