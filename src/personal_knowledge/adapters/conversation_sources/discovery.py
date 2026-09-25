@@ -17,6 +17,14 @@ Public seam (engineering contract):
 Invariants: read-only discovery; per-family detector owned by the family
 adapter; content-hash dedup; stage path = ``<stage_root>/<family>/<relative>``;
 no canonical write, no activation, no paid calls (D-31).
+
+Cross-family nesting (P1-4): when one family's candidate root sits inside
+another family's root (``~/.gemini/antigravity`` inside ``~/.gemini``), the
+subtree belongs to the more specific family — the enclosing family's walk
+prunes it before listing, so one source file is claimed (and staged) by at
+most one family. Judged purely by path containment between candidate roots
+(no family names hardcoded), computed per call from the effective roots, so
+env overrides (``PK_CLIENT_ROOT_*``) are covered too.
 """
 
 from __future__ import annotations
@@ -259,10 +267,12 @@ class DiscoveryLedger:
     reachable through two aliases or two nested roots is one candidate.
 
     Claim vs unclaimed is decided **after every family has walked** — a file is
-    claimed iff *at least one* family detector accepted it (a file can only be
-    judged once the last family has had its turn: a root of family B may sit
-    inside a root of family A, as ``~/.gemini/antigravity`` does inside
-    ``~/.gemini``).
+    claimed iff *at least one* family detector accepted it. Since P1-4, a
+    nested cross-family subtree is pruned from the enclosing family's walk
+    *before* listing (see :func:`_reserved_subtrees_by_owner`), so the same
+    file is no longer walked twice under different families; the settle-last
+    order remains as the safety net for the overlaps pruning does not cover
+    (roots shared exactly by two families, alias keys walking the same root).
 
     ``claimed`` is the number of distinct files accepted by >= 1 family.
     ``unclaimed`` holds the files no family accepted, one entry each; its
@@ -300,8 +310,79 @@ def _file_identity(path: Path) -> str:
     return os.path.normcase(str(path.resolve()))
 
 
-def _walk(root: Path, *, family: str | None = None) -> list[Path]:
-    """Bounded recursive file listing (no symlinks/junctions)."""
+def _normalized_root(path: Path) -> Path:
+    """Case/separator-normalized absolute path for containment comparisons.
+
+    Unlike :func:`_file_identity` this never calls ``resolve()``: the walk
+    yields paths under the root *as given*, so both sides of the containment
+    check must stay in the same (non-symlink-resolved) spelling. ``abspath``
+    still collapses ``..`` segments; ``normcase`` makes Windows case- and
+    slash-insensitive.
+    """
+    return Path(os.path.normcase(os.path.abspath(str(path))))
+
+
+def _reserved_subtrees_by_owner(
+    effective: dict[str, tuple[Path, ...]],
+) -> dict[str, frozenset[Path]]:
+    """Owner family -> candidate roots of *other* families nested inside its own.
+
+    P1-4 (audit): one source file must be claimed by at most one family. When
+    family B's root sits strictly inside family A's root (antigravity inside
+    gemini, no names hardcoded), the subtree is reserved for B: A's walk prunes
+    it before listing, instead of the two scans both claiming the same native
+    file into two stage slots (two canonical ids for one session).
+
+    Alias keys are resolved to their owner first, so a root shared by an alias
+    and its owner (vscode-copilot/copilot) is one owner, never excluded; and
+    roots nested within the *same* owner (codex sessions/archived_sessions,
+    zcode cli/db inside cli) are untouched — the per-family ``seen`` dedup
+    already keeps those single-claim. Computed from the effective roots on
+    every :func:`discover_client_sources` call, so ``PK_CLIENT_ROOT_*``
+    overrides participate on equal terms with the defaults.
+    """
+    owner_roots: dict[str, set[Path]] = {}
+    for family, paths in effective.items():
+        try:
+            owner = resolve_family(family)
+        except KeyError:
+            # Unregistered family: every probe dies in detect_family
+            # (probe_error path) and nothing is ever claimed, so there is no
+            # claim to protect and nothing to reserve against.
+            continue
+        owner_roots.setdefault(owner, set()).update(
+            _normalized_root(p) for p in paths
+        )
+    reserved: dict[str, set[Path]] = {}
+    for owner, owner_roots_ in owner_roots.items():
+        excluded: set[Path] = set()
+        for root in owner_roots_:
+            for other, other_roots in owner_roots.items():
+                if other == owner:
+                    continue
+                for candidate in other_roots:
+                    # Strictly nested only: two families sharing the exact
+                    # same root keep today's behavior (each detector decides).
+                    if candidate != root and candidate.is_relative_to(root):
+                        excluded.add(candidate)
+        if excluded:
+            reserved[owner] = frozenset(excluded)
+    return reserved
+
+
+def _walk(
+    root: Path,
+    *,
+    family: str | None = None,
+    exclude: frozenset[Path] = frozenset(),
+) -> list[Path]:
+    """Bounded recursive file listing (no symlinks/junctions).
+
+    ``exclude`` holds normalized roots of *other* families nested inside
+    ``root`` (see :func:`_reserved_subtrees_by_owner`): os.walk never descends
+    into them, so the enclosing family's scan stops at the subtree boundary
+    instead of claiming another family's files (P1-4).
+    """
     gemini_tmp = family == "gemini"
     skip = SKIP_DIR_NAMES - {"tmp"} if gemini_tmp else SKIP_DIR_NAMES
     out: list[Path] = []
@@ -317,6 +398,11 @@ def _walk(root: Path, *, family: str | None = None) -> list[Path]:
                 allowed = [d for d in allowed if d == "chats"]
             elif len(after) >= 2:
                 allowed = []
+        if exclude:
+            allowed = [
+                d for d in allowed
+                if _normalized_root(Path(dirpath) / d) not in exclude
+            ]
         dirnames[:] = allowed
         for name in filenames:
             candidate = Path(dirpath) / name
@@ -352,9 +438,15 @@ def discover_client_sources(
     settled at the end, so a file rejected by a family whose root merely
     encloses another family's root still lands under the family that accepted
     it.
+
+    Cross-family nesting is resolved *before* any detector runs (P1-4): a root
+    of family B strictly inside a root of family A reserves that subtree for B,
+    and A's walk prunes it (see :func:`_reserved_subtrees_by_owner`), so the
+    same source file can no longer surface in two families' results.
     """
     effective = roots if roots is not None else FAMILY_CLIENT_ROOTS
     found: dict[str, list[Path]] = {}
+    reserved = _reserved_subtrees_by_owner(effective)
     # 台账按解析后的绝对路径全局去重：别名家族（vscode-copilot → copilot）与属主
     # 共享同一 root，同一批文件不能算两遍。返回值保持原样（别名键另有消费者）。
     track = ledger is not None
@@ -367,6 +459,12 @@ def discover_client_sources(
     # found[family] 走，跨家族重复在分解侧是真实存在的）。
     accepted_by_owner: dict[str, set[str]] = {}
     for family, root_paths in effective.items():
+        # 未登记家族的每个文件都走 probe_error 分支，没有可保护的认领；
+        # resolve_family 的 KeyError 在这里只影响剪枝，不影响逐文件流程。
+        try:
+            exclude: frozenset[Path] = reserved.get(resolve_family(family), frozenset())
+        except KeyError:
+            exclude = frozenset()
         matches: list[Path] = []
         seen: set[str] = set()
         for root in root_paths:
@@ -374,7 +472,7 @@ def discover_client_sources(
                 continue
             if track:
                 ledger.scanned_roots += 1
-            for file_path in _walk(root, family=family):
+            for file_path in _walk(root, family=family, exclude=exclude):
                 identity = _file_identity(file_path)
                 if identity in seen:
                     # 同一家族的第二个 root 嵌套在第一个里面（zcode：先直取

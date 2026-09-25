@@ -780,3 +780,124 @@ def test_nested_cross_family_root_is_claimed_by_the_accepting_family(
     # 台账只增可见性：不传 ledger 的结果逐比特一致。
     plain = discover_client_sources(roots)
     assert plain == found
+
+
+# ------------------- P1-4：跨家族嵌套 root 在扫描阶段就让位（更具体家族优先）
+#
+# audit P1-4：gemini 的根 ``~/.gemini`` 包着 antigravity 的根
+# ``~/.gemini/antigravity``。修复前 gemini 的 walk 会走进 antigravity 子树，
+# 凡是 gemini 形状的 ``.json``（顶层 ``messages`` 列表）都被 gemini 探测器
+# 认领并 stage 到 ``<mirror>/gemini/...``；同一批文件在真实布局里与
+# antigravity 的 slot 并存 → 同一会话两个 canonical id（cs|gemini|X 与
+# cs|antigravity|X），投影与检索层双份，任何塌缩机制都不生效。
+# 修复后按「候选根之间的路径包含关系」通用判定：子树归更具体的家族，
+# 外层家族的 walk 在下探前剪枝——在 stage 之前就消除跨家族重复。
+
+
+def _write_gemini_chat(root: Path, project: str, name: str) -> Path:
+    """最小 gemini 会话文件（tmp/<project>/chats/session-*.json 形状）。"""
+    path = root / "tmp" / project / "chats" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"messages": []}), encoding="utf-8")
+    return path
+
+
+def test_p1_4_nested_subtree_is_not_claimed_by_the_enclosing_family(
+    tmp_path: Path,
+) -> None:
+    """嵌套子树里的文件不得被外层家族列出或认领；外层自己的文件照旧。"""
+    from personal_knowledge.adapters.conversation_sources.discovery import (
+        DiscoveryLedger,
+    )
+
+    gemini_root = tmp_path / "home" / ".gemini"
+    nested = gemini_root / "antigravity"
+    # 刻意造成 gemini 形状：修复前 gemini 的探测器会接受它（red 基准）。
+    hijacked = _write_gemini_chat(nested, "proj", "session-x.json")
+    # 对照：gemini 自己的会话文件不受剪枝影响。
+    own = _write_gemini_chat(gemini_root, "proj", "session-own.json")
+    assert hijacked.relative_to(gemini_root).parts[:1] == ("antigravity",)
+
+    roots = {"gemini": (gemini_root,), "antigravity": (nested,)}
+    ledger = DiscoveryLedger()
+    found = discover_client_sources(roots, ledger=ledger)
+
+    # 嵌套子树归 antigravity：gemini 不再列出/认领它（它的探测器对 JSON
+    # 本来就不接受，所以两个家族的 found 里都不该出现）。
+    assert hijacked not in found["gemini"]
+    assert hijacked not in found["antigravity"]
+    assert own in found["gemini"]
+
+    # 台账：候选只剩 gemini 自己的文件，嵌套文件不再进 gemini 的
+    # not_this_family 桶（修复前 candidates == 2）。
+    assert ledger.candidates == 1
+    assert ledger.claimed == 1
+    assert ledger.claimed_by_family == {"gemini": 1}
+    assert ledger.unclaimed == []
+
+    # 台账只增可见性：不传 ledger 的结果逐比特一致。
+    assert discover_client_sources(roots) == found
+
+
+def test_p1_4_stage_lands_nested_cross_family_file_in_one_slot(
+    tmp_path: Path,
+) -> None:
+    """stage 层面：嵌套子树文件不得落进外层家族的 slot 树。"""
+    gemini_root = tmp_path / "home" / ".gemini"
+    nested = gemini_root / "antigravity"
+    _write_gemini_chat(nested, "proj", "session-x.json")
+    own = _write_gemini_chat(gemini_root, "proj", "session-own.json")
+
+    report = stage_client_sources(
+        roots={"gemini": (gemini_root,), "antigravity": (nested,)},
+        stage_root=tmp_path / "stage",
+    )
+
+    # gemini slot 只有自己的文件（修复前 hijacked 会以
+    # antigravity/tmp/... 前缀混进 gemini slot）。
+    assert report["families"]["gemini"]["staged_paths"] == [
+        own.relative_to(gemini_root).as_posix()
+    ]
+    assert not (tmp_path / "stage" / "gemini" / "antigravity").exists()
+    assert (tmp_path / "stage" / "gemini" / own.relative_to(gemini_root)).is_file()
+
+
+def test_p1_4_identical_roots_across_families_keep_detector_verdicts(
+    tmp_path: Path,
+) -> None:
+    """两个家族共享完全相同的 root：不是嵌套，不剪枝，探测器各自裁决。
+
+    守住「严格嵌套才让位」的边界——防止实现把 >= 写成 >（同根也剪）导致
+    属主家族丢文件。
+    """
+    shared = tmp_path / "shared"
+    chat = _write_gemini_chat(shared, "proj", "session-x.json")
+    roots = {"gemini": (shared,), "antigravity": (shared,)}
+    found = discover_client_sources(roots=roots)
+    assert chat in found["gemini"]
+
+
+def test_p1_4_env_override_roots_participate_in_nesting(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """PK_CLIENT_ROOT_* 覆盖出来的嵌套根同样参与让位判定。
+
+    嵌套判定按有效根的路径包含关系逐次计算，不读 import 期常量——所以
+    override 把 antigravity 指进 gemini 树内部时，剪枝照样生效。
+    """
+    home = tmp_path / "home"
+    gemini_root = home / ".gemini"
+    nested = gemini_root / "antigravity"
+    hijacked = _write_gemini_chat(nested, "proj", "session-x.json")
+    own = _write_gemini_chat(gemini_root, "proj", "session-own.json")
+
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("PK_CLIENT_ROOT_ANTIGRAVITY", str(nested))
+    # 只取涉及的两个家族：真实机器上的其他根不进本测试。
+    defaults = discovery._default_roots()
+    roots = {k: defaults[k] for k in ("gemini", "antigravity")}
+    assert nested.resolve() in roots["antigravity"]
+
+    found = discover_client_sources(roots=roots)
+    assert hijacked not in found["gemini"]
+    assert own in found["gemini"]
