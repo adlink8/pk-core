@@ -1,4 +1,4 @@
-"""grok 家族（生产模块 ``grok``，ADAPTER_VERSION 1.4.0）适配契约。
+"""grok 家族（生产模块 ``grok``，ADAPTER_VERSION 1.4.1）适配契约。
 
 公开 seam 是 registry（``adapt_for`` / ``detect_family``）——生产代码只经它
 调用家族模块，所以断言也走同一入口，不直接摸 ``grok.adapt``。夹具来自
@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -491,3 +492,287 @@ class TestGrokSessionKeyFallback:
         # 单用 parent.name 的旧兜底会把两把键都算成 ``sessions``。
         assert ids_per_path[0] != ids_per_path[1]
         assert all(id_ != "sessions" for ids in ids_per_path for id_ in ids)
+
+
+# ------------------------------------------------ 重复原生 id 消歧（P1-17a）
+# 事件 id 是 (family, artifact, native_id) 内容寻址且不含 kind 域：tool_call
+# 原生 id 复用会折叠成重复事件 id，AdaptationResult 直接拒收整份会话；旧的
+# ``pending_calls[call_id] = ...`` 还会静默覆盖首对映射。任何输入都不得抛
+# duplicate event id——重复 id 按出现顺序追加确定性序号后缀，首个映射保留。
+
+
+class TestGrokDuplicateNativeIds:
+    @staticmethod
+    def _adapt_chat(tmp_path: Path, chat_text: str):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "chat_history.jsonl").write_text(chat_text, encoding="utf-8")
+        _manifest, captured = artifacts.captured_directory(
+            src, tmp_path, include_relative=("chat_history.jsonl",),
+            byte_limit=1_000_000, count_limit=8,
+        )
+        return registry.adapt_for(
+            "grok", SourceArtifactSet(artifacts=captured),
+            artifact_root=tmp_path / "artifacts",
+        )
+
+    def test_duplicate_call_ids_across_rows_both_emit_events(self, tmp_path: Path):
+        """跨行复用同一 tool_call id：两个 call 都有事件，会话不再整体失败。"""
+        row1 = {"type": "assistant", "id": "a1", "content": "one",
+                "tool_calls": [{"id": "call-dup", "name": "read_file", "arguments": "{}"}]}
+        tr1 = {"type": "tool_result", "id": "tr-1",
+               "tool_call_id": "call-dup", "content": "first"}
+        row2 = {"type": "assistant", "id": "a2", "content": "two",
+                "tool_calls": [{"id": "call-dup", "name": "read_file", "arguments": "{}"}]}
+        tr2 = {"type": "tool_result", "id": "tr-2",
+               "tool_call_id": "call-dup", "content": "second"}
+        text = "\n".join(json.dumps(r) for r in (row1, tr1, row2, tr2)) + "\n"
+
+        result = self._adapt_chat(tmp_path, text)
+
+        calls = [e for e in result.events if e.kind is EventKind.TOOL_CALL]
+        assert len(calls) == 2
+        assert len({e.event_id for e in calls}) == 2
+        results = [e for e in result.events if e.kind is EventKind.TOOL_RESULT]
+        assert len(results) == 2
+        linked = [
+            r for r in result.relations if r.relation_kind is RelationKind.CALL_RESULT
+        ]
+        assert len(linked) == 2
+        # 两次结果都回链到首个 call 事件：配对不丢失、也不指向不存在的 call。
+        assert {r.source_event_id for r in linked} == {calls[0].event_id}
+        assert any("duplicate tool_call id" in w for w in result.warnings)
+
+    def test_duplicate_call_ids_within_one_row_both_emit_events(self, tmp_path: Path):
+        row = {"type": "assistant", "id": "a1", "content": "two calls same id",
+               "tool_calls": [
+                   {"id": "call-dup", "name": "read_file", "arguments": "{}"},
+                   {"id": "call-dup", "name": "write_file", "arguments": "{}"},
+               ]}
+
+        result = self._adapt_chat(tmp_path, json.dumps(row) + "\n")
+
+        calls = [e for e in result.events if e.kind is EventKind.TOOL_CALL]
+        assert len(calls) == 2
+        assert len({e.event_id for e in calls}) == 2
+        # 消歧保序：首次出现保留裸 id，重复出现带确定性序号后缀。
+        assert calls[0].provenance.native_event_id == "call-dup"
+        assert (calls[1].provenance.native_event_id or "").startswith("call-dup#")
+
+    def test_row_id_and_call_id_sharing_one_string_do_not_collide(self, tmp_path: Path):
+        """事件 id 域不含 kind：行 id 与 call id 撞串也必须消歧，不得抛。"""
+        row = {"type": "assistant", "id": "same-id", "content": "row",
+               "tool_calls": [{"id": "same-id", "name": "read_file", "arguments": "{}"}]}
+        follow = {"type": "assistant", "id": "same-id", "content": "again"}
+
+        result = self._adapt_chat(
+            tmp_path, json.dumps(row) + "\n" + json.dumps(follow) + "\n"
+        )
+
+        assert len({e.event_id for e in result.events}) == len(result.events)
+
+    def test_duplicate_subagent_ids_do_not_crash(self, tmp_path: Path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "subagents.json").write_text(
+            json.dumps([
+                {"id": "sub-dup", "name": "a"},
+                {"id": "sub-dup", "name": "b"},
+            ]),
+            encoding="utf-8",
+        )
+        _manifest, captured = artifacts.captured_directory(
+            src, tmp_path, include_relative=("subagents.json",),
+            byte_limit=1_000_000, count_limit=4,
+        )
+        result = registry.adapt_for(
+            "grok", SourceArtifactSet(artifacts=captured),
+            artifact_root=tmp_path / "artifacts",
+        )
+
+        subs = [e for e in result.events if e.kind is EventKind.SUBAGENT_BOUNDARY]
+        assert len(subs) == 2
+        assert len({e.event_id for e in subs}) == 2
+        assert any(
+            "subagents.json" in w and "duplicate" in w for w in result.warnings
+        )
+
+
+# ------------------------------------------------ 坏行计数上报（P1-17b 回归）
+# JSONL 里的坏行（非法 JSON / 合法 JSON 但非对象）解析继续，但必须以 warnings
+# 计数上报，不允许静默吞掉。
+
+
+class TestGrokJsonlBadLineAccounting:
+    @staticmethod
+    def _capture_one(tmp_path: Path, name: str, text: str):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / name).write_text(text, encoding="utf-8")
+        _manifest, captured = artifacts.captured_directory(
+            src, tmp_path, include_relative=(name,),
+            byte_limit=1_000_000, count_limit=8,
+        )
+        return registry.adapt_for(
+            "grok", SourceArtifactSet(artifacts=captured),
+            artifact_root=tmp_path / "artifacts",
+        )
+
+    def test_chat_history_bad_lines_are_counted_in_warnings(self, tmp_path: Path):
+        lines = [
+            json.dumps({"type": "user", "id": "u1", "content": "ok"}),
+            "{not valid json",
+            json.dumps([1, 2, 3]),
+            json.dumps({"type": "assistant", "id": "a1", "content": "fine"}),
+            "",
+        ]
+        result = self._capture_one(
+            tmp_path, "chat_history.jsonl", "\n".join(lines) + "\n"
+        )
+
+        msgs = [
+            e for e in result.events
+            if e.kind in (EventKind.USER_MESSAGE, EventKind.ASSISTANT_MESSAGE)
+        ]
+        assert len(msgs) == 2, "好行必须照常解析，坏行只跳过不中断"
+        assert any(
+            "chat_history.jsonl" in w and "skipped 2 malformed" in w
+            for w in result.warnings
+        )
+
+    def test_events_jsonl_bad_lines_are_counted_in_warnings(self, tmp_path: Path):
+        lines = [
+            json.dumps({"ts": "2026-07-01T10:00:00Z", "type": "phase_changed"}),
+            "]{ broken",
+        ]
+        result = self._capture_one(tmp_path, "events.jsonl", "\n".join(lines) + "\n")
+
+        native_rows = [
+            e for e in result.events
+            if (e.provenance.native_locator or "").startswith("events.jsonl#")
+        ]
+        assert len(native_rows) == 1
+        assert any(
+            "events.jsonl" in w and "skipped 1 malformed" in w
+            for w in result.warnings
+        )
+
+
+# ------------------------------------------ 时间戳全类型归一（P2 回归）
+# 原生 ts 可能是 ISO 字符串、epoch 秒（10 位整型）或 epoch 毫秒（13 位整型）。
+# 旧实现只认 str：整型 ts 一律丢弃成 None，epoch 秒更是 normalize_timestamp
+# 的盲区。归一后必须全部落到 canonical UTC ``...Z``。
+
+
+def _iso_ts(seconds: int, millis: int = 0) -> str:
+    dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    base = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return base if not millis else base[:-1] + f".{millis:03d}Z"
+
+
+TS_SECONDS = 1751300000
+TS_MILLIS = 1751300000123
+
+
+class TestGrokTimestampNormalization:
+    @staticmethod
+    def _capture(tmp_path: Path, include_relative, files: dict[str, str]):
+        src = tmp_path / "src"
+        src.mkdir()
+        for name, text in files.items():
+            (src / name).write_text(text, encoding="utf-8")
+        _manifest, captured = artifacts.captured_directory(
+            src, tmp_path, include_relative=include_relative,
+            byte_limit=1_000_000, count_limit=8,
+        )
+        return registry.adapt_for(
+            "grok", SourceArtifactSet(artifacts=captured),
+            artifact_root=tmp_path / "artifacts",
+        )
+
+    def test_events_jsonl_integer_timestamps_are_normalized(self, tmp_path: Path):
+        rows = [
+            {"ts": TS_SECONDS, "type": "phase_changed"},
+            {"ts": TS_MILLIS, "type": "tool_started"},
+        ]
+        result = self._capture(
+            tmp_path, ("events.jsonl",),
+            {"events.jsonl": "\n".join(json.dumps(r) for r in rows) + "\n"},
+        )
+
+        occurred = sorted(
+            e.occurred_at for e in result.events
+            if (e.provenance.native_locator or "").startswith("events.jsonl#")
+        )
+        assert occurred == sorted([
+            _iso_ts(TS_SECONDS), _iso_ts(TS_SECONDS, 123),
+        ])
+
+    def test_summary_json_integer_timestamps_are_normalized(self, tmp_path: Path):
+        doc = {
+            "info": {"id": "ts-native-1"},
+            "created_at": TS_SECONDS,
+            "updated_at": TS_MILLIS,
+        }
+        result = self._capture(
+            tmp_path, ("summary.json",),
+            {"summary.json": json.dumps(doc)},
+        )
+
+        session = result.sessions[0]
+        assert session.started_at == _iso_ts(TS_SECONDS)
+        assert session.ended_at == _iso_ts(TS_SECONDS, 123)
+        lifecycle = next(
+            e for e in result.events if e.kind is EventKind.SESSION_LIFECYCLE
+        )
+        assert lifecycle.occurred_at == _iso_ts(TS_SECONDS)
+
+    def test_chat_row_integer_timestamp_is_normalized(self, tmp_path: Path):
+        row = {"type": "user", "id": "u1", "content": "x", "timestamp": TS_SECONDS}
+        result = self._capture(
+            tmp_path, ("chat_history.jsonl",),
+            {"chat_history.jsonl": json.dumps(row) + "\n"},
+        )
+
+        user = next(e for e in result.events if e.kind is EventKind.USER_MESSAGE)
+        assert user.occurred_at == _iso_ts(TS_SECONDS)
+
+
+# ------------------------------------- detect 流式探测窗口（P2 回归）
+# 旧实现 ``read_text(...)[:16384]`` 把整份 transcript 全量载入内存再截断；
+# 大文件（多 MB）在 discovery 扫描时每个候选都白付一次全量读。探测必须
+# 流式分块只读前 16K。
+
+
+class TestGrokDetectStreamingWindow:
+    @staticmethod
+    def _capture_chat(tmp_path: Path, text: str):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "chat_history.jsonl").write_text(text, encoding="utf-8")
+        _manifest, captured = artifacts.captured_directory(
+            src, tmp_path, include_relative=("chat_history.jsonl",),
+            byte_limit=10_000_000, count_limit=8,
+        )
+        return captured[0]
+
+    def test_large_file_detect_streams_without_full_read(self, tmp_path, monkeypatch):
+        big = (
+            json.dumps({"type": "system", "content": "preamble " * 20000}) + "\n"
+            + json.dumps({"type": "user", "content": "tail"})
+        )
+        chat = self._capture_chat(tmp_path, big)
+
+        def _no_full_read(self, *args, **kwargs):
+            raise AssertionError("detect 不得整文件 read_text（流式探测窗口）")
+
+        monkeypatch.setattr(Path, "read_text", _no_full_read)
+        assert registry.detect_family(
+            "grok", chat, artifact_root=tmp_path / "artifacts"
+        ) is True
+
+    def test_markers_beyond_16k_window_do_not_match(self, tmp_path):
+        chat = self._capture_chat(tmp_path, "x" * 20000 + '"type":"user"')
+        assert registry.detect_family(
+            "grok", chat, artifact_root=tmp_path / "artifacts"
+        ) is False

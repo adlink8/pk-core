@@ -23,6 +23,9 @@ from personal_knowledge.adapters.conversation_sources.agentsview_pathless import
     adapt_pathless_observation,
     is_agentsview_store,
 )
+from personal_knowledge.adapters.conversation_sources.time_utils import (
+    normalize_timestamp,
+)
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
     EventContractError,
@@ -42,7 +45,9 @@ from personal_knowledge.core.conversation_events import (
 FAMILY = "grok"
 # 1.3.0：detect 变为对畸形字节全函数（非 UTF-8 返回 False 而非抛），
 # 探测器行为变了 → capability digest 变。
-ADAPTER_VERSION = "1.4.0"
+# 1.4.1：重复原生 id 确定性消歧、坏 JSONL 行计数上报、时间戳全类型归一、
+# detect 流式读探测窗口——适配输出语义变了，版本号如实跟进。
+ADAPTER_VERSION = "1.4.1"
 CONTRACT_VERSION = "2"
 
 # Native ``chat_history.jsonl`` record type -> canonical event kind.
@@ -139,7 +144,19 @@ def detect(artifact: SourceArtifact, *, artifact_root: Path) -> bool:
     ):
         return False
     try:
-        head = artifact_bytes_path(artifact_root, artifact).read_text(encoding="utf-8")[:16384]
+        # 流式分块读探测窗口（P2）：旧实现 ``read_text(...)[:16384]`` 会把整份
+        # transcript 全量载入内存再截断，多 MB 的会话文件在 discovery 扫描时
+        # 每个候选都白付一次全量读。这里按小块滚动只保留前 16384 个字符。
+        parts: list[str] = []
+        remaining = 16384
+        with artifact_bytes_path(artifact_root, artifact).open("r", encoding="utf-8") as handle:
+            while remaining > 0:
+                piece = handle.read(min(2048, remaining))
+                if not piece:
+                    break
+                parts.append(piece)
+                remaining -= len(piece)
+        head = "".join(parts)
     except (OSError, ValueError):
         # ValueError 覆盖 UnicodeDecodeError：非 UTF-8 字节的 transcript 必须判为
         # 「不是我」，不得把解析异常抛给发现层（会被记成 probe_error）。
@@ -182,12 +199,19 @@ def _event(artifact, *, session_id, kind, locator, native_id=None, occurred_at=N
     )
 
 
-def _read_jsonl_blob(root: Path, artifact: SourceArtifact) -> list[dict]:
+def _read_jsonl_blob(root: Path, artifact: SourceArtifact) -> tuple[list[dict], int]:
+    """Read a JSONL blob, returning ``(dict rows, skipped line count)``.
+
+    坏行（非法 JSON / 合法 JSON 但不是对象）跳过但**计数**：解析继续、绝不
+    fail-closed 整个文件，但丢行是保真度损失，必须经 warnings 上报而不是
+    静默吞掉（P1-17b）。
+    """
     try:
         text = (root / artifact.content_hash[:32]).read_text(encoding="utf-8")
     except OSError:
-        return []
-    rows = []
+        return [], 0
+    rows: list[dict] = []
+    skipped = 0
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -195,10 +219,48 @@ def _read_jsonl_blob(root: Path, artifact: SourceArtifact) -> list[dict]:
         try:
             obj = json.loads(line)
         except ValueError:
+            skipped += 1
             continue
         if isinstance(obj, dict):
             rows.append(obj)
-    return rows
+        else:
+            skipped += 1
+    return rows, skipped
+
+
+# 与 time_utils 一致的毫秒判定下限：13 位以上才是毫秒，10 位 epoch 秒落在
+# (0, 1e12) 区间，normalize_timestamp 对它有盲区（会原样 str 保留），本文件
+# 内补预处理。
+_EPOCH_MS_FLOOR = 1_000_000_000_000
+
+
+def _normalize_ts(value) -> str | None:
+    """归一 Grok 全部原生时间戳到 canonical UTC ``...Z``。
+
+    接受 ISO-8601 字符串、epoch 秒（int/float）与 epoch 毫秒（int/float）。
+    ``normalize_timestamp`` 把整型一律按毫秒判定，10 位 epoch 秒会漏成数字
+    字符串；这里对落在 (0, 1e12) 的数值先按秒换算成毫秒再委托共享 seam。
+    """
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0 < value < _EPOCH_MS_FLOOR
+    ):
+        return normalize_timestamp(int(value) * 1000)
+    return normalize_timestamp(value)
+
+
+def _disambiguate(seen: dict[str, int], native_id: str) -> str:
+    """确定性消歧：同一原生 id 第 N 次复用时追加 ``#N``，首次保留裸 id。
+
+    事件 id 是 (family, artifact, native_id) 内容寻址的且不含 kind 域，任何
+    原生 id 复用（reasoning 行、tool_call id、subagent id……）都会折叠成
+    重复事件并让 AdaptationResult 拒收整份会话。按出现顺序追加序号，重放
+    同一输入得到同一结果。
+    """
+    repeat = seen.get(native_id, 0)
+    seen[native_id] = repeat + 1
+    return f"{native_id}#{repeat}" if repeat else native_id
 
 
 def _flatten_content(value) -> str | None:
@@ -343,7 +405,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         events.append(_event(
             summary_json, session_id=session_id, kind=EventKind.SESSION_LIFECYCLE,
             locator=f"{summary_json.relative_path}#info", native_id=native_session,
-            occurred_at=doc.get("created_at"), native_session=native_session,
+            occurred_at=_normalize_ts(doc.get("created_at")), native_session=native_session,
         ))
         if doc.get("session_summary"):
             events.append(_event(
@@ -351,7 +413,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 kind=EventKind.COMPACTION_SUMMARY,
                 locator=f"{summary_json.relative_path}#session_summary",
                 native_id=f"{native_session}:summary",
-                occurred_at=doc.get("updated_at"),
+                occurred_at=_normalize_ts(doc.get("updated_at")),
                 summary=str(doc.get("session_summary"))[:2048],
                 fidelity=_fidelity(
                     CONTENT_AVAILABILITY=FidelityLevel.PARTIAL,
@@ -364,24 +426,32 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     chat = by_path.get("chat_history.jsonl")
     if chat is not None:
         # Native tool-call id -> emitted TOOL_CALL event id, so a later
-        # tool_result can be linked back to the call it answers.
+        # tool_result can be linked back to the call it answers. Repeated
+        # native call ids keep the FIRST mapping (P1-17a): the duplicate call
+        # still emits its own disambiguated event, but a later tool_result can
+        # only be paired with one canonical call event.
         pending_calls: dict[str, str] = {}
         # Grok reuses one native reasoning id across several distinct rows of a
         # session (observed: a single ``rs_...`` id on 10 separate reasoning
         # rows). Event ids are content-addressed per (artifact, native id) and
         # exclude the event kind, so a reused id would collapse distinct rows
         # into duplicate events and fail the contract. Disambiguate repeats
-        # positionally; the first occurrence keeps the bare native id.
+        # positionally; the first occurrence keeps the bare native id. The
+        # counter is shared between row ids and tool-call ids: the event
+        # identity ignores kind, so an ``id`` string reused across those
+        # namespaces must collide-proof too.
         seen_native: dict[str, int] = {}
-        for index, row in enumerate(_read_jsonl_blob(artifact_root, chat)):
+        chat_rows, chat_skipped = _read_jsonl_blob(artifact_root, chat)
+        if chat_skipped:
+            warnings.append(
+                f"chat_history.jsonl: skipped {chat_skipped} malformed or "
+                "non-object line(s)"
+            )
+        for index, row in enumerate(chat_rows):
             rtype = str(row.get("type") or row.get("role") or "")
             locator = f"chat_history.jsonl#{index}"
-            native_id = str(row.get("id") or f"row-{index}")
-            repeat = seen_native.get(native_id, 0)
-            seen_native[native_id] = repeat + 1
-            if repeat:
-                native_id = f"{native_id}#{repeat}"
-            occurred_at = row.get("timestamp")
+            native_id = _disambiguate(seen_native, str(row.get("id") or f"row-{index}"))
+            occurred_at = _normalize_ts(row.get("timestamp"))
             kind = _RECORD_KINDS.get(rtype)
             if kind is None:
                 events.append(_event(chat, session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
@@ -437,17 +507,27 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                     ))
             # An assistant turn may carry any number of tool invocations; each
             # becomes its own typed event so call/result pairing survives.
+            # Repeated native call ids (P1-17a) get a deterministic positional
+            # suffix so every call still emits its own event instead of
+            # collapsing into a duplicate event id that rejects the session.
             for call_index, call in enumerate(row.get("tool_calls") or []):
                 if not isinstance(call, dict):
                     continue
                 call_id = str(call.get("id") or f"{native_id}:call:{call_index}")
+                call_native_id = _disambiguate(seen_native, call_id)
                 call_event = _event(chat, session_id=session_id, kind=EventKind.TOOL_CALL,
                                     locator=f"{locator}#tool_call:{call_index}",
-                                    native_id=call_id, occurred_at=occurred_at,
+                                    native_id=call_native_id, occurred_at=occurred_at,
                                     content=_tool_call_text(call),
                                     native_session=native_session)
                 events.append(call_event)
-                pending_calls[call_id] = call_event.event_id
+                if call_id in pending_calls:
+                    warnings.append(
+                        f"chat_history.jsonl: duplicate tool_call id {call_id!r} "
+                        "disambiguated; result linkage keeps the first call event"
+                    )
+                else:
+                    pending_calls[call_id] = call_event.event_id
             usage_summary = _row_usage_summary(row)
             if usage_summary:
                 events.append(_event(
@@ -466,7 +546,12 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     # not a silent drop.
     events_artifact = by_path.get("events.jsonl")
     if events_artifact is not None:
-        for index, row in enumerate(_read_jsonl_blob(artifact_root, events_artifact)):
+        event_rows, event_skipped = _read_jsonl_blob(artifact_root, events_artifact)
+        if event_skipped:
+            warnings.append(
+                f"events.jsonl: skipped {event_skipped} malformed or non-object line(s)"
+            )
+        for index, row in enumerate(event_rows):
             native_type = row.get("type")
             type_name = native_type if isinstance(native_type, str) and native_type else ""
             locator = f"events.jsonl#{index}"
@@ -476,12 +561,12 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 if type_name
                 else "events.jsonl record has no type"
             )
-            occurred = row.get("ts")
+            occurred = _normalize_ts(row.get("ts"))
             event = _event(
                 events_artifact, session_id=session_id,
                 kind=EventKind.UNKNOWN_NATIVE,
                 locator=locator, native_id=native_id,
-                occurred_at=occurred if isinstance(occurred, str) else None,
+                occurred_at=occurred,
                 fidelity=_fidelity(
                     STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
                     RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
@@ -536,12 +621,20 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             sub_doc = []
         subs = sub_doc if isinstance(sub_doc, list) else sub_doc.get("subagents", [])
         parent = next((e for e in events if e.kind is EventKind.SESSION_LIFECYCLE), None)
+        # 复用的 subagent id 同样会折叠成重复事件 id（P1-17a），按出现顺序消歧。
+        seen_sub_ids: dict[str, int] = {}
         for index, sub in enumerate(subs if isinstance(subs, list) else []):
             if not isinstance(sub, dict):
                 continue
+            raw_sub_id = str(sub.get("id") or f"sub-{index}")
+            sub_id = _disambiguate(seen_sub_ids, raw_sub_id)
+            if sub_id != raw_sub_id:
+                warnings.append(
+                    f"subagents.json: duplicate subagent id {raw_sub_id!r} disambiguated"
+                )
             ev = _event(sub_artifact, session_id=session_id, kind=EventKind.SUBAGENT_BOUNDARY,
-                        locator=f"subagents.json#{index}", native_id=sub.get("id") or f"sub-{index}",
-                        occurred_at=sub.get("created_at"),
+                        locator=f"subagents.json#{index}", native_id=sub_id,
+                        occurred_at=_normalize_ts(sub.get("created_at")),
                         summary=str(sub.get("name") or sub.get("task") or "")[:256] or None,
                         native_session=native_session)
             events.append(ev)
@@ -582,8 +675,8 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 ),
             ),
             native_session_id=native_session,
-            started_at=doc.get("created_at") if isinstance(doc, dict) else None,
-            ended_at=doc.get("updated_at") if isinstance(doc, dict) else None,
+            started_at=_normalize_ts(doc.get("created_at")) if isinstance(doc, dict) else None,
+            ended_at=_normalize_ts(doc.get("updated_at")) if isinstance(doc, dict) else None,
             cwd=_grok_cwd(info),
             model=_grok_model(doc, info, artifact_root, chat),
             git_branch=_grok_branch(info, doc),
@@ -676,7 +769,7 @@ def _grok_model(doc: dict, info: dict, artifact_root: Path, chat) -> str | None:
     if chat is None:
         return None
     try:
-        rows = _read_jsonl_blob(artifact_root, chat)
+        rows, _skipped = _read_jsonl_blob(artifact_root, chat)
     except Exception:
         return None
     for row in rows:
