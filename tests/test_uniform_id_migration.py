@@ -256,12 +256,15 @@ def test_plan_and_verify(db):
 def test_adapter_rows_keep_native_addresses(db):
     plan, _ = _plan(db)
     msgs = {r["canonical_message_id"]: r for r in plan.messages}
-    # the locator wins over the native id (codex records the literal
-    # 'agent_message' as a native id, so ids are not address-safe)
-    assert "cm|claude|S-native-1|agent-x.jsonl#L1" in msgs
-    assert "cm|claude|S-native-1|agent-x.jsonl#L2" in msgs
-    assert msgs["cm|claude|S-native-1|agent-x.jsonl#L2"]["content_length"] \
+    # native-id-first family (claude): the reliable client uuid is the
+    # address, so a re-capture through a different mirror path keeps the id
+    assert "cm|claude|S-native-1|uuid-u1" in msgs
+    assert "cm|claude|S-native-1|uuid-a1" in msgs
+    assert msgs["cm|claude|S-native-1|uuid-a1"]["content_length"] \
         == len("hi there")
+    # locator-first family (codex): the native id is not address-safe (the
+    # adapter records the literal 'agent_message'), so the locator wins
+    assert "cm|codex|C-native-1|rollout-c.jsonl#L4" in msgs
 
 
 def test_address_precedence():
@@ -274,6 +277,31 @@ def test_address_precedence():
     assert u._adapter_address("z", {"source_message_ref": "ref-1"}, {},
                               stats) == ("ref-1", "source_message_ref")
     assert u._adapter_address("w", {}, {}, stats) == ("w", "canonical_id_hash")
+    # native-id-first families address messages by their native id
+    assert u._adapter_address("x", {}, {"x": ("uuid-9", "f.jsonl#L12")},
+                              stats, "claude") == ("uuid-9", "native_event_id")
+    # ...but still fall back to the locator when the id is missing
+    assert u._adapter_address("x", {}, {"x": (None, "f.jsonl#L12")},
+                              stats, "claude") == ("f.jsonl#L12", "native_locator")
+    # codex keeps locator-first even when a native id is present
+    assert u._adapter_address("x", {}, {"x": ("agent_message", "r.jsonl#L7")},
+                              stats, "codex") == ("r.jsonl#L7", "native_locator")
+
+
+def test_adapter_address_is_family_aware():
+    nid, loc = "uuid-u1", "mirror-a/agent-x.jsonl#L1"
+    for family in ("claude", "qoder", "zcode", "mimo", "opencode", "pi",
+                   "antigravity", "gemini", "copilot", "workbuddy", "kimi",
+                   "kimi-work"):
+        assert u.adapter_address(nid, loc, family) == nid, family
+        assert u.adapter_address(None, loc, family) == loc, family
+        assert u.adapter_address(nid, None, family) == nid, family
+    # locator-first families and the legacy default signature
+    for family in ("codex", "grok", "chatgpt", "cursor", "", None):
+        assert u.adapter_address(nid, loc, family) == loc, family
+        assert u.adapter_address(nid, None, family) == nid, family
+    # both missing -> empty (the caller falls back to the event id)
+    assert u.adapter_address(None, None, "claude") == ""
 
 
 def test_same_address_two_captures_keeps_newest_only(db):
@@ -281,13 +309,13 @@ def test_same_address_two_captures_keeps_newest_only(db):
     assert problems == []
     rows = [r for r in plan.messages
             if r["canonical_session_id"] == "cs|claude|S-native-1"
-            and r["canonical_message_id"].endswith("agent-x.jsonl#L1")]
+            and r["canonical_message_id"].endswith("uuid-u1")]
     assert len(rows) == 1
     # the active generation's capture wins over the stale one
     assert rows[0]["content_hash"] == "h1"
     m = {old: new for t, old, new in plan.id_map if t == "canonical_messages"}
     stale = u.v2_message_hash("ev1b")
-    assert m[stale] == "cm|claude|S-native-1|agent-x.jsonl#L1"
+    assert m[stale] == "cm|claude|S-native-1|uuid-u1"
 
 
 def test_merged_session_keeps_snapshot_only_content(db):
@@ -375,7 +403,7 @@ def test_apply_roundtrip(tmp_path, db):
         == len(plan.tools)
     row = con.execute(
         "SELECT content, role, ordinal FROM canonical_messages WHERE"
-        " canonical_message_id='cm|claude|S-native-1|agent-x.jsonl#L2'").fetchone()
+        " canonical_message_id='cm|claude|S-native-1|uuid-a1'").fetchone()
     assert (row["content"], row["role"], row["ordinal"]) == ("hi there",
                                                              "assistant", 2)
     assert con.execute("SELECT count(*) FROM id_migration_map").fetchone()[0] \
@@ -704,3 +732,549 @@ def test_projection_dedups_shared_address_keeping_richer_copy():
     # and the id is the origin-derived one
     assert report.messages[0]["canonical_message_id"] == \
         "cm|codex|S1|rollout.jsonl#L10"
+def test_projection_merges_session_copies_of_one_native_session():
+    """Two ce sessions of one native session merge into ONE canonical row.
+
+    ``_project_sessions`` emits one row per ce session and origin-derived ids
+    make every copy of the same native session share a canonical_session_id;
+    the writer keys rows by id, so the last copy used to win wholesale —
+    started_at/ended_at/counts depended on slot-hash order and flipped on
+    every re-capture. The merge keeps started=min, ended=max, counts=max.
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [
+        {"session_id": "ce-a", "family": "codex", "native_session_id": "S1",
+         "started_at": "2026-08-03T02:00:00Z",
+         "ended_at": "2026-08-03T03:00:00Z",
+         "cwd": None, "git_branch": "main", "model": None},
+        {"session_id": "ce-b", "family": "codex", "native_session_id": "S1",
+         "started_at": "2026-08-03T01:30:00Z",
+         "ended_at": "2026-08-03T03:30:00Z",
+         "cwd": "/repo", "git_branch": "main", "model": "gpt-5"},
+    ]
+    event_rows = [
+        # ce-a saw one user turn; ce-b (a later, fuller capture) saw two.
+        {"event_id": "e1", "session_id": "ce-a", "kind": "user_message",
+         "native_event_id": None, "native_locator": "rollout.jsonl#L10",
+         "occurred_at": "2026-08-03T02:10:00Z", "ordinal": 1,
+         "content": "turn one"},
+        {"event_id": "e2", "session_id": "ce-b", "kind": "user_message",
+         "native_event_id": None, "native_locator": "rollout.jsonl#L10",
+         "occurred_at": "2026-08-03T02:10:00Z", "ordinal": 1,
+         "content": "turn one"},
+        {"event_id": "e3", "session_id": "ce-b", "kind": "user_message",
+         "native_event_id": None, "native_locator": "rollout.jsonl#L20",
+         "occurred_at": "2026-08-03T02:20:00Z", "ordinal": 2,
+         "content": "turn two"},
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+
+    sessions = report.sessions
+    assert len(sessions) == 1, sessions
+    row = sessions[0]
+    assert row["canonical_session_id"] == "cs|codex|S1"
+    assert row["started_at"] == "2026-08-03T01:30:00Z"   # min across copies
+    assert row["ended_at"] == "2026-08-03T03:30:00Z"     # max across copies
+    assert row["message_count"] == 2                     # max across copies
+    assert row["user_message_count"] == 2                # max across copies
+    assert row["cwd"] == "/repo"                         # non-empty wins
+    assert row["model"] == "gpt-5"                       # non-empty wins
+    # and the rows stay reproducible on re-computation
+    again = compute_projection("gen-1", session_rows, event_rows)
+    assert again.sessions == sessions
+
+
+def test_projection_keeps_explicit_empty_content_over_summary_copy():
+    """A legitimate ``content=""`` copy must not be overwritten by summary.
+
+    ``""`` is a legitimate tool-only/empty native message (documented in
+    ``_project_messages``). The collapse between same-address copies used to
+    compare bare ``len(content or summary)``, which let the summary fallback
+    prose win over an explicitly empty body. Now an explicit ``content`` —
+    even empty — beats a summary-only copy.
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [
+        {"session_id": "ce-a", "family": "codex", "native_session_id": "S1"},
+        {"session_id": "ce-b", "family": "codex", "native_session_id": "S1"},
+    ]
+    event_rows = [
+        # same address: an older adapter stored only the bounded summary
+        {"event_id": "e1", "session_id": "ce-a", "kind": "assistant_message",
+         "native_event_id": None, "native_locator": "rollout.jsonl#L10",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": None, "summary": "bounded summary prose fallback"},
+        # a newer capture maps the exact body: an explicit empty string
+        {"event_id": "e2", "session_id": "ce-b", "kind": "assistant_message",
+         "native_event_id": None, "native_locator": "rollout.jsonl#L10",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "", "summary": None},
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    assert len(report.messages) == 1
+    assert report.messages[0]["content"] == ""
+    assert report.messages[0]["content_length"] == 0
+
+
+def test_projection_mirror_recapture_keeps_one_id_for_native_id_families():
+    """One native message collected through two mirror paths = ONE cm id.
+
+    The locator embeds the mirror-relative path of the artifact a capture was
+    staged from, so locator-first addressing gave the same native message a
+    different cm id per mirror path (measured 2026-09-24: ~770 duplicate rows
+    out of 4,007 in one canonical session). Native-id-first families address
+    the message by its mirror-path-free client uuid instead, so the second
+    capture collapses onto the first row (the ``seen`` mechanism keeps the
+    richer copy when the bytes differ).
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [
+        {"session_id": "ce-a", "family": "claude", "native_session_id": "S1"},
+        {"session_id": "ce-b", "family": "claude", "native_session_id": "S1"},
+    ]
+    event_rows = [
+        {"event_id": "e1", "session_id": "ce-a", "kind": "user_message",
+         "native_event_id": "uuid-u1",
+         "native_locator": "mirror-a/projects/p/agent-x.jsonl#L1",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "hello"},
+        {"event_id": "e2", "session_id": "ce-b", "kind": "user_message",
+         "native_event_id": "uuid-u1",
+         "native_locator": "mirror-b/projects/p/agent-x.jsonl#L1",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "hello"},
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    assert len(report.messages) == 1
+    assert report.messages[0]["canonical_message_id"] == "cm|claude|S1|uuid-u1"
+    assert report.collapsed_duplicate_ids == 1
+
+
+def test_projection_mirror_recapture_keeps_richer_bytes_per_native_id():
+    """Same native id, different captured bytes: the richer copy wins."""
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [
+        {"session_id": "ce-a", "family": "claude", "native_session_id": "S1"},
+        {"session_id": "ce-b", "family": "claude", "native_session_id": "S1"},
+    ]
+    event_rows = [
+        {"event_id": "e1", "session_id": "ce-a", "kind": "assistant_message",
+         "native_event_id": "uuid-a1",
+         "native_locator": "mirror-a/agent-x.jsonl#L2",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "truncated"},
+        {"event_id": "e2", "session_id": "ce-b", "kind": "assistant_message",
+         "native_event_id": "uuid-a1",
+         "native_locator": "mirror-b/agent-x.jsonl#L2",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "the full assistant answer"},
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    assert len(report.messages) == 1
+    assert report.messages[0]["content"] == "the full assistant answer"
+
+
+def test_projection_codex_keeps_locator_first_for_mirror_copies():
+    """codex native ids are placeholders: mirror copies must NOT collapse.
+
+    The codex adapter records the literal 'agent_message' as the native id of
+    446 message events in one session (measured 2026-09-23), so its address
+    rule stays locator-first — two mirror paths yield two distinct ids.
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [
+        {"session_id": "ce-a", "family": "codex", "native_session_id": "S1"},
+        {"session_id": "ce-b", "family": "codex", "native_session_id": "S1"},
+    ]
+    event_rows = [
+        {"event_id": "e1", "session_id": "ce-a", "kind": "assistant_message",
+         "native_event_id": "agent_message",
+         "native_locator": "rollout-a.jsonl#L10",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "hello"},
+        {"event_id": "e2", "session_id": "ce-b", "kind": "assistant_message",
+         "native_event_id": "agent_message",
+         "native_locator": "rollout-b.jsonl#L10",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "hello"},
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    ids = {m["canonical_message_id"] for m in report.messages}
+    assert ids == {"cm|codex|S1|rollout-a.jsonl#L10",
+                   "cm|codex|S1|rollout-b.jsonl#L10"}
+
+
+def test_projection_placeholder_native_id_falls_back_to_locator():
+    """A native id repeated with conflicting content is a placeholder.
+
+    If one canonical session's native ids do not identify messages (the same
+    id carrying different bodies), id-first would collapse genuinely different
+    messages onto one row. That session keeps the locator-first rule, so every
+    distinct message survives under its own address.
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [
+        {"session_id": "ce-a", "family": "claude", "native_session_id": "S1"},
+    ]
+    event_rows = [
+        {"event_id": "e1", "session_id": "ce-a", "kind": "user_message",
+         "native_event_id": "user", "native_locator": "agent-x.jsonl#L1",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "first question"},
+        {"event_id": "e2", "session_id": "ce-a", "kind": "user_message",
+         "native_event_id": "user", "native_locator": "agent-x.jsonl#L5",
+         "occurred_at": "2026-08-03T02:10:00Z", "ordinal": 2,
+         "content": "second question"},
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    ids = {m["canonical_message_id"] for m in report.messages}
+    assert ids == {"cm|claude|S1|agent-x.jsonl#L1",
+                   "cm|claude|S1|agent-x.jsonl#L5"}
+
+
+def test_projection_placeholder_detection_is_per_session():
+    """A placeholder id in one session must not change another session's ids.
+
+    The fallback is decided per canonical session: session T2's healthy uuids
+    keep native-id-first addressing even though session T1's ids collapsed.
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [
+        {"session_id": "ce-1", "family": "claude", "native_session_id": "T1"},
+        {"session_id": "ce-2", "family": "claude", "native_session_id": "T2"},
+    ]
+    event_rows = [
+        {"event_id": "e1", "session_id": "ce-1", "kind": "user_message",
+         "native_event_id": "user", "native_locator": "a.jsonl#L1",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "one"},
+        {"event_id": "e2", "session_id": "ce-1", "kind": "user_message",
+         "native_event_id": "user", "native_locator": "a.jsonl#L2",
+         "occurred_at": "2026-08-03T02:10:00Z", "ordinal": 2,
+         "content": "two"},
+        {"event_id": "e3", "session_id": "ce-2", "kind": "user_message",
+         "native_event_id": "uuid-ok", "native_locator": "b.jsonl#L1",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1,
+         "content": "healthy"},
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    ids = {m["canonical_message_id"] for m in report.messages}
+    assert ids == {"cm|claude|T1|a.jsonl#L1",
+                   "cm|claude|T1|a.jsonl#L2",
+                   "cm|claude|T2|uuid-ok"}
+
+
+# --------------------------------------------------------------------------
+# P1-3: the writer reconciles incoming rows against the rows already stored
+# (read-merge-write), so a live-sync round that applies only one slot cannot
+# overwrite a richer body an earlier round stored from another slot.
+# --------------------------------------------------------------------------
+
+def _upsert_con(tmp_path, name="reconcile"):
+    con = sqlite3.connect(tmp_path / f"{name}.sqlite")
+    for stmt in DDL:
+        con.execute(stmt)
+    return con
+
+
+def _projection_message(mid, content, **overrides):
+    row = {
+        "canonical_message_id": mid,
+        "canonical_session_id": "cs|codex|S1",
+        "source": "legacy",
+        "source_message_ref": "rollout.jsonl#L10",
+        "ordinal": 1,
+        "role": "assistant",
+        "content": content,
+        "content_length": len(content or ""),
+        "timestamp": "2026-08-03T02:00:00Z",
+        "model": None,
+        "is_system": 0,
+        "is_sidechain": 0,
+        "content_hash": None,
+        "evidence_scope": "user",
+    }
+    row.update(overrides)
+    return row
+
+
+def _projection_tool(tid, name, length, **overrides):
+    row = {
+        "canonical_tool_id": tid,
+        "canonical_session_id": "cs|codex|S1",
+        "source": "legacy",
+        "source_kind": "call",
+        "tool_name": name,
+        "category": None,
+        "status": "ok",
+        "call_index": 1,
+        "subagent_session_id": None,
+        "content_length": length,
+        "timestamp": "2026-08-03T02:00:00Z",
+    }
+    row.update(overrides)
+    return row
+
+
+def _projection_session(csid, **overrides):
+    row = {
+        "canonical_session_id": csid,
+        "primary_source": "legacy",
+        "agent": "codex",
+        "started_at": "2026-08-03T02:00:00Z",
+        "ended_at": "2026-08-03T03:00:00Z",
+        "message_count": 1,
+        "user_message_count": 1,
+        "file_hash": None,
+        "parent_canonical_id": None,
+        "relationship_type": None,
+        "cwd": None,
+        "git_branch": None,
+        "model": None,
+        "evidence_eligible": 1,
+        "evidence_scope": "user",
+        "merged": 0,
+        "lifecycle": "active",
+        "superseded_by_canonical_id": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def _reconcile_report(sessions=(), messages=(), tools=()):
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        CompatibilityProjectionReport,
+        ProjectionFingerprint,
+    )
+    return CompatibilityProjectionReport(
+        generation_id="gen-1",
+        sessions=tuple(sessions),
+        messages=tuple(messages),
+        tools=tuple(tools),
+        excluded=(),
+        fingerprint=ProjectionFingerprint("gen-1", len(sessions),
+                                          len(messages), len(tools), "digest"),
+    )
+
+
+def test_upsert_reconcile_keeps_richer_stored_message_across_applies(tmp_path):
+    """Slot A stored a rich body; slot B's poorer re-capture must not win.
+
+    This is the P1-3 cross-apply shape: live sync projects only the slots a
+    round touched, so the poor copy of slot B arrives in a *separate*
+    ``upsert_compatibility_projection`` call — with no in-call ``seen`` dict
+    to protect it. The writer must reconcile against the stored row and
+    write nothing; the reverse order must still fill in the rich body.
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        upsert_compatibility_projection,
+    )
+
+    mid = "cm|claude|S1|uuid-a1"
+    rich = _projection_message(mid, "the full assistant answer")
+    poor = _projection_message(mid, "truncated")
+
+    # rich first (slot A), then a poor re-capture (slot B)
+    con = _upsert_con(tmp_path)
+    first = upsert_compatibility_projection(
+        con, _reconcile_report(messages=[rich]))
+    assert first["canonical_messages"] == {"inserted": 1, "updated": 0}, first
+    counts = upsert_compatibility_projection(
+        con, _reconcile_report(messages=[poor]))
+    body = con.execute(
+        "SELECT content, content_length FROM canonical_messages"
+        " WHERE canonical_message_id=?", (mid,)).fetchone()
+    con.close()
+    assert body == ("the full assistant answer", 25), body
+    assert counts["canonical_messages"] == {"inserted": 0, "updated": 0}, counts
+
+    # reverse order: poor copy stored first, rich copy must upgrade it
+    con = _upsert_con(tmp_path, name="reconcile-reversed")
+    upsert_compatibility_projection(con, _reconcile_report(messages=[poor]))
+    upsert_compatibility_projection(con, _reconcile_report(messages=[rich]))
+    body = con.execute(
+        "SELECT content, content_length FROM canonical_messages"
+        " WHERE canonical_message_id=?", (mid,)).fetchone()
+    con.close()
+    assert body == ("the full assistant answer", 25), body
+
+
+def test_upsert_reconcile_keeps_explicit_empty_body_over_summary_row(tmp_path):
+    """The stored-row reconciliation uses the same key as ``_richer``.
+
+    An explicit ``content=""`` row must not be overwritten by a summary-only
+    copy (``content=None``), even though the latter's prose is longer.
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        upsert_compatibility_projection,
+    )
+
+    mid = "cm|codex|S1|rollout.jsonl#L10"
+    empty = _projection_message(mid, "")
+    summary_only = _projection_message(mid, None, content_length=None,
+                                       source_message_ref="other.jsonl#L10")
+    con = _upsert_con(tmp_path)
+    upsert_compatibility_projection(con, _reconcile_report(messages=[empty]))
+    counts = upsert_compatibility_projection(
+        con, _reconcile_report(messages=[summary_only]))
+    body = con.execute(
+        "SELECT content FROM canonical_messages"
+        " WHERE canonical_message_id=?", (mid,)).fetchone()
+    con.close()
+    assert body == ("",), body
+    assert counts["canonical_messages"] == {"inserted": 0, "updated": 0}, counts
+
+
+def test_upsert_reconcile_keeps_richer_stored_tool_across_applies(tmp_path):
+    """Same reconciliation for canonical_tool_events (summary length)."""
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        upsert_compatibility_projection,
+    )
+
+    tid = "ct|codex|S1|L10"
+    rich = _projection_tool(tid, "Read file src/app/main.py line 1-400", 36)
+    poor = _projection_tool(tid, "Read file", 9)
+
+    con = _upsert_con(tmp_path)
+    upsert_compatibility_projection(con, _reconcile_report(tools=[rich]))
+    counts = upsert_compatibility_projection(
+        con, _reconcile_report(tools=[poor]))
+    row = con.execute(
+        "SELECT tool_name, content_length FROM canonical_tool_events"
+        " WHERE canonical_tool_id=?", (tid,)).fetchone()
+    con.close()
+    assert row == ("Read file src/app/main.py line 1-400", 36), row
+    assert counts["canonical_tool_events"] == {"inserted": 0, "updated": 0}, counts
+
+    # reverse order: the richer candidate upgrades the poorer stored row
+    con = _upsert_con(tmp_path, name="reconcile-reversed")
+    upsert_compatibility_projection(con, _reconcile_report(tools=[poor]))
+    upsert_compatibility_projection(con, _reconcile_report(tools=[rich]))
+    row = con.execute(
+        "SELECT tool_name, content_length FROM canonical_tool_events"
+        " WHERE canonical_tool_id=?", (tid,)).fetchone()
+    con.close()
+    assert row == ("Read file src/app/main.py line 1-400", 36), row
+
+
+def test_upsert_reconcile_merges_session_fields_with_stored_row(tmp_path):
+    """A later, partial apply merges session fields instead of overwriting.
+
+    started=min / ended=max / cwd / model follow ``_merge_session_copies``;
+    fields the projection does not merge (agent, lifecycle, ...) keep the
+    stored row's value. The counts deliberately follow the candidate even
+    when smaller: they are derived from the round's stale-filtered event
+    set, so a truncated source must be able to decrease them (the
+    live-sync truncation contract).
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        upsert_compatibility_projection,
+    )
+
+    csid = "cs|codex|S1"
+    stored = _projection_session(
+        csid, started_at="2026-08-03T02:00:00Z",
+        ended_at="2026-08-03T03:00:00Z",
+        message_count=1, user_message_count=1,
+        cwd=None, model=None, lifecycle="active")
+    candidate = _projection_session(
+        csid, started_at="2026-08-03T01:30:00Z",
+        ended_at="2026-08-03T02:30:00Z",  # earlier than stored: loses
+        message_count=3, user_message_count=2,
+        cwd="/repo", model="gpt-5", lifecycle="archived")
+
+    con = _upsert_con(tmp_path)
+    upsert_compatibility_projection(con, _reconcile_report(sessions=[stored]))
+    counts = upsert_compatibility_projection(
+        con, _reconcile_report(sessions=[candidate]))
+    row = con.execute(
+        "SELECT started_at, ended_at, message_count, user_message_count,"
+        " cwd, model, lifecycle FROM canonical_sessions"
+        " WHERE canonical_session_id=?", (csid,)).fetchone()
+    con.close()
+    assert row == ("2026-08-03T01:30:00Z", "2026-08-03T03:00:00Z", 3, 2,
+                   "/repo", "gpt-5", "active"), row
+    assert counts["canonical_sessions"] == {"inserted": 0, "updated": 1}, counts
+
+    # a round that saw fewer live events (e.g. after truncation) drops the
+    # derived counts, while the monotonic window keeps the wider span
+    con = _upsert_con(tmp_path, name="reconcile-shrink")
+    fuller = _projection_session(
+        csid, started_at="2026-08-03T01:30:00Z",
+        ended_at="2026-08-03T03:30:00Z",
+        message_count=6, user_message_count=3)
+    truncated = _projection_session(
+        csid, started_at="2026-08-03T01:30:00Z",
+        ended_at="2026-08-03T02:30:00Z",
+        message_count=4, user_message_count=2)
+    upsert_compatibility_projection(con, _reconcile_report(sessions=[fuller]))
+    upsert_compatibility_projection(
+        con, _reconcile_report(sessions=[truncated]))
+    row = con.execute(
+        "SELECT started_at, ended_at, message_count, user_message_count"
+        " FROM canonical_sessions WHERE canonical_session_id=?",
+        (csid,)).fetchone()
+    con.close()
+    assert row == ("2026-08-03T01:30:00Z", "2026-08-03T03:30:00Z", 4, 2), row
+
+
+def test_upsert_reconcile_stays_idempotent_on_replay(tmp_path):
+    """Re-applying identical rows still writes nothing (unchanged semantics)."""
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        upsert_compatibility_projection,
+    )
+
+    report = _reconcile_report(
+        sessions=[_projection_session("cs|codex|S1")],
+        messages=[_projection_message("cm|codex|S1|L10", "hello")],
+        tools=[_projection_tool("ct|codex|S1|L10", "Bash", 4)],
+    )
+    con = _upsert_con(tmp_path)
+    upsert_compatibility_projection(con, report)
+    counts = upsert_compatibility_projection(con, report)
+    con.close()
+    assert counts == {
+        "canonical_sessions": {"inserted": 0, "updated": 0},
+        "canonical_messages": {"inserted": 0, "updated": 0},
+        "canonical_tool_events": {"inserted": 0, "updated": 0},
+    }, counts
+
+
+def test_upsert_reconcile_can_be_disabled(tmp_path, monkeypatch):
+    """The escape hatch restores the pre-P1-3 candidate-wins behaviour."""
+    import personal_knowledge.application.conversation.compatibility_projection as cp
+
+    monkeypatch.setattr(cp, "MERGE_WITH_STORED", False)
+    mid = "cm|claude|S1|uuid-a1"
+    rich = _projection_message(mid, "the full assistant answer")
+    poor = _projection_message(mid, "truncated")
+
+    con = _upsert_con(tmp_path)
+    cp.upsert_compatibility_projection(con, _reconcile_report(messages=[rich]))
+    cp.upsert_compatibility_projection(con, _reconcile_report(messages=[poor]))
+    body = con.execute(
+        "SELECT content FROM canonical_messages"
+        " WHERE canonical_message_id=?", (mid,)).fetchone()
+    con.close()
+    assert body == ("truncated",), body

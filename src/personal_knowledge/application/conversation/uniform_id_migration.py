@@ -28,16 +28,22 @@ Every canonical row is keyed by where it physically comes from::
     tool:     ct|<family>|<native_session_id>|<address at origin>
 
 ``<address at origin>`` is the message's own address inside its origin, in a
-fixed precedence:
+per-family precedence (see ``NATIVE_ID_FIRST_FAMILIES``):
 
-1. the event's native locator (``rollout-….jsonl#L1011``,
-   ``wire.jsonl#L116``, ``sqlite:db.sqlite#part:…``) — its physical position in
-   the origin, which every projected kind carries;
-2. otherwise the client's native message id (claude ``uuid``, zcode ``part_…``,
-   grok ``row-N``, mimo/opencode ``msg_…``, …). ``native_event_id`` is only a
-   fallback because it is not reliably unique: measured 2026-09-23, the codex
-   adapter records the literal ``agent_message`` as the native id of 446
-   message events in one session, so id-first would collapse them;
+1. for families whose adapters record a reliable per-message native id (claude
+   ``uuid``, zcode ``part_…``, mimo/opencode ``msg_…``, …) the native message
+   id is the address and the native locator (``rollout-….jsonl#L1011``,
+   ``agent-….jsonl#L1``) is only the fallback. The locator embeds the
+   mirror-relative path of the artifact it was staged from, so when one native
+   session is collected through N different mirror paths the same message used
+   to get N different addresses (measured 2026-09-24: ~770 duplicate rows out
+   of 4,007 in one canonical session); the native id is mirror-path-free and
+   collapses those copies back onto one row;
+2. for families whose native id is NOT reliably unique (measured 2026-09-23:
+   the codex adapter records the literal ``agent_message`` as the native id of
+   446 message events in one session, so id-first would collapse them) the
+   locator is the address and the native id is only the fallback — codex, grok
+   and chatgpt stay locator-first;
 3. for rows whose only surviving origin is the AgentsView snapshot (no native
    root on disk: chatgpt, vscode-copilot, gemini, qoder, …, plus any session the
    adapter never captured): the legacy raw ref (``legacy:<file>:<index>``) for
@@ -143,6 +149,20 @@ INDEX_DDL = (
 )
 
 LEGACY_REF_RE = re.compile(r"^legacy:(.+):(\d+)$")
+
+# Families whose adapters record a reliable per-message native id (a client
+# uuid unique within the native session): for these the native id is the
+# message address and the locator (which embeds the mirror-relative path) is
+# only the fallback, so collecting one native session through several mirror
+# paths reproduces the same cm id instead of duplicating every message.
+# Deliberately absent: codex (literal 'agent_message' shared by 446 message
+# events of one session — id-first would collapse them), grok and chatgpt
+# (no reliable native message id; keep the locator-first behavior), cursor
+# (native message ids optional/unverified — conservative default applies).
+NATIVE_ID_FIRST_FAMILIES: frozenset[str] = frozenset({
+    "claude", "qoder", "gemini", "copilot", "workbuddy", "kimi", "kimi-work",
+    "zcode", "mimo", "opencode", "antigravity", "pi",
+})
 
 
 # --------------------------------------------------------------------------
@@ -474,33 +494,50 @@ def _tool_key(row: dict) -> tuple:
 
 
 def adapter_address(native_event_id: str | None,
-                    native_locator: str | None) -> str:
-    """The origin address of an adapter event: locator first, native id second.
+                    native_locator: str | None,
+                    family: str = "") -> str:
+    """The origin address of an adapter event, per family (see module doc).
 
-    The locator is the event's physical position in its origin file
-    (``rollout-….jsonl#L1011``) and is per-event for every projected kind.
-    ``native_event_id`` is only a fallback because it is not reliably unique:
-    measured 2026-09-23, the codex adapter records the literal string
+    For families in ``NATIVE_ID_FIRST_FAMILIES`` the native message id is the
+    address and the locator is the fallback: the locator embeds the
+    mirror-relative path of the artifact a capture was staged from, so id-first
+    is what keeps a re-capture through a different mirror path on the same cm
+    id. For every other family (codex records the literal string
     ``agent_message`` as the native id of 446 message events in a single
-    session, so id-first would collapse unrelated messages onto one address.
+    session, measured 2026-09-23) the locator stays the address and the native
+    id the fallback.
+
+    ``family`` defaults to ``""`` — an unknown family keeps the historical
+    locator-first rule, so older call sites that do not pass a family keep
+    their behavior. Tools are addressed by the locator everywhere: the decided
+    scope of this fix is message ids only.
     """
-    loc = (native_locator or "").strip()
-    if loc:
-        return loc
     nid = (native_event_id or "").strip()
-    return nid
+    loc = (native_locator or "").strip()
+    if (family or "").strip().lower() in NATIVE_ID_FIRST_FAMILIES:
+        return nid or loc
+    return loc or nid
 
 
 def _adapter_address(canonical_id: str, row: dict, ev_attr: dict,
-                     stats: Counter) -> tuple[str, str]:
-    """-> (address, form) for an adapter row (keeps the form for reporting)."""
+                     stats: Counter, family: str = "") -> tuple[str, str]:
+    """-> (address, form) for an adapter row (keeps the form for reporting).
+
+    Same per-family rule as :func:`adapter_address`: messages of
+    native-id-first families are addressed by their native id so the migrated
+    id matches what the live projection derives for a re-capture; every other
+    family (and every tool row) keeps the locator-first rule.
+    """
     attr = ev_attr.get(canonical_id)
+    nid_first = (family or "").strip().lower() in NATIVE_ID_FIRST_FAMILIES
     if attr:
-        nid, loc = attr
-        if loc and str(loc).strip():
-            return str(loc).strip(), "native_locator"
-        if nid and str(nid).strip():
-            return str(nid).strip(), "native_event_id"
+        nid, loc = str(attr[0] or "").strip(), str(attr[1] or "").strip()
+        if nid_first and nid:
+            return nid, "native_event_id"
+        if loc:
+            return loc, "native_locator"
+        if nid:
+            return nid, "native_event_id"
     ref = (row.get("source_message_ref") or "").strip()
     if ref:
         stats["address_fallback_source_ref"] += 1
@@ -536,7 +573,7 @@ def _merge_messages(g: _Group, ev_attr: dict, gen_of_v2_csid: dict,
     by_addr: dict[str, list[dict]] = defaultdict(list)
     for row in g.v2_messages:
         addr, form = _adapter_address(row["canonical_message_id"], row,
-                                      ev_attr, stats)
+                                      ev_attr, stats, fam)
         forms[(fam, "message", form)] += 1
         by_addr[addr].append(row)
     chosen: list[tuple[str, dict]] = []

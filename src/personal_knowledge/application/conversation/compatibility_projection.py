@@ -13,7 +13,10 @@ This module owns ONLY event-to-legacy mapping:
     :class:`ProjectionFingerprint` (generation lineage).
   - :func:`upsert_compatibility_projection` is the only writer: it persists
     those rows inside the caller's transaction, inserting the missing ones and
-    refreshing the changed ones with an ``UPDATE``. It never deletes. Both the
+    refreshing the changed ones with an ``UPDATE`` that is first reconciled
+    against the row already stored (P1-3: the richer copy wins, so applying
+    one slot at a time can no longer let a poorer re-capture overwrite a
+    richer body written by an earlier round). It never deletes. Both the
     incremental path and activation/rollback go through it, because the store is
     a **collection**: a row the sources no longer produce stays exactly as
     collected, and inserting, updating and deleting must all leave every other
@@ -38,7 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,6 +78,12 @@ EXCLUDED_KINDS: frozenset[EventKind] = frozenset(
 # 32766 (3.32+). Chunk well below both so a large delete can
 # never fail on arity.
 _PARAM_CHUNK = 400
+
+# P1-3: the writer reconciles each incoming row against the row already
+# stored (read-merge-write) instead of blindly overwriting it. Escape hatch
+# for tests that need the pre-P1-3 "candidate always wins" behaviour:
+# ``compatibility_projection.MERGE_WITH_STORED = False``. Default on.
+MERGE_WITH_STORED = True
 
 
 def _chunks(values: list, size: int = _PARAM_CHUNK):
@@ -186,9 +195,9 @@ def compute_projection(
     messages, tools, excluded = _classify_events(
         generation_id, sessions_by_id, event_rows
     )
-    projected_sessions = _project_sessions(
+    projected_sessions = _merge_session_copies(_project_sessions(
         sessions_by_id, family_by_session, key_by_session, messages
-    )
+    ))
     collapsed = [0]
     seen_messages: dict = {}
     seen_tools: dict = {}
@@ -252,14 +261,28 @@ def _richer(candidate: dict, prior: dict) -> bool:
     """True when ``candidate`` carries more content than the prior copy.
 
     Same address, different captured bytes (a file captured twice at different
-    moments): keep the copy with the longer body. Deterministic tiebreak on
-    event_id so the choice never depends on row order.
+    moments): keep the richer copy. Comparison key is
+    ``(content is not None, len(content if content is not None else summary))``:
+
+      - A copy that carries an explicit ``content`` — including ``""``, which is
+        a legitimate tool-only/empty native message (see _project_messages) —
+        always beats a copy that only has the bounded ``summary`` fallback.
+        Comparing bare lengths instead would let summary prose overwrite a
+        legitimately empty body.
+      - Among copies of the same kind, the longer body wins.
+      - Deterministic tiebreak on event_id so the choice never depends on row
+        order.
     """
-    cand_len = len(candidate.get("content") or candidate.get("summary") or "")
-    prior_len = len(prior["_event"].get("content")
-                    or prior["_event"].get("summary") or "")
-    if cand_len != prior_len:
-        return cand_len > prior_len
+
+    def _key(event: dict) -> tuple[bool, int]:
+        content = event.get("content")
+        body = content if content is not None else event.get("summary") or ""
+        return content is not None, len(body)
+
+    cand_key = _key(candidate)
+    prior_key = _key(prior["_event"])
+    if cand_key != prior_key:
+        return cand_key > prior_key
     return str(candidate.get("event_id") or "") < str(
         prior["_event"].get("event_id") or "")
 
@@ -315,6 +338,131 @@ def _project_sessions(
     return projected
 
 
+def _merge_session_pair(prior: dict, other: dict) -> dict:
+    """Merge one session copy into ``prior`` (in place); returns ``prior``.
+
+    The single merge rule shared by ``_merge_session_copies`` (copies of one
+    native session inside one ``compute_projection`` call) and — for the
+    monotonic fields — by ``_merge_stored_session_row`` (an incoming
+    candidate vs the canonical_sessions row already stored):
+
+      - ``started_at``: earliest non-None value (None-safe).
+      - ``ended_at``: latest non-None value (None-safe).
+      - ``message_count`` / ``user_message_count``: max across copies (each
+        copy counts only its own events, so the fullest capture wins).
+      - ``cwd`` / ``model``: smallest non-empty value, so a multi-valued
+        merge is still reproducible (and order-independent).
+      - Everything else: ``prior``'s value is kept (copies share
+        family/native key; at the writer the stored row is the incumbent).
+    """
+    for field in ("started_at", "ended_at"):
+        value, base = other.get(field), prior.get(field)
+        if value is None:
+            continue
+        if base is None or (field == "started_at" and value < base) \
+                or (field == "ended_at" and value > base):
+            prior[field] = value
+    for field in ("message_count", "user_message_count"):
+        value = other.get(field)
+        if value is not None and (prior.get(field) is None
+                                  or value > prior[field]):
+            prior[field] = value
+    for field in ("cwd", "model"):
+        value = other.get(field)
+        if value and (prior.get(field) is None or value < prior[field]):
+            prior[field] = value
+    return prior
+
+
+def _merge_session_copies(projected: list[dict]) -> list[dict]:
+    """Collapse session rows that share a canonical_session_id into one row.
+
+    One native session can be discovered as several ce sessions in one
+    generation (the same file staged twice, a session plus its subagent
+    artifact); ``_project_sessions`` then emits one row per ce session, all
+    carrying the same origin-derived ``canonical_session_id``. The writer
+    (``_upsert_rows``) keys rows by id, so the last duplicate would silently
+    overwrite the others — making started_at/ended_at/counts/cwd/model depend
+    on slot-hash ordering and flip on every re-capture. Merge instead, so the
+    outgoing rows carry a unique ``canonical_session_id``; the field rules
+    live in :func:`_merge_session_pair` (shared with the writer's
+    stored-row reconciliation).
+
+    This merge touches only canonical_sessions rows; the messages/tools
+    per-id collapse in ``_project_messages`` / ``_project_tools`` (``_richer``)
+    is unchanged.
+    """
+    merged: dict[str, dict] = {}
+    for row in projected:
+        prior = merged.get(row["canonical_session_id"])
+        if prior is None:
+            merged[row["canonical_session_id"]] = dict(row)
+            continue
+        _merge_session_pair(prior, row)
+    return list(merged.values())
+
+
+def _merge_stored_session_row(prior: tuple, candidate: tuple) -> tuple:
+    """Reconcile a candidate canonical_sessions row against the stored row.
+
+    Monotonic fields follow the same rules as :func:`_merge_session_copies`
+    (via the shared :func:`_merge_session_pair`): started_at=min,
+    ended_at=max, cwd/model smallest non-empty; everything else keeps the
+    stored row's value.
+
+    ``message_count`` / ``user_message_count`` deliberately do NOT take the
+    max here: they are *derived* counters of the round's stale-filtered
+    event set and must be able to decrease — a truncated source marks its
+    lost events stale and the projection must stop counting them (see
+    ``test_truncation_marks_lost_events_stale_and_projection_drops_them``).
+    The candidate's counts therefore win as-is; copies of one native session
+    inside a single round already merged to the max in
+    :func:`_merge_session_copies`. Honest boundary: across rounds that touch
+    different mirror slots of one native session, the counts follow the last
+    applied slot — only the richer-bytes guarantee for messages/tools (and
+    the monotonic started/ended window) is stable across applies.
+    """
+    merged = dict(zip(_SESSION_COLUMNS, prior))
+    cand = dict(zip(_SESSION_COLUMNS, candidate))
+    _merge_session_pair(merged, cand)
+    for field in ("message_count", "user_message_count"):
+        if cand.get(field) is not None:
+            merged[field] = cand[field]
+    return tuple(merged[column] for column in _SESSION_COLUMNS)
+
+
+def _placeholder_native_ids(
+    messages: dict[str, list[dict]],
+    key_by_session: dict[str, tuple[str, str]],
+) -> set[tuple[str, str]]:
+    """Canonical sessions whose native message ids are placeholders, not keys.
+
+    The per-family rule addresses native-id-first families by their native
+    message id, but that id is trusted only as long as it identifies one
+    message *within its artifact*: a reliable client uuid never repeats inside
+    one artifact, so an id that occurs several times in the same ce session
+    (the way codex records the literal ``agent_message`` for 446 message
+    events of one session) is a constant/placeholder, and id-first would
+    collapse genuinely different messages onto one row. Such a session falls
+    back to the locator-first rule.
+
+    Repeats *across* artifacts are not a suspicion: one native message
+    collected through several mirror paths carries the same uuid in each copy
+    — collapsing those copies onto one id is exactly what the rule is for,
+    with the ``seen``/``_richer`` mechanism keeping the richer bytes when the
+    captures disagree.
+    """
+    counts: dict[tuple[str, str], Counter] = defaultdict(Counter)
+    for sid, events in messages.items():
+        key = key_by_session[sid]
+        for event in events:
+            nid = (event.get("native_event_id") or "").strip()
+            if nid:
+                counts[(key, sid)][nid] += 1
+    return {key for (key, _sid), ids in counts.items()
+            if any(n > 1 for n in ids.values())}
+
+
 def _project_messages(
     key_by_session: dict[str, tuple[str, str]],
     messages: dict[str, list[dict]],
@@ -323,8 +471,12 @@ def _project_messages(
 ) -> list[dict]:
     """Map message-kind events to canonical_messages rows (documented lossy)."""
     projected: list[dict] = []
+    placeholders = _placeholder_native_ids(messages, key_by_session)
     for sid, events in sorted(messages.items()):
         family, native = key_by_session[sid]
+        # A session whose native ids proved to be placeholders keeps the
+        # locator-first rule: pass a family the rule does not recognize.
+        address_family = "" if (family, native) in placeholders else family
         for ordinal, event in enumerate(sorted(
             events, key=lambda e: (e.get("ordinal") or 0, e.get("event_id") or "")
         ), start=1):
@@ -340,7 +492,8 @@ def _project_messages(
             new_id = make_message_id(
                 family, native,
                 adapter_address(event.get("native_event_id"),
-                                event.get("native_locator"))
+                                event.get("native_locator"),
+                                address_family)
                 or event["event_id"])
             # One native session can be discovered as several ce sessions in
             # one generation (the same file staged twice, a session plus its
@@ -502,18 +655,116 @@ def build_compatibility_projection(
     return compute_projection(generation_id, sessions, events)
 
 
+# Column indexes used by the stored-row reconciliation below.
+_MESSAGE_CONTENT_IDX = _MESSAGE_COLUMNS.index("content")
+_TOOL_CONTENT_LENGTH_IDX = _TOOL_COLUMNS.index("content_length")
+_TOOL_NAME_IDX = _TOOL_COLUMNS.index("tool_name")
+
+
+def _merge_stored_row(
+    table: str, prior: tuple, candidate: tuple
+) -> tuple:
+    """Reconcile an incoming candidate row against the row already stored.
+
+    Dispatches on the table; unknown tables keep the pre-P1-3 behaviour
+    (candidate wins wholesale).
+    """
+    if table == "canonical_sessions":
+        return _merge_stored_session_row(prior, candidate)
+    if table == "canonical_messages":
+        return _merge_stored_message_row(prior, candidate)
+    if table == "canonical_tool_events":
+        return _merge_stored_tool_row(prior, candidate)
+    return candidate
+
+
+def _merge_stored_message_row(prior: tuple, candidate: tuple) -> tuple:
+    """Reconcile a candidate canonical_messages row against the stored row.
+
+    Row-level analog of ``_richer``: the projected row's ``content`` column
+    already carries the resolved body (content or the summary fallback), so
+    the comparison key ``(content is not None, len(content or ""))``
+    reproduces the event-level ordering exactly — an explicit body
+    (including ``""``) beats a summary-only copy, and among bodies of the
+    same kind the longer one wins.
+
+      - candidate richer → candidate.
+      - stored richer → stored (the merged tuple equals the stored tuple, so
+        no UPDATE is issued and the earlier round's longer body survives).
+      - same content → candidate (equivalent; if nothing else differs the
+        generic equality check still skips the write).
+      - same richness but different bytes (same-length divergent captures —
+        the row level has no event_id for ``_richer``'s tiebreak):
+        lexicographically smaller content wins, which is order-independent
+        and therefore cannot flap across apply rounds.
+    """
+    stored_content = prior[_MESSAGE_CONTENT_IDX]
+    cand_content = candidate[_MESSAGE_CONTENT_IDX]
+    stored_key = (stored_content is not None, len(stored_content or ""))
+    cand_key = (cand_content is not None, len(cand_content or ""))
+    if cand_key > stored_key:
+        return candidate
+    if cand_key < stored_key:
+        return prior
+    if stored_content == cand_content:
+        return candidate
+    return candidate if (cand_content or "") < (stored_content or "") else prior
+
+
+def _merge_stored_tool_row(prior: tuple, candidate: tuple) -> tuple:
+    """Reconcile a candidate canonical_tool_events row against the stored row.
+
+    canonical_tool_events carries no content column — the captured body is
+    the tool summary, stored as ``content_length`` (and ``tool_name`` for
+    calls), so the ``_richer`` key degenerates to the summary length. A
+    stored row with a NULL length (legacy row) counts as empty so any
+    candidate carrying a summary wins.
+    """
+    stored_len = prior[_TOOL_CONTENT_LENGTH_IDX]
+    cand_len = candidate[_TOOL_CONTENT_LENGTH_IDX]
+    if (cand_len or 0) > (stored_len if stored_len is not None else -1):
+        return candidate
+    if (cand_len if cand_len is not None else -1) < \
+            (stored_len if stored_len is not None else -1):
+        return prior
+    stored_name, cand_name = prior[_TOOL_NAME_IDX], candidate[_TOOL_NAME_IDX]
+    if stored_name == cand_name:
+        return candidate
+    return candidate if (cand_name or "") < (stored_name or "") else prior
+
+
 def _upsert_rows(
     con: sqlite3.Connection,
     *,
     table: str,
     columns: tuple[str, ...],
     rows: tuple[dict, ...],
+    merge_with_stored: bool = True,
 ) -> tuple[int, int]:
     """Insert the missing rows and refresh the changed ones in place.
 
-    ``columns[0]`` is the table's primary key. Rows whose values are identical
-    to what is stored are left untouched, so a re-projection of an unchanged
-    session writes nothing at all. Returns ``(inserted, updated)``.
+    ``columns[0]`` is the table's primary key. Before writing, the rows
+    already stored under the incoming ids are SELECTed (batched ``IN``
+    queries, chunked well below SQLite's variable ceiling via ``_chunks``)
+    and each incoming row is reconciled against its stored twin:
+
+      - absent id → INSERT (unchanged).
+      - present id → :func:`_merge_stored_row` decides what is written.
+        ``canonical_messages`` / ``canonical_tool_events`` keep the richer
+        copy (same rule as ``_richer``); ``canonical_sessions`` merge
+        started_at/ended_at/counts/cwd/model with the same rules as
+        ``_merge_session_copies``. A candidate that is poorer than the
+        stored row therefore writes nothing, so applying one slot per
+        live-sync round can no longer bounce a row's body back and forth
+        with the collection order (P1-3).
+      - a merged row identical to the stored row is skipped entirely, so an
+        idempotent replay of unchanged content still writes nothing at all.
+
+    Honest boundary: this is an optimistic read-merge-write inside the
+    caller's single transaction — it converges every row to the richest
+    value seen so far, but it does NOT keep cross-round version history (a
+    poorer candidate is dropped, not archived; a history table is future
+    work). Returns ``(inserted, updated)``.
     """
 
     if not rows:
@@ -533,12 +784,19 @@ def _upsert_rows(
         ):
             stored[str(row[0])] = tuple(row)
 
-    to_insert = [row for row in incoming.values() if str(row[0]) not in stored]
-    to_update = [
-        row
-        for row_id, row in incoming.items()
-        if row_id in stored and stored[row_id] != row
-    ]
+    to_insert = []
+    to_update = []
+    for row_id, row in incoming.items():
+        prior = stored.get(row_id)
+        if prior is None:
+            to_insert.append(row)
+            continue
+        merged = (
+            _merge_stored_row(table, prior, row)
+            if merge_with_stored else row
+        )
+        if merged != prior:
+            to_update.append(merged)
     if to_insert:
         con.executemany(
             f"INSERT INTO {table} ({', '.join(columns)}) "
@@ -561,8 +819,16 @@ def upsert_compatibility_projection(
 
     This is the **only** projection writer: the incremental live path and the
     activation/rollback path both go through it. It inserts rows that are absent
-    and refreshes rows whose values changed with an ``UPDATE``:
+    and refreshes rows whose reconciled values changed with an ``UPDATE``
+    (``_upsert_rows``):
 
+      - Reconciliation (P1-3, on by default via ``MERGE_WITH_STORED``): an
+        incoming row whose id already exists is merged with the stored row —
+        messages/tools keep the richer copy (same rule as ``_richer``),
+        sessions merge started_at/ended_at/counts/cwd/model. Live sync applies
+        only the slots a round touched, so without this a poorer re-capture of
+        slot B would overwrite the richer body an earlier round stored from
+        slot A, and the row would flap with the collection order.
       - ``canonical_sessions`` / ``canonical_messages`` /
         ``canonical_tool_events`` are read with a **monotonic rowid cursor** by
         ``retrieval/conversation_fts.py``, so rewriting a row must not move its
@@ -586,7 +852,10 @@ def upsert_compatibility_projection(
         ("canonical_tool_events", _TOOL_COLUMNS, report.tools),
     ):
         inserted, updated = _upsert_rows(
-            con, table=table, columns=columns, rows=rows
+            con, table=table, columns=columns, rows=rows,
+            # Read at call time so tests can flip the escape hatch by
+            # monkeypatching the module constant.
+            merge_with_stored=MERGE_WITH_STORED,
         )
         counts[table] = {"inserted": inserted, "updated": updated}
         if rows:
