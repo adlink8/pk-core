@@ -7,10 +7,12 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from personal_knowledge.adapters.conversation_sources import registry
-from personal_knowledge.core.conversation_events import EventKind
+from personal_knowledge.core.conversation_events import EventKind, make_event_id
 from tests.contract.conversation_sources.support import artifacts
 from tests.contract.conversation_sources.support import cursor as cursor_fixtures
 
@@ -141,3 +143,97 @@ def test_cursor_empty_transcript_no_ghost_session(tmp_path):
     )
     result = registry.adapt_for("cursor", artifacts.single(artifact), artifact_root=root)
     assert result.sessions == ()
+
+
+def _make_multi_thread_cursor_db(path) -> None:
+    """两个 thread 的 v1 schema 库：messages 无 thread 列，按时间窗归属。"""
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, created_at TEXT);
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY, role TEXT, content TEXT, created_at TEXT
+            );
+            """
+        )
+        con.execute(
+            "INSERT INTO threads VALUES ('t1', 'thread one', '2026-07-01T10:00:00Z')"
+        )
+        con.execute(
+            "INSERT INTO threads VALUES ('t2', 'thread two', '2026-07-01T11:00:00Z')"
+        )
+        con.execute(
+            "INSERT INTO messages VALUES ('m1', 'user', 'multi-t1-a', '2026-07-01T10:00:01Z')"
+        )
+        con.execute(
+            "INSERT INTO messages VALUES ('m2', 'assistant', 'multi-t1-b', '2026-07-01T10:00:02Z')"
+        )
+        con.execute(
+            "INSERT INTO messages VALUES ('m3', 'user', 'multi-t2-a', '2026-07-01T11:00:01Z')"
+        )
+        con.execute(
+            "INSERT INTO messages VALUES ('m4', 'assistant', 'multi-t2-b', '2026-07-01T11:00:02Z')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_cursor_multi_thread_sqlite_one_session_per_thread(tmp_path):
+    # P0-2 回归：多 thread 库必须每个 thread 一个独立会话，消息各归各，
+    # 否则 AdaptationResult.__post_init__ 撞 duplicate session id。
+    db = tmp_path / "cursor-multi.db"
+    _make_multi_thread_cursor_db(db)
+    artifact, root = artifacts.captured_sqlite(
+        db, tmp_path,
+        allowed_tables=cursor_fixtures.SQLITE_TABLES,
+        allowed_columns=cursor_fixtures.SQLITE_COLUMNS,
+        byte_limit=1_000_000, count_limit=4,
+    )
+    result = registry.adapt_for("cursor", artifacts.single(artifact), artifact_root=root)
+
+    assert len(result.sessions) == 2
+    assert len({s.session_id for s in result.sessions}) == 2
+
+    by_native = {s.native_session_id: s for s in result.sessions}
+    assert set(by_native) == {"t1", "t2"}
+
+    per_session: dict[str, list] = {}
+    for event in result.events:
+        if event.kind in (EventKind.USER_MESSAGE, EventKind.ASSISTANT_MESSAGE):
+            per_session.setdefault(event.session_id, []).append(event.content)
+    assert sorted(per_session[by_native["t1"].session_id]) == ["multi-t1-a", "multi-t1-b"]
+    assert sorted(per_session[by_native["t2"].session_id]) == ["multi-t2-a", "multi-t2-b"]
+    # 没有任何消息被算到两个会话头上。
+    all_message_events = [e for e in result.events if e.kind in (
+        EventKind.USER_MESSAGE, EventKind.ASSISTANT_MESSAGE)]
+    assert len(all_message_events) == 4
+
+    # started_at / ended_at 按本 thread 自己的消息计算，不共享全局末条时间戳。
+    assert by_native["t1"].started_at == "2026-07-01T10:00:00Z"
+    assert by_native["t1"].ended_at == "2026-07-01T10:00:02Z"
+    assert by_native["t2"].started_at == "2026-07-01T11:00:00Z"
+    assert by_native["t2"].ended_at == "2026-07-01T11:00:02Z"
+
+
+def test_cursor_single_thread_sqlite_session_id_shape_stable(tmp_path):
+    # 兼容性契约：单 thread 库的 session id 仍是 probe 版本派生的常量，
+    # 不因 per-thread id 规则而无谓漂移。
+    db = tmp_path / "cursor-single.db"
+    cursor_fixtures.make_cursor_db(db)
+    artifact, root = artifacts.captured_sqlite(
+        db, tmp_path,
+        allowed_tables=cursor_fixtures.SQLITE_TABLES,
+        allowed_columns=cursor_fixtures.SQLITE_COLUMNS,
+        byte_limit=1_000_000, count_limit=4,
+    )
+    result = registry.adapt_for("cursor", artifacts.single(artifact), artifact_root=root)
+
+    assert len(result.sessions) == 1
+    expected = make_event_id(
+        "cursor", artifact.artifact_id, "2", None,
+        kind=EventKind.SESSION_LIFECYCLE, native_locator="probe:v1",
+    )
+    assert result.sessions[0].session_id == expected
+    assert all(e.session_id == expected for e in result.events)

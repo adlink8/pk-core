@@ -138,8 +138,6 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             warnings=(f"schema not supported by any probe version; present tables: {sorted(tables)[:8]}",),
         )
 
-    session_id = make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION,
-                               None, kind=EventKind.SESSION_LIFECYCLE, native_locator=f"probe:{version}")
     events: list[TypedEvent] = []
     sessions: list[AdaptedSession] = []
 
@@ -161,15 +159,75 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             sessions=(), relations=(), warnings=("threads table is empty (partial)",),
         )
 
-    message_timestamps = [
-        m["created_at"] for m in messages if "created_at" in m.keys() and m["created_at"] is not None
-    ]
+    thread_refs: list[tuple[str, str | None]] = []
+    for thread in threads:
+        tid = str(thread["id"] if "id" in thread.keys() else thread[0])
+        created_at = (
+            thread["created_at"]
+            if "created_at" in thread.keys() and thread["created_at"] is not None
+            else None
+        )
+        thread_refs.append((tid, created_at))
+    # Ascending by created_at (None first): used for time-window attribution
+    # when the messages table carries no explicit thread link column.
+    ordered_threads = sorted(thread_refs, key=lambda tc: (tc[1] is None, tc[1] or ""))
+
+    link_key = None
+    if messages:
+        for candidate in ("thread_id", "threadId", "thread"):
+            if candidate in messages[0].keys():
+                link_key = candidate
+                break
+
+    buckets: dict[str, list] = {tid: [] for tid, _created in thread_refs}
+    for message in messages:
+        if link_key is not None:
+            linked = message[link_key] if link_key in message.keys() else None
+            if linked is not None and str(linked) in buckets:
+                buckets[str(linked)].append(message)
+                continue
+        created = (
+            message["created_at"]
+            if "created_at" in message.keys() and message["created_at"] is not None
+            else None
+        )
+        owner = None
+        if created is not None:
+            for tid, thread_created in ordered_threads:
+                if thread_created is not None and thread_created <= created:
+                    owner = tid
+        if owner is None:
+            # Before every thread start / no timestamps at all: the earliest
+            # thread. For a single-thread store this is the only thread.
+            owner = ordered_threads[0][0]
+        buckets[owner].append(message)
+
+    # Single-thread stores keep the historical probe-derived constant id so
+    # already-published identities do not drift; multi-thread stores need a
+    # per-thread id or AdaptationResult would collide on duplicate session ids.
+    single_thread = len(thread_refs) == 1
 
     for thread in threads:
         tid = str(thread["id"] if "id" in thread.keys() else thread[0])
+        thread_messages = buckets.get(tid, [])
+        if single_thread:
+            thread_session_id = make_event_id(
+                FAMILY, artifact.artifact_id, CONTRACT_VERSION, None,
+                kind=EventKind.SESSION_LIFECYCLE, native_locator=f"probe:{version}",
+            )
+        else:
+            thread_session_id = make_event_id(
+                FAMILY, artifact.artifact_id, CONTRACT_VERSION, None,
+                kind=EventKind.SESSION_LIFECYCLE,
+                native_locator=f"probe:{version}#thread:{tid}",
+            )
         locator = f"{artifact.relative_path}#thread:{tid}"
+        thread_timestamps = [
+            m["created_at"] for m in thread_messages
+            if "created_at" in m.keys() and m["created_at"] is not None
+        ]
         sessions.append(AdaptedSession(
-            session_id=session_id,
+            session_id=thread_session_id,
             provenance=Provenance(
                 artifact_id=artifact.artifact_id, artifact_hash=artifact.content_hash,
                 native_locator=locator, native_session_id=tid, native_event_id=tid,
@@ -181,11 +239,11 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 if "created_at" in thread.keys() and thread["created_at"] is not None
                 else None
             ),
-            ended_at=message_timestamps[-1] if message_timestamps else None,
+            ended_at=max(thread_timestamps) if thread_timestamps else None,
         ))
         events.append(TypedEvent(
-            event_id=session_id,
-            session_id=session_id, kind=EventKind.SESSION_LIFECYCLE,
+            event_id=thread_session_id,
+            session_id=thread_session_id, kind=EventKind.SESSION_LIFECYCLE,
             provenance=Provenance(
                 artifact_id=artifact.artifact_id, artifact_hash=artifact.content_hash,
                 native_locator=locator, native_session_id=tid, native_event_id=tid,
@@ -196,46 +254,46 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             summary=str(thread["title"] if "title" in thread.keys() else "")[:256] or None,
         ))
 
-    for message in messages:
-        if "role" not in message.keys():
-            continue
-        role = message["role"]
-        kind = EventKind.USER_MESSAGE if role == "user" else (
-            EventKind.ASSISTANT_MESSAGE if role in ("assistant", "model") else None)
-        locator = f"{artifact.relative_path}#message:{message['id'] if 'id' in message.keys() else len(events)}"
-        if kind is None:
+        for message in thread_messages:
+            if "role" not in message.keys():
+                continue
+            role = message["role"]
+            kind = EventKind.USER_MESSAGE if role == "user" else (
+                EventKind.ASSISTANT_MESSAGE if role in ("assistant", "model") else None)
+            locator = f"{artifact.relative_path}#message:{message['id'] if 'id' in message.keys() else len(events)}"
+            if kind is None:
+                events.append(TypedEvent(
+                    event_id=make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION, locator,
+                                           kind=EventKind.UNKNOWN_NATIVE, session_id=thread_session_id),
+                    session_id=thread_session_id, kind=EventKind.UNKNOWN_NATIVE,
+                    provenance=Provenance(
+                        artifact_id=artifact.artifact_id, artifact_hash=artifact.content_hash,
+                        native_locator=locator, native_session_id=tid,
+                        native_event_id=message["id"] if "id" in message.keys() else None,
+                        contract_version=CONTRACT_VERSION,
+                    ),
+                    fidelity=_fidelity(STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
+                                       RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
+                                       CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
+                ))
+                continue
             events.append(TypedEvent(
                 event_id=make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION, locator,
-                                       kind=EventKind.UNKNOWN_NATIVE, session_id=session_id),
-                session_id=session_id, kind=EventKind.UNKNOWN_NATIVE,
+                                       kind=kind, session_id=thread_session_id),
+                session_id=thread_session_id, kind=kind,
                 provenance=Provenance(
                     artifact_id=artifact.artifact_id, artifact_hash=artifact.content_hash,
-                    native_locator=locator, native_session_id=session_id,
+                    native_locator=locator, native_session_id=tid,
                     native_event_id=message["id"] if "id" in message.keys() else None,
                     contract_version=CONTRACT_VERSION,
                 ),
-                fidelity=_fidelity(STRUCTURE_COMPLETENESS=FidelityLevel.PARTIAL,
-                                   RELATION_COMPLETENESS=FidelityLevel.UNKNOWN,
-                                   CONTENT_AVAILABILITY=FidelityLevel.PARTIAL),
+                fidelity=_fidelity(),
+                occurred_at=message["created_at"] if "created_at" in message.keys() else None,
+                content=(
+                    None if "content" not in message.keys() or message["content"] is None
+                    else str(message["content"])
+                ),
             ))
-            continue
-        events.append(TypedEvent(
-            event_id=make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION, locator,
-                                   kind=kind, session_id=session_id),
-            session_id=session_id, kind=kind,
-            provenance=Provenance(
-                artifact_id=artifact.artifact_id, artifact_hash=artifact.content_hash,
-                native_locator=locator, native_session_id=session_id,
-                native_event_id=message["id"] if "id" in message.keys() else None,
-                contract_version=CONTRACT_VERSION,
-            ),
-            fidelity=_fidelity(),
-            occurred_at=message["created_at"] if "created_at" in message.keys() else None,
-            content=(
-                None if "content" not in message.keys() or message["content"] is None
-                else str(message["content"])
-            ),
-        ))
 
     return AdaptationResult(
         family=FAMILY, adapter_version=ADAPTER_VERSION, contract_version=CONTRACT_VERSION,
