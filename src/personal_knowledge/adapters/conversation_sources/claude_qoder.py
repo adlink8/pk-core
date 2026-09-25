@@ -11,7 +11,9 @@ keeps its own detector, schema gate and capability/fidelity outcomes.
 
 from __future__ import annotations
 
+import codecs
 import json
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -44,9 +46,26 @@ from personal_knowledge.core.conversation_events import (
     make_event_id,
 )
 
-ADAPTER_VERSION = "1.7.0"
+ADAPTER_VERSION = "1.8.0"
 
 CONTRACT_VERSION = "2"
+
+# P1-7: a bare uuid stem is a native session id (claude / qoder name their
+# exports ``<session-uuid>.jsonl``); anything else must not become one.
+_UUID_STEM_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+# P2 detect: probe the head of the file in bounded chunks instead of reading
+# it fully into memory (transcripts reach hundreds of MB; detection only
+# needs the first DAG-shaped record).  Chunked, not one fixed window: the
+# first record of a real export can itself be tens of KB (a user prompt with
+# injected instructions), so a single 16K window missed real qoder files
+# whose first ``uuid``+``parentUuid`` line starts at byte ~18K.  The scan
+# cap keeps the probe O(cap) no matter the file size.
+_DETECT_WINDOW_BYTES = 16_384
+_DETECT_SCAN_LIMIT = 262_144
 
 # P1-F4 content-fidelity: tool_call input, tool_result output and reasoning
 # text are all event *content* (the body) and are therefore never capped.
@@ -71,26 +90,47 @@ def _fidelity(**overrides) -> FidelityProfile:
     return FidelityProfile.from_levels(levels)
 
 
-# Standalone operational / system-metadata record types emitted by Claude
-# Code as top-level DAG records (no message envelope).  They carry no
-# user/assistant content but encode session state, provenance or tooling
-# bookkeeping; we classify them as system_message and surface their fields
-# through summary so the information is never lost.
-_META_RECORD_TYPES = {
+# P1-10 role pollution fix.  These standalone operational / system-metadata
+# record types (no message envelope) previously all mapped to
+# ``system_message``, which the compatibility projection flattens into
+# canonical_messages rows with ``role=system``.  Measured 2026-09 on the
+# pilot corpus that made 63.2% (qoder) / 55.3% (claude) of canonical
+# messages ``role=system``.  They are session state and file context, not
+# dialogue: they now map to non-message kinds that stay out of the
+# canonical message table (their fields still surface through summary /
+# content, so nothing is lost).
+#   - file / workspace context records -> FILE_CONTEXT (same semantics as
+#     the codex / zcode / kimi adapters' file-context events);
+#   - session operational state records -> SESSION_LIFECYCLE (same
+#     semantics as the copilot adapter's session.info/model_change).
+_FILE_CONTEXT_RECORD_TYPES = frozenset({
+    "attachment",
+    "file-history-snapshot",
+    "file-history-delta",
+    "workspace-directories",
+    "worktree-state",
+})
+
+_SESSION_STATE_RECORD_TYPES = frozenset({
     "last-prompt",
     "mode",
     "permission-mode",
     "ai-title",
-    "attachment",
     "queue-operation",
-    "file-history-snapshot",
     "pr-link",
-    "file-history-delta",
     "active-leaf",
     "runtime-config",
-    "workspace-directories",
-    "worktree-state",
-}
+})
+
+# ``system``/``system_message`` subtypes that are genuinely injected
+# system-visible lines (they keep SYSTEM_MESSAGE; they are rare and real
+# system dialogue, unlike the bookkeeping records above).
+_SYSTEM_MESSAGE_SUBTYPES = frozenset({
+    "api_error",
+    "away_summary",
+    "local_command",
+    "informational",
+})
 
 
 def _record_kind(record: dict) -> EventKind | None:
@@ -106,17 +146,21 @@ def _record_kind(record: dict) -> EventKind | None:
         return EventKind.TOOL_CALL
     if rtype == "tool_result":
         return EventKind.TOOL_RESULT
-    if rtype in _META_RECORD_TYPES:
-        return EventKind.SYSTEM_MESSAGE
+    if rtype in _FILE_CONTEXT_RECORD_TYPES:
+        return EventKind.FILE_CONTEXT
+    if rtype in _SESSION_STATE_RECORD_TYPES:
+        return EventKind.SESSION_LIFECYCLE
     if rtype in ("system", "system_message"):
         subtype = record.get("subtype")
         if subtype == "turn_duration":
             return EventKind.USAGE
         if subtype == "compact_boundary":
             return EventKind.COMPACTION_SUMMARY
-        # api_error and any other system subtype carry operational state
-        # and are surfaced as a system_message (previously unknown native).
-        return EventKind.SYSTEM_MESSAGE
+        if subtype in _SYSTEM_MESSAGE_SUBTYPES:
+            # api_error and other system subtypes carry operational state
+            # surfaced as a system_message (previously unknown native).
+            return EventKind.SYSTEM_MESSAGE
+        return EventKind.UNKNOWN_NATIVE
     return None
 
 
@@ -193,12 +237,50 @@ def _message_usage(record: dict):
     return None
 
 
-def _first_user_text_default(events) -> str | None:
-    """First user-message text (bounded) as a session-title fallback."""
-    for event in events:
-        if event.kind is EventKind.USER_MESSAGE and event.content:
-            text = event.content.strip()
-            return text[:120] or None
+# P2 title: system-injected user-role lines that must never become the
+# session title.  Real exports open with tag-wrapped operational records
+# (``<command-name>``, ``<local-command-stdout>``, ``<task-notification>``),
+# skill base-directory preambles and compaction continuations; a naive
+# "first user text" turned every such injection into the session title.
+_TITLE_PLACEHOLDER_HEAD = 160
+
+
+def _is_title_placeholder(text: str) -> bool:
+    """True when a user-role text is a system injection, not human dialogue."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped.startswith("<"):
+        # tag-wrapped injection (<command-name>…, <local-command-stdout>…,
+        # <task-notification>…) or a fully wrapped placeholder (<synthetic>)
+        return True
+    if stripped.startswith("[Request interrupted"):
+        return True
+    head = stripped[:_TITLE_PLACEHOLDER_HEAD].lower()
+    if "base directory for this skill:" in head:
+        return True
+    if "this session is being continued from a previous conversation" in head:
+        return True
+    # injected instruction blocks (AGENTS.md / CLAUDE.md content dumps)
+    if "agents.md" in head or "claude.md" in head:
+        return True
+    return False
+
+
+def _default_session_title(records) -> str | None:
+    """First main-session user text (bounded) as a session-title fallback.
+
+    Scope: called with the main-session records only (records without an
+    ``agentId``), so a sub-agent's first message can no longer leak into the
+    main session title when the file mixes both.
+    """
+    for record in records:
+        if _record_kind(record) is not EventKind.USER_MESSAGE:
+            continue
+        text = _text_content(record)
+        if not text or _is_title_placeholder(text):
+            continue
+        return text.strip()[:120] or None
     return None
 
 def _content_blocks(record: dict):
@@ -391,13 +473,29 @@ class _Family:
         self.dag_shape = dag_shape
         self.markers = markers
 
+    def _path_session_key(self, relative_path: str | None) -> str:
+        """P1-7: 会话键兜底 — 文件名词干只在它是合法会话 id 形态时使用。
+
+        claude / qoder 导出文件名是 uuid（即原生会话 id），词干可直接当
+        native_session 键；但导出副本 / 重命名文件（``session copy.jsonl``、
+        ``transcript.jsonl``）的词干不是会话 id，用词干会让不同文件的不同
+        会话撞到同一个伪会话键（kimi 家族曾实测 105 个会话共享 ``wire``
+        键）。此时改用确定性全路径键，与 grok.py 的
+        ``grok-path:<relative_path>`` 模式一致。
+        """
+        normalized = (relative_path or "").replace("\\", "/")
+        stem = Path(normalized).stem
+        if _UUID_STEM_RE.match(stem):
+            return stem
+        return f"{self.family}-path:{normalized}"
+
     def capability(self) -> CapabilityDescriptor:
         kinds = {
             EventKind.SESSION_LIFECYCLE, EventKind.USER_MESSAGE,
             EventKind.ASSISTANT_MESSAGE, EventKind.SYSTEM_MESSAGE,
             EventKind.REASONING,
             EventKind.TOOL_CALL, EventKind.TOOL_RESULT,
-            EventKind.USAGE,
+            EventKind.USAGE, EventKind.FILE_CONTEXT,
             EventKind.COMPACTION_SUMMARY, EventKind.UNKNOWN_NATIVE,
         }
         relations = {
@@ -422,15 +520,50 @@ class _Family:
     def detect(self, artifact: SourceArtifact, *, artifact_root: Path) -> bool:
         if not (artifact.relative_path or "").lower().endswith(".jsonl"):
             return False
+        markers = set(self.markers)
+        seen_markers: set[str] = set()
+        dag_ok = not self.dag_shape
         try:
-            lines = artifact_bytes_path(artifact_root, artifact).read_text(encoding="utf-8").splitlines()
-        except (OSError, ValueError):
-            # ValueError 覆盖 UnicodeDecodeError：非 UTF-8 字节的轨迹必须判为
-            # 「不是我」，不得把解析异常抛给发现层（会被记成 probe_error）。
+            with artifact_bytes_path(artifact_root, artifact).open("rb") as fh:
+                decoder = codecs.getincrementaldecoder("utf-8")()
+                carry = ""
+                scanned = 0
+                eof = False
+                while scanned < _DETECT_SCAN_LIMIT and (
+                    not dag_ok or (markers and not (seen_markers & markers))
+                ):
+                    chunk = fh.read(_DETECT_WINDOW_BYTES)
+                    if not chunk:
+                        eof = True
+                        break
+                    scanned += len(chunk)
+                    try:
+                        text = decoder.decode(chunk)
+                    except UnicodeDecodeError:
+                        # 非 UTF-8 字节的轨迹必须判为「不是我」，不得把解析
+                        # 异常抛给发现层（会被记成 probe_error）。
+                        return False
+                    text = carry + text
+                    *lines, carry = text.split("\n")
+                    for line in lines:
+                        if not dag_ok and '"uuid"' in line and '"parentUuid"' in line:
+                            dag_ok = True
+                        seen_markers.update(m for m in markers if m in line)
+                if eof:
+                    # 文件在扫描上限内结束：末个未换行的残行与增量解码器的
+                    # 缓冲都要参与判定；flush 报错说明编码真的坏了。
+                    try:
+                        carry += decoder.decode(b"", final=True)
+                    except UnicodeDecodeError:
+                        return False
+                    if not dag_ok and '"uuid"' in carry and '"parentUuid"' in carry:
+                        dag_ok = True
+                    seen_markers.update(m for m in markers if m in carry)
+        except OSError:
             return False
-        if self.dag_shape and not any('"uuid"' in l and '"parentUuid"' in l for l in lines):
+        if not dag_ok:
             return False
-        return any(m in l for l in lines for m in self.markers) if self.markers else True
+        return bool(seen_markers & markers) if markers else True
 
     def _event(self, artifact, *, session_id, kind, locator, native_id=None,
                occurred_at=None, content=None, summary=None, fidelity=None,
@@ -488,18 +621,23 @@ class _Family:
             EventKind.SYSTEM_MESSAGE,
         }
         # Standalone operational/metadata records (mode, ai-title, pr-link,
-        # api_error, ...) map to system_message and carry a non-empty summary
-        # recovered from their own fields rather than a message envelope.
-        meta_summary = _metadata_summary(record) if kind is EventKind.SYSTEM_MESSAGE else None
-        if meta_summary is not None:
-            # Round-4 fix: attachment records carry their payload (file diff
-            # blocks etc.) on record.attachment; project it as bounded content
-            # instead of a type-list-only summary.
+        # attachment, api_error, ...) are session state / file context, not
+        # dialogue (P1-10): they map to SESSION_LIFECYCLE / FILE_CONTEXT /
+        # SYSTEM_MESSAGE and carry a non-empty summary recovered from their
+        # own fields rather than a message envelope.
+        if kind in (EventKind.SESSION_LIFECYCLE, EventKind.FILE_CONTEXT,
+                    EventKind.SYSTEM_MESSAGE):
+            meta_summary = _metadata_summary(record)
+            if meta_summary is None:
+                # No identifying field recoverable: at least name the native
+                # type so the event is never an unexplained row.
+                meta_summary = f"{record.get('type') or 'record'}"
             meta_content = _metadata_text(record)
             native_type = record.get("type") or "unknown"
             meta_disp = (FieldDispositionRecord(
                 f"type:{native_type}", FieldDisposition.MAPPED,
-                f"operational metadata record type {native_type} classified as system_message",
+                f"operational metadata record type {native_type} "
+                f"classified as {kind.value}",
             ),)
             if record.get("type") == "attachment" and record.get("attachment") is not None:
                 try:
@@ -509,7 +647,7 @@ class _Family:
                 if att_text:
                     meta_content = att_text
             return [self._event(
-                artifact, session_id=session_id, kind=EventKind.SYSTEM_MESSAGE,
+                artifact, session_id=session_id, kind=kind,
                 locator=locator, native_id=record.get("uuid"), occurred_at=ts,
                 ordinal=ordinal_start, content=meta_content, summary=meta_summary,
                 native_session=sid, native_payload_ref=locator,
@@ -724,7 +862,9 @@ class _Family:
         native_session = next((
             r.get("session_id") or r.get("sessionId")
             for r in records if r.get("session_id") or r.get("sessionId")
-        ), Path(artifact.relative_path).stem)
+        ), None)
+        if not native_session:
+            native_session = self._path_session_key(artifact.relative_path)
 
         for lineno, record in enumerate(records, start=1):
             record_events, call_links = self._adapt_record(
@@ -949,7 +1089,7 @@ class _Family:
 
         sessions: list[AdaptedSession] = []
         if native_session:
-            title = _first_user_text_default(events)
+            title = _default_session_title(context_records)
             sessions.append(AdaptedSession(
                 session_id=session_id,
                 provenance=Provenance(

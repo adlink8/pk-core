@@ -160,6 +160,8 @@ def test_no_raw_epoch_integer_leaks_into_events(tmp_path):
 
 
 # --------------------------------------------- qoder queue-operation 正文
+# P1-10 起 queue-operation 归 SESSION_LIFECYCLE（会话运维状态），不再落成
+# system 消息；正文保全语义不变。
 
 def test_queue_operation_content_is_kept_in_full(tmp_path):
     """queue-operation 的正文只在顶层 content 上，必须全文进事件 content。
@@ -176,7 +178,7 @@ def test_queue_operation_content_is_kept_in_full(tmp_path):
     )
 
     assert artifacts.has_event(
-        result, EventKind.SYSTEM_MESSAGE, fixtures.QUEUE_OPERATION_TEXT
+        result, EventKind.SESSION_LIFECYCLE, fixtures.QUEUE_OPERATION_TEXT
     ), "queue-operation 正文被砍或丢失；全文必须落到 content"
     event = next(
         item for item in result.events
@@ -195,11 +197,127 @@ def test_short_queue_operation_content_also_lands_in_content(tmp_path):
     )
 
     assert artifacts.has_event(
-        result, EventKind.SYSTEM_MESSAGE, fixtures.QUEUE_OPERATION_SHORT_TEXT
+        result, EventKind.SESSION_LIFECYCLE, fixtures.QUEUE_OPERATION_SHORT_TEXT
     )
     assert artifacts.has_event(
         result, EventKind.ASSISTANT_MESSAGE, fixtures.QUEUE_OPERATION_ASSISTANT_TEXT
     )
+
+
+# ------------------------------------------------ P1-10 会话键 / role 污染
+
+@pytest.mark.parametrize("family", ["claude", "qoder"])
+def test_meta_record_types_never_become_system_role(tmp_path, family):
+    """P1-10：运维/元数据记录不得落成 system 消息（role 污染根因）。
+
+    权威库试点实测：qoder 65.4% / claude 57.7% 的 canonical 消息 role=system，
+    根因是 attachment / mode / active-leaf 等无信封记录全部被归类为
+    system_message。现在它们必须是 FILE_CONTEXT / SESSION_LIFECYCLE，
+    且字段信息经 summary 不丢。
+    """
+    _, _, result = fixtures.adapt_family(
+        family, tmp_path, "meta-records.jsonl", fixtures.meta_records(),
+    )
+
+    system_events = [
+        event for event in result.events
+        if event.kind is EventKind.SYSTEM_MESSAGE
+    ]
+    assert system_events == [], (
+        "运维/元数据记录仍然被归类为 system 消息（role 污染未修复）"
+    )
+    allowed = {EventKind.SESSION_LIFECYCLE, EventKind.FILE_CONTEXT}
+    kinds = {event.kind for event in result.events}
+    assert kinds <= allowed, kinds
+    for type_name in (
+        *fixtures.META_SESSION_STATE_TYPES, *fixtures.META_FILE_CONTEXT_TYPES
+    ):
+        assert any(
+            type_name in fixtures.explained(event) for event in result.events
+        ), f"{type_name} 的原生信息没有落在任何事件上"
+
+
+@pytest.mark.parametrize("family", ["claude", "qoder"])
+def test_genuine_system_subtypes_keep_system_role_unknown_stays_unknown(
+    tmp_path, family,
+):
+    """真系统行（api_error / away_summary）仍是 system；未知 subtype 不再冒充。
+
+    未知 subtype 归 UNKNOWN_NATIVE（按原生位置保全），不得顺手落成
+    system 消息。
+    """
+    _, _, result = fixtures.adapt_family(
+        family, tmp_path, "system-subtypes.jsonl", fixtures.system_subtype_records(),
+    )
+
+    by_native = {
+        event.provenance.native_event_id: event for event in result.events
+    }
+    assert by_native["sys-1"].kind is EventKind.SYSTEM_MESSAGE
+    assert (by_native["sys-1"].summary or "").startswith("api_error:")
+    assert by_native["sys-2"].kind is EventKind.SYSTEM_MESSAGE
+    assert by_native["sys-3"].kind is EventKind.UNKNOWN_NATIVE
+    assert by_native["sys-3"].kind is not EventKind.SYSTEM_MESSAGE
+
+
+# ------------------------------------------------ P1-7 会话键 stem 兜底
+
+@pytest.mark.parametrize("family", ["claude", "qoder"])
+def test_session_key_falls_back_to_uuid_stem(tmp_path, family):
+    """记录无会话 id 且文件名词干是 uuid 形态时，词干即原生会话键。"""
+    name = f"{fixtures.NO_KEY_SESSION_FILE_UUID}.jsonl"
+    _, _, result = fixtures.adapt_family(
+        family, tmp_path, name, fixtures.no_session_key_records(),
+    )
+    assert result.sessions
+    for session in result.sessions:
+        assert session.native_session_id == fixtures.NO_KEY_SESSION_FILE_UUID
+
+
+@pytest.mark.parametrize("family", ["claude", "qoder"])
+def test_session_key_uses_deterministic_path_key_when_stem_is_not_an_id(
+    tmp_path, family,
+):
+    """导出副本 / 重命名文件的词干不是会话 id，不得产生伪会话键。
+
+    词干不匹配 uuid 形态时必须用确定性全路径键（``<family>-path:<path>``，
+    与 grok.py 的 ``grok-path:`` 模式等价），不同文件不再撞同一个键。
+    """
+    name = "session copy.jsonl"
+    _, _, result = fixtures.adapt_family(
+        family, tmp_path, name, fixtures.no_session_key_records(),
+    )
+    expected = f"{family}-path:{name}"
+    assert result.sessions
+    for session in result.sessions:
+        assert session.native_session_id == expected
+
+
+# ------------------------------------------------ P2 会话标题兜底
+
+@pytest.mark.parametrize("family", ["claude", "qoder"])
+def test_session_title_skips_placeholders_and_subagent_messages(tmp_path, family):
+    """标题不得取命令占位（``<...>`` 包裹），也不得取子代理首句。"""
+    _, _, result = fixtures.adapt_family(
+        family, tmp_path, "title.jsonl", fixtures.title_records(),
+    )
+    titles = {session.title for session in result.sessions}
+    assert fixtures.TITLE_REAL_TEXT in titles, titles
+    assert fixtures.TITLE_PLACEHOLDER_TEXT not in titles
+    assert fixtures.TITLE_SUBAGENT_TEXT not in titles
+
+
+@pytest.mark.parametrize("family", ["claude", "qoder"])
+def test_session_title_skips_agents_md_injection_block(tmp_path, family):
+    """AGENTS.md 注入块不是用户说的话，不得成为标题。"""
+    _, _, result = fixtures.adapt_family(
+        family, tmp_path, "title-agents.jsonl",
+        fixtures.title_agents_injection_records(),
+    )
+    assert result.sessions
+    assert all(
+        session.title == fixtures.TITLE_REAL_TEXT for session in result.sessions
+    ), [session.title for session in result.sessions]
 
 
 # ------------------------------------------------------------ 超限正文
@@ -245,3 +363,22 @@ def test_claude_qoder_detector_rejects_malformed_bytes_without_raising(
 ):
     artifact, root = artifacts.probe_file(tmp_path, name, raw)
     assert registry.detect_family(family, artifact, artifact_root=root) is False
+
+
+# ------------------------------------------------ P2 detect 有界分块探测
+
+@pytest.mark.parametrize("family", ["claude", "qoder"])
+def test_detector_scans_past_a_giant_first_record_without_reading_whole_file(
+    tmp_path, family,
+):
+    """P2：首条记录超过 16K 时探测器仍能找到其后的 DAG 记录。
+
+    分块扫描取代全文件读内存：记录形状判定在扫描上限内逐块进行，真实
+    导出（首条用户 prompt 本身可达数十 KB）不再因为窗口截断而漏判。
+    """
+    raw = artifacts.jsonl(fixtures.deep_first_record_records())
+    assert len(raw.encode("utf-8")) > 16_384, (
+        "fixture must exceed the single-chunk window for this test to mean anything"
+    )
+    artifact, root = artifacts.probe_file(tmp_path, "deep-first.jsonl", raw)
+    assert registry.detect_family(family, artifact, artifact_root=root) is True
