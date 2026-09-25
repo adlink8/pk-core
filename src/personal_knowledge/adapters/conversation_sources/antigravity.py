@@ -399,6 +399,7 @@ def _adapt_live_store(
     empty_steps = 0
     undecodable_steps = 0
     annotation_only_results = 0
+    unknown_fragments = 0
     json_steps = 0
     unreadable = 0
     call_owner: dict[str, list[str]] = {}
@@ -456,6 +457,11 @@ def _adapt_live_store(
                 for part in step_decode.parts:
                     kind = _PART_KINDS.get(part.role)
                     if kind is None:
+                        # A fragment whose role cannot be named must be
+                        # counted (and warned), never silently dropped: the
+                        # payload stays addressable through the step's
+                        # native_payload_ref either way.
+                        unknown_fragments += 1
                         continue
                     if part.role == "tool_result" and part.text is None:
                         annotation_only_results += 1
@@ -479,8 +485,10 @@ def _adapt_live_store(
                             artifact, f"{step_locator}#{part.role}",
                             session=anchor_native, native_id=native,
                         ),
-                        fidelity=_decoded_fidelity(),
-                        occurred_at=_iso_utc(step_decode.epoch),
+                    fidelity=_decoded_fidelity(
+                        has_body=part.text is not None or part.fallback_text is not None
+                    ),
+                    occurred_at=_iso_utc(step_decode.epoch),
                         ordinal=idx,
                         content=(
                             part.text if part.text is not None else part.fallback_text
@@ -564,6 +572,12 @@ def _adapt_live_store(
             f"{annotation_only_results} tool execution step(s) carried no "
             "recoverable result text; their f140/f1 annotations were recorded "
             "in the event summary and the step payload stays addressable"
+        )
+    if unknown_fragments:
+        warnings.append(
+            f"{unknown_fragments} protobuf part fragment(s) with an "
+            "unrecognized role were not mapped to a typed event; the step "
+            "payload stays addressable through the event payload reference"
         )
     if json_steps:
         warnings.append(f"{json_steps} step payload(s) decoded from JSON")
@@ -685,12 +699,19 @@ _PART_KINDS = {
 }
 
 
-def _decoded_fidelity() -> FidelityProfile:
-    """Fidelity for a fragment recovered from the protobuf wire format."""
+def _decoded_fidelity(*, has_body: bool = True) -> FidelityProfile:
+    """Fidelity for a fragment recovered from the protobuf wire format.
+
+    A fragment without recoverable text (annotation-only tool results excepted
+    via ``fallback_text``) may not claim CONTENT_AVAILABILITY complete: the
+    structure is decoded, but the body did not map.
+    """
     return _fidelity(
         STRUCTURE_COMPLETENESS=FidelityLevel.COMPLETE,
         RELATION_COMPLETENESS=FidelityLevel.PARTIAL,
-        CONTENT_AVAILABILITY=FidelityLevel.COMPLETE,
+        CONTENT_AVAILABILITY=(
+            FidelityLevel.COMPLETE if has_body else FidelityLevel.PARTIAL
+        ),
         COMPACTION_VISIBILITY=FidelityLevel.COMPLETE,
     )
 
@@ -937,14 +958,16 @@ def _decode_live_step(step_type: int, payload: bytes) -> _StepDecode | None:
             if text is None and summary is None:
                 # Neither a result nor annotations: nothing to emit beyond the
                 # payload reference the step already carries.
-                break
+                continue
             parts.append(_Part(
                 role="tool_result", text=text, summary=summary,
                 native=f"call:{call_id}:result" if call_id else None,
                 link=call_id, dispositions=dispositions,
                 fallback_text=annotations_body,
             ))
-            break
+            # Every f140 execution blob is mapped. The old code broke after
+            # the first blob and silently dropped any further executions
+            # recorded on the same step.
 
     elif step_type == 17:
         for blob in top.blobs(24):

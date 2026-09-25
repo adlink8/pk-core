@@ -338,6 +338,18 @@ class _Family:
         warnings: list[str] = []
         by_message: dict[str, TypedEvent] = {}
         unknown = 0
+        # Loss counters that must surface in warnings instead of vanishing:
+        # orphan parts (parent message absent from the artifact) and JSON
+        # payloads that could not be parsed.
+        orphan_parts = 0
+        bad_json = 0
+
+        def _load_json(value) -> dict:
+            nonlocal bad_json
+            parsed, ok = _json_object_checked(value)
+            if not ok:
+                bad_json += 1
+            return parsed
 
         # Mimo carries no session.model column; fall back per-session to the
         # first assistant message model id before building sessions so an open
@@ -350,6 +362,8 @@ class _Family:
         # pick it up.
         msg_cwd_by_session: dict[str, str] = {}
         for _msg in messages:
+            # Auxiliary pre-scan of the same payloads the message loop reads;
+            # parse loss is counted there (once per payload), not here.
             _data = _json_object(_msg["data"]) if live else dict(_msg)
             if isinstance(_data, dict):
                 _cand = (_data.get("modelID") or _data.get("model_id"))
@@ -413,7 +427,7 @@ class _Family:
             sid = str(msg["session_id"])
             session_id = make_event_id(self.family, artifact.artifact_id, CONTRACT_VERSION,
                                        sid, kind=EventKind.SESSION_LIFECYCLE)
-            data = _json_object(msg["data"]) if live else dict(msg)
+            data = _load_json(msg["data"]) if live else dict(msg)
             role = data.get("role")
             kind = EventKind.USER_MESSAGE if role == "user" else (
                 EventKind.ASSISTANT_MESSAGE if role == "assistant" else None)
@@ -462,8 +476,12 @@ class _Family:
         for part in parts:
             parent = by_message.get(str(part["message_id"]))
             if parent is None:
+                # The parent message is absent from the artifact (schema
+                # drift, allowlist gap): the part must be counted, not
+                # silently dropped.
+                orphan_parts += 1
                 continue
-            part_data = _json_object(part["data"]) if live else dict(part)
+            part_data = _load_json(part["data"]) if live else dict(part)
             part_type = part_data.get("type") if live else part["part_type"]
 
             if part_type == "tool":
@@ -594,6 +612,17 @@ class _Family:
 
         if unknown:
             warnings.append(f"{unknown} unknown native record(s) preserved")
+        if orphan_parts:
+            warnings.append(
+                f"{orphan_parts} orphan part(s) whose parent message is absent "
+                "from the artifact; they map to no typed event and stay only "
+                "in the source artifact"
+            )
+        if bad_json:
+            warnings.append(
+                f"{bad_json} malformed JSON payload(s) decoded as empty; "
+                "their raw bytes stay in the artifact"
+            )
 
         return AdaptationResult(
             family=self.family, adapter_version=ADAPTER_VERSION, contract_version=CONTRACT_VERSION,
@@ -632,23 +661,58 @@ def _sessions_with_parts(parts, messages) -> set[str]:
 
 
 def _json_object(value) -> dict:
+    """Parse ``value`` as a JSON object; failures decode to ``{}`` silently.
+
+    Adaptation paths that must report loss use :func:`_json_object_checked`.
+    """
+    return _json_object_checked(value)[0]
+
+
+def _json_object_checked(value) -> tuple[dict, bool]:
+    """Parse ``value`` as a JSON object -> ``(obj, parsed_ok)``.
+
+    ``parsed_ok`` is ``False`` when the value is a string that failed to
+    parse as JSON (or parsed to a non-object); the caller counts the loss
+    instead of letting it vanish.
+    """
+    if not isinstance(value, str):
+        return (value if isinstance(value, dict) else {}), True
     try:
-        parsed = json.loads(value) if isinstance(value, str) else value
+        parsed = json.loads(value)
     except ValueError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        return {}, False
+    if isinstance(parsed, dict):
+        return parsed, True
+    return {}, False
 
 
+# Fully-qualified counter names: unambiguous anywhere in a payload.
 _USAGE_ALIASES = {
-    "input_tokens": ("input_tokens", "inputTokens", "prompt_tokens", "input", "inputOther"),
-    "output_tokens": ("output_tokens", "outputTokens", "completion_tokens", "output", "outputOther"),
-    "cache_read": ("cache_read", "cacheRead", "inputCacheRead", "read"),
-    "cache_write": ("cache_write", "cacheWrite", "inputCacheCreation", "write"),
-    "total_tokens": ("total_tokens", "totalTokens", "total"),
+    "input_tokens": ("input_tokens", "inputTokens", "prompt_tokens", "inputOther"),
+    "output_tokens": ("output_tokens", "outputTokens", "completion_tokens", "outputOther"),
+    "cache_read": ("cache_read", "cacheRead", "inputCacheRead"),
+    "cache_write": ("cache_write", "cacheWrite", "inputCacheCreation"),
+    "total_tokens": ("total_tokens", "totalTokens"),
 }
 
+# Bare words that only mean token counters *inside* the native ``tokens``
+# aggregate (``{"total": .., "input": .., "output": .., "cache": {"read": ..,
+# "write": ..}}``) or a ``usage`` / ``cache`` sub-payload. As uncontexted
+# payload keys they are ordinary words (an ``input`` of a config, a numeric
+# ``read`` flag) and used to fabricate false USAGE events.
+_BARE_USAGE_ALIASES = {
+    "input_tokens": ("input",),
+    "output_tokens": ("output",),
+    "cache_read": ("read",),
+    "cache_write": ("write",),
+    "total_tokens": ("total",),
+}
 
-def _canonical_usage_summary(data):
+# Dict keys whose sub-payload is by definition a token/usage context.
+_TOKEN_CONTEXT_KEYS = ("tokens", "usage", "cache")
+
+
+def _canonical_usage_summary(data, *, token_context: bool = False):
     """Token counters from a nested payload -> canonical usage summary or None.
 
     Maps the real Mimo/OpenCode ``tokens`` aggregate (``{"total": ...,
@@ -657,39 +721,64 @@ def _canonical_usage_summary(data):
     ``input_tokens=X output_tokens=Y [cache_read=Z cache_write=W]`` (only
     fields present, integer values), e.g. ``input_tokens=307 output_tokens=253
     cache_read=41152``. Canonical fields are always ordered first.
+
+    Bare aliases (``input`` / ``output`` / ``total`` / ``read`` / ``write``)
+    are trusted only in a token context: the whole payload when
+    ``token_context=True`` (caller already extracted the ``usage`` dict), or a
+    sub-payload reached through a ``tokens`` / ``usage`` / ``cache`` key.
     """
-    def resolve_counter(key):
+
+    def resolve_counter(key, bare_ok):
         for canonical, aliases in _USAGE_ALIASES.items():
             if key in aliases:
                 return canonical
+        if bare_ok:
+            for canonical, aliases in _BARE_USAGE_ALIASES.items():
+                if key in aliases:
+                    return canonical
         return None
 
-    counters = {}
+    counters: dict[str, int] = {}
 
-    def flatten(node, base=''):
+    def flatten(node, bare_ok):
         if not isinstance(node, dict):
             return
         for key, value in node.items():
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                canonical = resolve_counter(key)
+                canonical = resolve_counter(key, bare_ok)
                 if canonical:
                     counters.setdefault(canonical, int(value))
             elif isinstance(value, dict):
-                flatten(value, key)
+                flatten(value, bare_ok or key in _TOKEN_CONTEXT_KEYS)
 
-    tokens = data.get('tokens') if isinstance(data, dict) else None
-    if isinstance(tokens, dict):
-        flatten(tokens)
-    elif isinstance(data, dict):
-        flatten(data)
+    if isinstance(data, dict):
+        if isinstance(data.get("tokens"), dict):
+            flatten(data["tokens"], bare_ok=True)
+        else:
+            flatten(data, bare_ok=token_context)
     if not counters:
         return None
     return " ".join(str(k) + "=" + str(counters[k]) for k in _USAGE_ALIASES if k in counters)
 
 
+def _is_system_placeholder_title(text) -> bool:
+    """True when a candidate title is system-injected scaffolding rather than
+    a real user-authored title (aligned with codex / gemini / zcode):
+    directive blocks opening with ``<`` (e.g. <INSTRUCTIONS>, <AGENTS...),
+    AGENTS.md / 'instructions for' markers."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if text.lstrip().startswith("<"):
+        return True
+    lowered = text[:120].lower()
+    return "agents.md" in lowered or "instructions for" in lowered
+
+
 def _session_title(row, live):
     title = row["title"] if "title" in row.keys() else None
-    return (title.strip()[:256] if isinstance(title, str) and title.strip() else None)
+    if isinstance(title, str) and title.strip() and not _is_system_placeholder_title(title):
+        return title.strip()[:256]
+    return None
 
 
 def _session_cwd_field(row):
@@ -741,7 +830,9 @@ def _mimo_usage_summary(msg, data, live):
             parsed = _json_object(usage)
             usage = parsed or None
     if isinstance(usage, dict):
-        return _canonical_usage_summary(usage)
+        # The usage dict itself is a token context: bare counter words
+        # (input/output/...) are meaningful here.
+        return _canonical_usage_summary(usage, token_context=True)
     return _canonical_usage_summary(data)
 
 

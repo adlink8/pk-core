@@ -89,6 +89,25 @@ def _printable_ratio(text: str) -> float:
     return ok / len(text)
 
 
+def _noise_is_contiguous_tail(text: str) -> bool:
+    """True when the text is clean prose followed only by non-printable noise.
+
+    Lenient decoding must not fabricate prose out of low-noise binary. The
+    honest lenient case is a text field concatenated with a small binary
+    tail: printable characters up front, non-printable ones only at the end.
+    Noise scattered *through* printable text means the buffer is really
+    binary, and rendering it as text would invent content.
+    """
+    noise_started = False
+    for ch in text:
+        printable = ch.isprintable() or ch in "\n\r\t"
+        if not printable:
+            noise_started = True
+        elif noise_started:
+            return False
+    return noise_started
+
+
 def _decode_utf8(chunk: bytes) -> str | None:
     try:
         return chunk.decode("utf-8") or None
@@ -122,10 +141,13 @@ def as_text(chunk: bytes, *, lenient: bool = False) -> str | None:
     """Return ``chunk`` decoded as text, or ``None`` if it is binary.
 
     A chunk counts as text when it is valid UTF-8 and every character is
-    printable (newlines/tabs allowed). ``lenient`` additionally accepts mostly
-    printable buffers, which is useful for recovering a text field that was
-    concatenated with a small binary tail. When plain UTF-8 is not fully
-    printable the NUL-padded UTF-16 form is tried as a fallback.
+    printable (newlines/tabs allowed). ``lenient`` additionally accepts clean
+    text concatenated with a small binary tail: the printable characters must
+    all precede the non-printable ones (and the printable ratio must exceed
+    0.9). Noise scattered through printable text is still rejected — such a
+    buffer is really binary, and rendering it as prose would invent content.
+    When plain UTF-8 is not fully printable the NUL-padded UTF-16 form is
+    tried as a fallback.
     """
     if not chunk:
         return None
@@ -139,7 +161,7 @@ def as_text(chunk: bytes, *, lenient: bool = False) -> str | None:
             best, best_ratio = text, ratio
     if best is None:
         return None
-    if lenient and best_ratio > 0.9:
+    if lenient and best_ratio > 0.9 and _noise_is_contiguous_tail(best):
         return best
     return None
 

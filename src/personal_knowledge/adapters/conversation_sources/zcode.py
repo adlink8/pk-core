@@ -105,13 +105,30 @@ def _fidelity(**overrides) -> FidelityProfile:
     return FidelityProfile.from_levels(levels)
 
 
+# Fully-qualified counter names: unambiguous anywhere in a payload.
 _USAGE_ALIASES = {
-    "input_tokens": ("input_tokens", "inputTokens", "prompt_tokens", "input"),
-    "output_tokens": ("output_tokens", "outputTokens", "completion_tokens", "output"),
-    "cache_read": ("cache_read", "cacheRead", "cached_input_tokens", "read"),
-    "cache_write": ("cache_write", "cacheWrite", "cache_creation_input_tokens", "write"),
-    "total_tokens": ("total_tokens", "totalTokens", "total"),
+    "input_tokens": ("input_tokens", "inputTokens", "prompt_tokens"),
+    "output_tokens": ("output_tokens", "outputTokens", "completion_tokens"),
+    "cache_read": ("cache_read", "cacheRead", "cached_input_tokens"),
+    "cache_write": ("cache_write", "cacheWrite", "cache_creation_input_tokens"),
+    "total_tokens": ("total_tokens", "totalTokens"),
 }
+
+# Bare words that only mean token counters *inside* the native ``tokens``
+# aggregate (``{"total": .., "input": .., "output": .., "cache": {"read": ..,
+# "write": ..}}``) or a ``usage`` / ``cache`` sub-payload. As uncontexted
+# payload keys they are ordinary words and used to fabricate false USAGE
+# events (same convergence as the mimo/opencode adapter).
+_BARE_USAGE_ALIASES = {
+    "input_tokens": ("input",),
+    "output_tokens": ("output",),
+    "cache_read": ("read",),
+    "cache_write": ("write",),
+    "total_tokens": ("total",),
+}
+
+# Dict keys whose sub-payload is by definition a token/usage context.
+_TOKEN_CONTEXT_KEYS = ("tokens", "usage", "cache")
 
 
 def _usage_summary(data) -> str | None:
@@ -122,21 +139,34 @@ def _usage_summary(data) -> str | None:
     "cache": {"read": ..., "write": ...}}) - onto the canonical grammar
     "input_tokens=X output_tokens=Y [cache_read=Z cache_write=W]" (only
     present, integer values). Returns None when no counters are present.
+
+    Bare aliases (``input`` / ``output`` / ``total`` / ``read`` / ``write``)
+    are trusted only inside a token context: a sub-payload reached through a
+    ``tokens`` / ``usage`` / ``cache`` key.
     """
     counters: dict[str, int] = {}
 
-    def walk(obj) -> None:
+    def resolve_counter(key, bare_ok) -> str | None:
+        for canonical, aliases in _USAGE_ALIASES.items():
+            if key in aliases:
+                return canonical
+        if bare_ok:
+            for canonical, aliases in _BARE_USAGE_ALIASES.items():
+                if key in aliases:
+                    return canonical
+        return None
+
+    def walk(obj, bare_ok) -> None:
         if isinstance(obj, dict):
             for key, value in obj.items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    for canonical, aliases in _USAGE_ALIASES.items():
-                        if key in aliases:
-                            counters.setdefault(canonical, int(value))
-                            break
+                    canonical = resolve_counter(key, bare_ok)
+                    if canonical:
+                        counters.setdefault(canonical, int(value))
                 elif isinstance(value, dict):
-                    walk(value)
+                    walk(value, bare_ok or key in _TOKEN_CONTEXT_KEYS)
 
-    walk(data)
+    walk(data, bare_ok=False)
     if not counters:
         return None
     return " ".join(
@@ -253,15 +283,21 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
 
     # Session end = last native activity across its messages + parts (time_updated
     # preferred, falling back to time_created / created_at), keyed by the native
-    # session/trace id so AdaptedSession.ended_at is filled. Values sort lexically
-    # within one source's consistent timestamp format (ISO or epoch-ms integers).
+    # session/trace id so AdaptedSession.ended_at is filled. Values are compared
+    # AFTER normalize_timestamp so a store mixing ISO strings and epoch-ms
+    # integers (schema drift, hand-edited rows) is compared on one canonical
+    # UTC ISO shape instead of a lexicographic order that ranks "2026-.." above
+    # "17..." epoch strings.
     last_activity_by_sid: dict[str, str] = {}
 
     def _fold_activity(sid: str, ts) -> None:
         if not ts:
             return
-        text = str(ts)
-        if text > last_activity_by_sid.get(sid, ""):
+        text = normalize_timestamp(ts)
+        if not text:
+            return
+        current = last_activity_by_sid.get(sid)
+        if current is None or text > current:
             last_activity_by_sid[sid] = text
 
     # Round-5 fix: the native session row's own time_updated can be touched
@@ -290,6 +326,15 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     warnings: list[str] = []
     by_part: dict[str, TypedEvent] = {}
     unknown = 0
+    # Malformed JSON payloads decoded as empty must be counted, not vanish.
+    bad_json = 0
+
+    def _load_json(value) -> dict:
+        nonlocal bad_json
+        parsed, ok = _json_object_checked(value)
+        if not ok:
+            bad_json += 1
+        return parsed
     # first real (non-system) user-message text per native session, for the
     # title fallback when the stored title is absent or system scaffolding.
     first_user_text_by_sid: dict[str, str] = {}
@@ -339,7 +384,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     siblings_by_message: dict[str, list] = {}
     if live:
         for message in messages:
-            data = _json_object(message["data"])
+            data = _load_json(message["data"])
             message_roles[str(message["id"])] = data.get("role")
         for part in parts:
             siblings_by_message.setdefault(str(part["message_id"]), []).append(part)
@@ -351,7 +396,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             if str(row["id"]) != str(part["id"])
         ]
         if not others or not all(
-            _json_object(row["data"]).get("type") == "file" for row in others
+            _load_json(row["data"]).get("type") == "file" for row in others
         ):
             return []
         return sorted(str(row["id"]) for row in others)
@@ -360,7 +405,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
         sid = str(part["session_id"] if live else part["trace_id"])
         session_id = make_event_id(FAMILY, artifact.artifact_id, CONTRACT_VERSION,
                                    sid, kind=EventKind.SESSION_LIFECYCLE)
-        data = _json_object(part["data"]) if live else dict(part)
+        data = _load_json(part["data"]) if live else dict(part)
         ptype = data.get("type") if live else part["part_type"]
         kind = _PART_KINDS.get(ptype)
         part_id = str(part["id"] if live else part["part_id"])
@@ -595,6 +640,11 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
 
     if unknown:
         warnings.append(f"{unknown} unknown part type(s) preserved")
+    if bad_json:
+        warnings.append(
+            f"{bad_json} malformed JSON payload(s) decoded as empty; "
+            "their raw bytes stay in the artifact"
+        )
 
     return AdaptationResult(
         family=FAMILY, adapter_version=ADAPTER_VERSION, contract_version=CONTRACT_VERSION,
@@ -605,11 +655,29 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
 
 
 def _json_object(value) -> dict:
+    """Parse ``value`` as a JSON object; failures decode to ``{}`` silently.
+
+    Adaptation paths that must report loss use :func:`_json_object_checked`.
+    """
+    return _json_object_checked(value)[0]
+
+
+def _json_object_checked(value) -> tuple[dict, bool]:
+    """Parse ``value`` as a JSON object -> ``(obj, parsed_ok)``.
+
+    ``parsed_ok`` is ``False`` when the value is a string that failed to
+    parse as JSON (or parsed to a non-object); the caller counts the loss
+    instead of letting it vanish.
+    """
+    if not isinstance(value, str):
+        return (value if isinstance(value, dict) else {}), True
     try:
-        parsed = json.loads(value) if isinstance(value, str) else value
+        parsed = json.loads(value)
     except ValueError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        return {}, False
+    if isinstance(parsed, dict):
+        return parsed, True
+    return {}, False
 
 
 def _add_timeline_text(pieces: list[str], value) -> None:

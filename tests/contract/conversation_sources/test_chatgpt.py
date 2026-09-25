@@ -141,3 +141,43 @@ def test_chatgpt_sqlite_messages_explain_missing_content(tmp_path):
     # 隐私边界：允许清单外的凭据表整表排除，哨兵值不得抵达事件。
     assert any("credentials" in d for d in artifact.privacy_dispositions)
     assert artifacts.CANARY not in artifacts.event_text(result)
+
+
+# --------------------------------- 时间戳零归一化补口（P2 收尾）
+
+def test_chatgpt_timestamps_go_through_normalize(tmp_path):
+    """AgentsView 行的时间戳可能是 epoch-ms 数字串或非 Z 时区的 ISO。
+
+    它们必须在适配器里归一成规范 UTC ``Z`` 形状，而不是原样透传给
+    ``occurred_at`` / ``started_at`` / ``ended_at``。
+    """
+    db = tmp_path / "sessions.db"
+    chatgpt.make_agentsview_db(
+        db,
+        sessions=(
+            # epoch 毫秒数字串 -> 2023-11-14T22:13:20Z
+            (chatgpt.PATHLESS_SESSION_ID, "chatgpt", "1700000000000",
+             "1700000000500", None, None),
+        ),
+        messages=(
+            # 带非 UTC 时区的 ISO -> 2026-07-01T04:00:00Z
+            (
+                "message-tz", chatgpt.PATHLESS_SESSION_ID, 1, "user",
+                chatgpt.PATHLESS_USER_TEXT, "2026-07-01T12:00:00+08:00", 0, 0,
+            ),
+        ),
+    )
+    artifact, root = chatgpt.captured_agentsview(db, tmp_path)
+    result = registry.adapt_for(
+        "chatgpt", artifacts.single(artifact), artifact_root=root
+    )
+
+    session = result.sessions[0]
+    assert session.started_at == "2023-11-14T22:13:20Z"
+    assert session.ended_at == "2023-11-14T22:13:20.500Z"
+
+    lifecycle = artifacts.event_with(result, EventKind.SESSION_LIFECYCLE)
+    assert lifecycle.occurred_at == "2023-11-14T22:13:20Z"
+
+    message = artifacts.event_with(result, EventKind.USER_MESSAGE)
+    assert message.occurred_at == "2026-07-01T04:00:00Z"

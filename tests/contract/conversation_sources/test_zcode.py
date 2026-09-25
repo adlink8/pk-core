@@ -244,3 +244,48 @@ def test_zcode_honest_empty_native_records_explain_themselves(tmp_path: Path) ->
             "attachment-only user message",
         ),
     ]
+
+
+# --------------------- 混存时间戳折叠 / usage 裸词收敛 / 坏 JSON 计数（P2 收尾）
+
+def test_zcode_ended_at_folds_normalized_timestamps(tmp_path: Path) -> None:
+    """ISO 与 epoch-ms 混存时 ended_at 折叠必须先 normalize 再比较。
+
+    字典序上 "2023-11-14..." > "1893456000000"，但时间上 2030 的 epoch 毫秒
+    更晚：先 normalize 到 UTC ISO 再取 max 才能拿到正确的会话终点。
+    """
+    artifact, root = zcode.live_loss_artifact(tmp_path)
+    result = registry.adapt_for(FAMILY, artifacts.single(artifact), artifact_root=root)
+    assert result.sessions[0].ended_at == zcode.EXPECTED_ENDED_AT_ISO
+
+
+def test_zcode_bare_counter_words_outside_token_context_make_no_usage(
+    tmp_path: Path,
+) -> None:
+    """顶层裸词 ``input`` / ``read`` 数字不是 token 计数，不得伪造 USAGE。"""
+    artifact, root = zcode.live_loss_artifact(tmp_path)
+    result = registry.adapt_for(FAMILY, artifacts.single(artifact), artifact_root=root)
+    bare_usage = [
+        event for event in result.events
+        if event.provenance.native_event_id == "part-bare:usage"
+    ]
+    assert bare_usage == [], (
+        "bare word counters outside a token context fabricated a USAGE event"
+    )
+
+
+def test_zcode_tokens_aggregate_maps_canonically(tmp_path: Path) -> None:
+    """``tokens`` 聚合里的裸词在 token 上下文里照常映射成规范 usage。"""
+    artifact, root = zcode.live_loss_artifact(tmp_path)
+    result = registry.adapt_for(FAMILY, artifacts.single(artifact), artifact_root=root)
+    usage = _event_by_native(result, "part-tokens:usage")
+    assert usage.summary == zcode.LOSS_TOKENS_AGGREGATE_SUMMARY
+
+
+def test_zcode_malformed_json_payloads_are_counted(tmp_path: Path) -> None:
+    """坏 JSON 载荷解码为空必须计数进 warnings，不许静默变 {}。"""
+    artifact, root = zcode.live_loss_artifact(tmp_path)
+    result = registry.adapt_for(FAMILY, artifacts.single(artifact), artifact_root=root)
+    assert any(
+        "1 malformed JSON payload(s)" in w for w in result.warnings
+    ), result.warnings

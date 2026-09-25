@@ -21,6 +21,9 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     SourceArtifact,
     SourceArtifactSet,
 )
+from personal_knowledge.adapters.conversation_sources.time_utils import (
+    normalize_timestamp,
+)
 from personal_knowledge.core.conversation_events import (
     AdaptedSession,
     EventContractError,
@@ -183,8 +186,10 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             provenance=provenance,
             fidelity=_fidelity(),
             native_session_id=native_session_id,
-            started_at=row["started_at"],
-            ended_at=row["ended_at"],
+            # Native timestamps reach the canonical shape here, not downstream:
+            # AgentsView rows may hold epoch-ms integers or non-Z ISO stamps.
+            started_at=normalize_timestamp(row["started_at"]),
+            ended_at=normalize_timestamp(row["ended_at"]),
             field_dispositions=(unavailable_path,),
         ))
         events.append(TypedEvent(
@@ -200,7 +205,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
             kind=EventKind.SESSION_LIFECYCLE,
             provenance=provenance,
             fidelity=_fidelity(),
-            occurred_at=row["started_at"],
+            occurred_at=normalize_timestamp(row["started_at"]),
             field_dispositions=(unavailable_path,),
         ))
 
@@ -249,7 +254,7 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
                 event_id=native_message_id,
             ),
             fidelity=_fidelity(),
-            occurred_at=row["timestamp"],
+            occurred_at=normalize_timestamp(row["timestamp"]),
             ordinal=row["ordinal"],
             native_payload_ref=f"{artifact.artifact_id}:messages:{native_message_id}",
             content=content,

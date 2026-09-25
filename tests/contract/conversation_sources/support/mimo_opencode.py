@@ -299,3 +299,103 @@ def event_named(result, native_id: str):
         event for event in result.events
         if event.provenance.native_event_id == native_id
     )
+
+
+# ------------------------------------------- 丢失可见性（live 形状专用夹具）
+
+# 系统注入的脚手架标题：必须被滤掉，不许成为 session title。
+LOSS_PLACEHOLDER_TITLE = "<INSTRUCTIONS> agents.md scaffold for the agent"
+
+# usage 夹具断言值：usage 字典与 tokens 聚合各自映射出的规范串。
+LOSS_USAGE_DICT_SUMMARY = "input_tokens=5 output_tokens=6"
+LOSS_TOKENS_AGGREGATE_SUMMARY = (
+    "input_tokens=10 output_tokens=20 cache_read=1 cache_write=2 total_tokens=33"
+)
+
+
+def _write_live_loss_db(path: Path) -> None:
+    """live 形状库：孤儿 part、坏 JSON 载荷、usage 裸词收敛、占位标题。
+
+    覆盖四类「以前静默或误报」的形态：
+
+    * ``p-orphan`` 指向不存在的 message —— 必须计数进 warnings；
+    * ``m-bad`` 的 ``data`` 不是合法 JSON —— 必须计数进 warnings；
+    * ``p-bare`` 顶层裸词 ``input`` / ``read`` 数字 —— 不得伪造 USAGE 事件；
+    * ``m-ok`` 的 ``usage`` 字典与 ``p-tokens`` 的 ``tokens`` 聚合 ——
+      裸词在 token 上下文里必须照常映射成规范 usage。
+    """
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, title TEXT,
+                time_created TEXT, time_updated TEXT, time_compacting TEXT
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT,
+                time_created TEXT, time_updated TEXT, data TEXT
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                time_created TEXT, time_updated TEXT, data TEXT
+            );
+            """
+        )
+        con.execute(
+            "INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)",
+            ("s-loss", None, LOSS_PLACEHOLDER_TITLE,
+             "2026-07-01T00:00:00Z", "2026-07-01T00:00:01Z", None),
+        )
+        con.execute(
+            "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+            ("m-ok", "s-loss", "2026-07-01T00:00:03Z", "2026-07-01T00:00:03Z",
+             json.dumps({
+                 "role": "user",
+                 "input": 9,  # 顶层裸词，不在 token 上下文：不得计数
+                 "usage": {"input": 5, "output": 6},
+             })),
+        )
+        con.execute(
+            "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
+            ("m-bad", "s-loss", "2026-07-01T00:00:04Z", "2026-07-01T00:00:04Z",
+             "{not json"),
+        )
+        parts = [
+            # 孤儿：父消息不在 artifact 里。
+            ("p-orphan", "m-missing", "s-loss",
+             {"type": "text", "text": "fixture orphan body"}),
+            # 顶层裸词数字：usage 收敛前会被误报成 USAGE。
+            ("p-bare", "m-ok", "s-loss",
+             {"type": "text", "text": "fixture bare body",
+              "input": 123, "read": 5}),
+            # tokens 聚合：裸词在 token 上下文里照常映射。
+            ("p-tokens", "m-bad", "s-loss",
+             {"type": "text", "text": "fixture tokens body",
+              "tokens": {"input": 10, "output": 20,
+                         "cache": {"read": 1, "write": 2}, "total": 33}}),
+        ]
+        for part_id, message_id, session_id, payload in parts:
+            con.execute(
+                "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
+                (part_id, message_id, session_id, "2026-07-01T00:00:05Z",
+                 "2026-07-01T00:00:05Z", json.dumps(payload)),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def live_loss_store(tmp_path: Path, family: str) -> tuple[SourceArtifact, Path]:
+    """丢失可见性 live 库 -> ``(artifact, artifact_root)``。"""
+    label = f"mimo_opencode.live.loss.{family}"
+    root = Path(tmp_path) / f"{family}-loss"
+    root.mkdir(parents=True, exist_ok=True)
+    digest = artifacts.blob_name(label)
+    blob = root / digest[:32]
+    _write_live_loss_db(blob)
+    artifact = _sqlite_artifact(
+        root, digest=digest, artifact_id=f"art-{label}", family=family,
+        relative_path=f"{family}-loss.db",
+    )
+    return artifact, root

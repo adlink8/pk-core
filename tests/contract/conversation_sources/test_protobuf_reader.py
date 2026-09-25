@@ -88,6 +88,25 @@ class TestTextDetection:
         # one stray control byte in eleven: > 0.9 printable
         assert as_text(b"abcdefghij" + b"\x01", lenient=True) == "abcdefghij\x01"
 
+    def test_lenient_accepts_text_with_small_binary_tail(self):
+        # same rule at a larger size: the NUL gets dropped by the UTF-16
+        # recovery fallback, leaving clean text + a one-byte binary tail
+        assert as_text(b"clean text body" + b"\x00\x01", lenient=True) == (
+            "clean text body\x01"
+        )
+
+    def test_lenient_rejects_scattered_noise(self):
+        # > 0.9 printable, but the control bytes are scattered THROUGH the
+        # text instead of forming a tail: such a buffer is really binary and
+        # must not be rendered as prose (no content invention).
+        scattered = b"abcdefghijklmnopqrs\x01t\x02uvwxyz"
+        assert len(scattered) == 28
+        assert as_text(scattered, lenient=True) is None
+
+    def test_lenient_rejects_noise_between_text_runs(self):
+        # printable -> noise -> printable: the noise is not a tail
+        assert as_text(b"abcdef\x01ghijklmnop", lenient=True) is None
+
     def test_lenient_still_rejects_heavily_binary_buffer(self):
         assert as_text(b"abc" + b"\x01" * 7, lenient=True) is None
 

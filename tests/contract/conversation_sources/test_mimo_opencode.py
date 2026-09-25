@@ -177,3 +177,62 @@ def test_mimo_oversized_bodies_are_kept_in_full(tmp_path):
         assert not artifacts.any_reason(result, "truncated"), (
             f"{family}: content cap removed, no truncation disposition allowed"
         )
+
+
+# --------------------------- 丢失可见性 / usage 裸词收敛 / 占位标题（P2 收尾）
+
+@pytest.fixture(params=mio.FAMILIES)
+def loss(tmp_path, request):
+    """丢失可见性 live 库的适配结果 ``(family, result)``。"""
+    family = request.param
+    artifact, root = mio.live_loss_store(tmp_path, family)
+    result = registry.adapt_for(
+        family, artifacts.single(artifact), artifact_root=root,
+    )
+    return family, result
+
+
+def test_orphan_parts_are_counted_in_warnings(loss):
+    """父消息不在 artifact 里的 part 必须计数进 warnings，不许静默消失。"""
+    _family, result = loss
+    assert any("1 orphan part(s)" in w for w in result.warnings), result.warnings
+
+
+def test_malformed_json_payloads_are_counted_in_warnings(loss):
+    """坏 JSON 载荷解码为空必须计数进 warnings，不许静默变 {}。"""
+    _family, result = loss
+    assert any(
+        "1 malformed JSON payload(s)" in w for w in result.warnings
+    ), result.warnings
+
+
+def test_bare_counter_words_outside_token_context_make_no_usage(loss):
+    """顶层裸词 ``input`` / ``read`` 数字不是 token 计数，不得伪造 USAGE。"""
+    _family, result = loss
+    bare_usage = [
+        event for event in result.events
+        if event.provenance.native_event_id == "p-bare:usage"
+    ]
+    assert bare_usage == [], (
+        "bare word counters outside a token context fabricated a USAGE event"
+    )
+
+
+def test_usage_dict_and_tokens_aggregate_map_canonically(loss):
+    """裸词在 token 上下文（usage 字典 / tokens 聚合）里照常映射成规范 usage。"""
+    _family, result = loss
+    assert mio.event_named(result, "m-ok:usage").summary == (
+        mio.LOSS_USAGE_DICT_SUMMARY
+    )
+    assert mio.event_named(result, "p-tokens:usage").summary == (
+        mio.LOSS_TOKENS_AGGREGATE_SUMMARY
+    )
+
+
+def test_placeholder_session_title_is_filtered(loss):
+    """系统注入的脚手架标题不得成为 session title（对齐 codex / zcode）。"""
+    _family, result = loss
+    session = next(
+        s for s in result.sessions if s.native_session_id == "s-loss"
+    )
+    assert session.title is None

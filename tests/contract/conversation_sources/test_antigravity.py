@@ -20,6 +20,9 @@ import json
 from pathlib import Path
 
 from personal_knowledge.adapters.conversation_sources import discovery, registry
+from personal_knowledge.adapters.conversation_sources import (
+    antigravity as antigravity_module,
+)
 from personal_knowledge.core.conversation_events import (
     EventKind,
     FidelityDimension,
@@ -663,3 +666,64 @@ class TestLegacyMissingCreatedAt:
         # step 时间列存在时事件时间戳不受影响。
         step_events = [e for e in result.events if e.kind is EventKind.USER_MESSAGE]
         assert step_events and step_events[0].occurred_at == "2026-09-16T03:37:12Z"
+
+
+# --------------------- 丢失可见性 / 诚实保真度（P2 收尾，live 形状专用）
+
+def _two_execution_step() -> bytes:
+    """step_type=132 带两个 f140 执行 blob：每个都必须映射成 tool result。"""
+    f5 = fixtures.ld(
+        4,
+        fixtures.st(1, "call_1") + fixtures.st(2, "run_command")
+        + fixtures.st(3, "{}"),
+    )
+    return (
+        fixtures.vi(1, 132) + fixtures.vi(4, 3) + fixtures.ld(5, f5)
+        + fixtures.ld(140, fixtures.ld(2, fixtures.st(1, "first result")))
+        + fixtures.ld(140, fixtures.ld(2, fixtures.st(1, "second result")))
+    )
+
+
+def _no_argument_tool_call_step() -> bytes:
+    """step_type=15 的 f20/f7 工具调用只带 call id 与工具名，没有 f3 参数。"""
+    f20 = fixtures.ld(
+        7, fixtures.st(1, "call_1") + fixtures.st(2, "run_command"),
+    )
+    return fixtures.step(15, fixtures.ld(20, f20))
+
+
+def test_step_type_132_maps_every_execution_blob(tmp_path):
+    """同一个 step 里的第二个 f140 执行 blob 不得被 break 丢掉。"""
+    db = fixtures.live_db(tmp_path, [(132, _two_execution_step())])
+    result = _adapt_live(db)
+    results = [e for e in result.events if e.kind is EventKind.TOOL_RESULT]
+    assert {e.content for e in results} == {"first result", "second result"}
+    assert any(e.content == "first result" for e in results)
+    assert any(e.content == "second result" for e in results)
+
+
+def test_tool_call_without_arguments_is_honestly_partial(tmp_path):
+    """读不出正文的解码片段不得谎报 CONTENT_AVAILABILITY=complete。"""
+    db = fixtures.live_db(tmp_path, [(15, _no_argument_tool_call_step())])
+    result = _adapt_live(db)
+    call = _only(result, EventKind.TOOL_CALL)
+    assert call.content is None
+    assert (
+        call.fidelity.level(FidelityDimension.CONTENT_AVAILABILITY)
+        is FidelityLevel.PARTIAL
+    )
+
+
+def test_unrecognized_role_fragments_are_counted(tmp_path, monkeypatch):
+    """无法命名角色的解码片段必须计数进 warnings，不许静默 continue。"""
+    kinds = dict(antigravity_module._PART_KINDS)
+    del kinds["assistant"]
+    monkeypatch.setattr(antigravity_module, "_PART_KINDS", kinds)
+    db = fixtures.live_db(
+        tmp_path, [(15, fixtures.assistant_reply_step(ASSISTANT_REPLY))]
+    )
+    result = _adapt_live(db)
+    assert any(
+        "1 protobuf part fragment(s) with an unrecognized role" in w
+        for w in result.warnings
+    ), result.warnings

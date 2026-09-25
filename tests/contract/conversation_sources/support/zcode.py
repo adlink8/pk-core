@@ -506,3 +506,78 @@ def store_artifact(
         byte_limit=1_000_000,
         count_limit=8,
     )
+
+
+# ------------------------------------- 丢失可见性（在线库）：混存时间戳等
+
+# 混存时间戳基准：session.time_updated 是 epoch 毫秒 int（2030-01-01），
+# message.time_updated 是 ISO 字符串（更早但字典序更大）。字典序折叠会
+# 选错 ended_at；先 normalize 再比较才能得到 2030。
+MIXED_SESSION_UPDATED_MS = 1_893_456_000_000   # -> 2030-01-01T00:00:00Z
+MIXED_MESSAGE_UPDATED_ISO = "2023-11-14T22:13:21Z"
+EXPECTED_ENDED_AT_ISO = "2030-01-01T00:00:00Z"
+
+# usage 夹具断言值。
+LOSS_TOKENS_AGGREGATE_SUMMARY = (
+    "input_tokens=10 output_tokens=20 cache_read=1 cache_write=2 total_tokens=33"
+)
+
+
+def build_live_loss_db(path: Path) -> None:
+    """在线形态库：混存时间戳、坏 JSON 载荷、usage 裸词收敛、孤儿 part。"""
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(_LIVE_SCHEMA)
+        con.execute(
+            "INSERT INTO session VALUES (?, ?, ?, ?, ?, ?)",
+            ("sess-1", None, "fixture session",
+             1_700_000_000_000, MIXED_SESSION_UPDATED_MS, "/tmp/fixture"),
+        )
+        con.executemany(
+            "INSERT INTO message VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("msg-user", "sess-1",
+                 1_700_000_000_000, MIXED_MESSAGE_UPDATED_ISO,
+                 json.dumps({"role": "user"}), 1),
+            ],
+        )
+        parts = [
+            # 顶层裸词数字：usage 收敛前会被误报成 USAGE。
+            ("part-bare", "msg-user", "sess-1", 1_700_000_000_000, None,
+             json.dumps({"type": "text", "text": LIVE_USER_TEXT,
+                         "input": 123, "read": 5}), 2),
+            # tokens 聚合：裸词在 token 上下文里照常映射。
+            ("part-tokens", "msg-user", "sess-1", 1_700_000_000_000, None,
+             json.dumps({"type": "text", "text": "fixture tokens body",
+                         "tokens": {"input": 10, "output": 20,
+                                    "cache": {"read": 1, "write": 2},
+                                    "total": 33}}), 3),
+            # 坏 JSON 载荷：必须计数进 warnings。
+            ("part-bad", "msg-user", "sess-1", 1_700_000_000_000, None,
+             "{not json", 4),
+            # 孤儿：父消息不在库里（在线形态会落成带解释的 unknown 事件）。
+            ("part-orphan", "msg-missing", "sess-1", 1_700_000_000_000, None,
+             json.dumps({"type": "text", "text": "fixture orphan body"}), 5),
+        ]
+        con.executemany(
+            "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?, ?)", parts
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def live_loss_artifact(
+    directory: Path,
+    *,
+    label: str = "zcode.live.loss",
+) -> tuple[SourceArtifact, Path]:
+    """丢失可见性在线库字节 -> ``(artifact, artifact_root)``。"""
+    directory = Path(directory)
+    db = directory / ".build" / f"{label}.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    build_live_loss_db(db)
+    return artifacts.file_artifact(
+        directory, label, "db.sqlite", db.read_bytes(),
+        family="zcode", source_kind="sqlite",
+    )

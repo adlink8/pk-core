@@ -50,6 +50,48 @@ LAST_PROMPT_AGENT_ID = "agent-fixture-lp"
 LAST_PROMPT_TEXT = "夹具：上一次提示只有这句假文本。"
 LAST_PROMPT_AGENT_TEXT = "夹具：子代理在 last-prompt 旁边的假回复。"
 
+# P1-10：无 message 信封的运维 / 元数据记录（role 污染源）。
+META_SESSION_ID = "s-meta"
+META_SESSION_STATE_TYPES = (
+    "last-prompt",
+    "mode",
+    "permission-mode",
+    "ai-title",
+    "queue-operation",
+    "pr-link",
+    "active-leaf",
+    "runtime-config",
+)
+META_FILE_CONTEXT_TYPES = (
+    "attachment",
+    "file-history-snapshot",
+    "file-history-delta",
+    "workspace-directories",
+    "worktree-state",
+)
+
+# P1-7：没有任何 sessionId / session_id 的 DAG 记录（会话键兜底路径）。
+NO_KEY_SESSION_FILE_UUID = "3cba7d05-d4a9-4c6a-8d05-3cba7d05d4a9"
+NO_KEY_USER_TEXT = "夹具：没有会话键的用户句。"
+NO_KEY_ASSISTANT_TEXT = "夹具：没有会话键的助手句。"
+
+# P2 title：占位正文与真标题。
+TITLE_SESSION_ID = "s-title"
+TITLE_PLACEHOLDER_TEXT = (
+    "<command-name>/model</command-name>\n"
+    "<command-message>model</command-message>\n"
+    "<local-command-stdout>Set model</local-command-stdout>"
+)
+TITLE_SUBAGENT_TEXT = "夹具：子代理首句不应成为主会话标题。"
+TITLE_AGENTS_INJECTION = (
+    "Contents of C:\\fixture\\.zcode\\AGENTS.md (user default instructions):\n"
+    "# 全局军规正文……（注入块，不是用户说的话）"
+)
+TITLE_REAL_TEXT = "夹具：真正的会话标题句。"
+
+# P2 detect：首条记录本身超过 16K，DAG 记录在其后。
+TITLE_DETECT_PAD = "x" * 20_000
+
 # qoder：同一文件内 epoch 毫秒整数与 ISO 串混排（真实导出的时间形状）。
 # 时间值被断言，正文不被断言，故正文用合成占位句。
 QODER_EPOCH_MS = 1780575834000
@@ -298,6 +340,157 @@ def queue_operation_records() -> list[dict]:
                 "role": "assistant",
                 "content": [{"type": "text", "text": QUEUE_OPERATION_ASSISTANT_TEXT}],
             },
+        },
+    ]
+
+
+def meta_records() -> list[dict]:
+    """全部无 message 信封的运维 / 元数据记录形状（P1-10 的 role 污染源）。
+
+    每条记录带齐各自的标识字段，保证 `_metadata_summary` 能恢复出非空
+    summary —— 「不落成 system 消息」与「信息不丢」同时被断言。
+    """
+    records: list[dict] = []
+    for index, type_name in enumerate(META_SESSION_STATE_TYPES):
+        record: dict = {
+            "type": type_name,
+            "uuid": f"meta-s{index}",
+            "parentUuid": None,
+            "sessionId": META_SESSION_ID,
+        }
+        if type_name == "last-prompt":
+            record["lastPrompt"] = "夹具：上次提示词。"
+        elif type_name == "mode":
+            record["mode"] = "code"
+        elif type_name == "permission-mode":
+            record["permissionMode"] = "default"
+        elif type_name == "ai-title":
+            record["aiTitle"] = "夹具标题"
+        elif type_name == "queue-operation":
+            record["operation"] = "enqueue"
+            record["content"] = "夹具：排队句。"
+        elif type_name == "pr-link":
+            record["prUrl"] = "https://fixture.example/pr/1"
+        elif type_name == "active-leaf":
+            record["leafUuid"] = "leaf-fixture"
+        elif type_name == "runtime-config":
+            record["model"] = "fixture-model"
+        records.append(record)
+    for index, type_name in enumerate(META_FILE_CONTEXT_TYPES):
+        record = {
+            "type": type_name,
+            "uuid": f"meta-f{index}",
+            "parentUuid": None,
+            "sessionId": META_SESSION_ID,
+        }
+        if type_name == "attachment":
+            record["attachment"] = {"type": "file-diff", "addedLines": ["+fixture"]}
+        elif type_name == "file-history-snapshot":
+            record["snapshot"] = [{"fixture": True}]
+        elif type_name == "file-history-delta":
+            record["trackingPath"] = "D:/fixture/file.py"
+        elif type_name == "workspace-directories":
+            record["directories"] = ["D:/fixture/workspace"]
+        elif type_name == "worktree-state":
+            record["worktreeSession"] = "wt-fixture"
+        records.append(record)
+    return records
+
+
+def system_subtype_records() -> list[dict]:
+    """``type=system`` 的三种 subtype：真系统行、away 摘要与未来未知 subtype。"""
+    return [
+        {
+            "type": "system", "uuid": "sys-1", "subtype": "api_error",
+            "parentUuid": None, "sessionId": META_SESSION_ID,
+            "error": {"message": "夹具：接口错误。"},
+        },
+        {
+            "type": "system", "uuid": "sys-2", "subtype": "away_summary",
+            "parentUuid": None, "sessionId": META_SESSION_ID,
+            "summary": "夹具：离开期间摘要。",
+        },
+        {
+            "type": "system", "uuid": "sys-3", "subtype": "not-yet-known-subtype",
+            "parentUuid": None, "sessionId": META_SESSION_ID,
+        },
+    ]
+
+
+def no_session_key_records() -> list[dict]:
+    """没有任何 sessionId / session_id 的 message DAG 记录（P1-7 兜底路径）。"""
+    return [
+        {
+            "type": "user",
+            "uuid": "nk-u1",
+            "parentUuid": None,
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": NO_KEY_USER_TEXT}],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "nk-a1",
+            "parentUuid": "nk-u1",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": NO_KEY_ASSISTANT_TEXT}],
+            },
+        },
+    ]
+
+
+def title_records() -> list[dict]:
+    """主会话首句是命令占位、中间夹一条子代理消息、末尾才是真标题。"""
+    return [
+        {
+            "type": "user", "uuid": "t1", "parentUuid": None,
+            "sessionId": TITLE_SESSION_ID,
+            "message": {"role": "user", "content": TITLE_PLACEHOLDER_TEXT},
+        },
+        {
+            "type": "user", "uuid": "t2", "parentUuid": "t1",
+            "agentId": "agent-title", "sessionId": TITLE_SESSION_ID,
+            "message": {"role": "user",
+                        "content": [{"type": "text", "text": TITLE_SUBAGENT_TEXT}]},
+        },
+        {
+            "type": "user", "uuid": "t3", "parentUuid": "t2",
+            "sessionId": TITLE_SESSION_ID,
+            "message": {"role": "user",
+                        "content": [{"type": "text", "text": TITLE_REAL_TEXT}]},
+        },
+    ]
+
+
+def title_agents_injection_records() -> list[dict]:
+    """主会话首句是 AGENTS.md 注入块，随后才是用户真话。"""
+    return [
+        {
+            "type": "user", "uuid": "ti-1", "parentUuid": None,
+            "sessionId": TITLE_SESSION_ID,
+            "message": {"role": "user", "content": TITLE_AGENTS_INJECTION},
+        },
+        {
+            "type": "user", "uuid": "ti-2", "parentUuid": "ti-1",
+            "sessionId": TITLE_SESSION_ID,
+            "message": {"role": "user",
+                        "content": [{"type": "text", "text": TITLE_REAL_TEXT}]},
+        },
+    ]
+
+
+def deep_first_record_records() -> list[dict]:
+    """首条记录正文超过 16K，DAG 形状的记录在其后（detect 分块扫描）。"""
+    return [
+        {"type": "note", "text": TITLE_DETECT_PAD},
+        {
+            "type": "user", "uuid": "deep-u1", "parentUuid": None,
+            "sessionId": "s-deep",
+            "message": {"role": "user",
+                        "content": [{"type": "text", "text": NO_KEY_USER_TEXT}]},
+            "stop_reason": None, "isSidechain": False,
         },
     ]
 

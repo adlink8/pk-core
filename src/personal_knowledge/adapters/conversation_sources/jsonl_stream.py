@@ -11,6 +11,10 @@ Behaviour is fail-closed by default:
     before the offending entry is yielded (``max_bytes`` is checked against
     the file size before any line is read).
 
+Adapters that want to tolerate a few corrupt lines while still accounting
+for them use :func:`iter_jsonl_lines_counted` (skip + count); it never
+changes the default fail-closed behaviour of :func:`iter_jsonl_lines`.
+
 Pure standard library (``json`` / ``pathlib``); no external dependencies.
 """
 
@@ -58,6 +62,45 @@ def iter_jsonl_lines(
         JSONLLineError: a non-blank line is invalid JSON and ``strict``.
         FileNotFoundError: ``path`` does not exist.
     """
+    yield from _iter_jsonl(
+        path, max_bytes=max_bytes, max_entries=max_entries, strict=strict,
+        errors=None,
+    )
+
+
+def iter_jsonl_lines_counted(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+    max_entries: int | None = None,
+    errors: list[int] | None = None,
+) -> Iterator[dict]:
+    """Tolerant JSONL read: skip corrupt lines and COUNT them.
+
+    Identical to ``iter_jsonl_lines(strict=False)`` except that the 1-based
+    line numbers of skipped corrupt lines are appended to ``errors`` (pass a
+    list; its length is the corruption count for warnings). Line content is
+    never reported — only the line number — so nothing from the payload can
+    leak into a warning. ``max_entries`` / ``max_bytes`` limits still fail
+    closed.
+
+    Yields:
+        Parsed JSON object per non-blank line, in file order.
+    """
+    yield from _iter_jsonl(
+        path, max_bytes=max_bytes, max_entries=max_entries, strict=False,
+        errors=errors,
+    )
+
+
+def _iter_jsonl(
+    path: Path,
+    *,
+    max_bytes: int | None,
+    max_entries: int | None,
+    strict: bool,
+    errors: list[int] | None,
+) -> Iterator[dict]:
     p = Path(path)
 
     if max_bytes is not None and p.stat().st_size > max_bytes:
@@ -79,6 +122,8 @@ def iter_jsonl_lines(
                     raise JSONLLineError(
                         f"invalid JSON at {p} line {lineno}: {exc}"
                     ) from exc
+                if errors is not None:
+                    errors.append(lineno)
                 continue
             if max_entries is not None and entries >= max_entries:
                 raise JSONLLimitExceeded(
