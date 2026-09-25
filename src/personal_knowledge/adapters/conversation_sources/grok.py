@@ -42,7 +42,7 @@ from personal_knowledge.core.conversation_events import (
 FAMILY = "grok"
 # 1.3.0：detect 变为对畸形字节全函数（非 UTF-8 返回 False 而非抛），
 # 探测器行为变了 → capability digest 变。
-ADAPTER_VERSION = "1.3.0"
+ADAPTER_VERSION = "1.4.0"
 CONTRACT_VERSION = "2"
 
 # Native ``chat_history.jsonl`` record type -> canonical event kind.
@@ -282,38 +282,64 @@ def adapt(artifact_set: SourceArtifactSet, *, artifact_root: Path) -> Adaptation
     artifacts = artifact_set.artifacts
     by_path = {Path(a.relative_path).name: a for a in artifacts}
 
-    session_id = make_event_id(FAMILY, artifacts[0].artifact_id, CONTRACT_VERSION,
-                               None, kind=EventKind.SESSION_LIFECYCLE, native_locator="session")
     events: list[TypedEvent] = []
     relations: list[EventRelation] = []
     warnings: list[str] = []
-    native_session = None
 
     summary_artifact = by_path.get("summary.md")
+    summary_json = by_path.get("summary.json")
+
+    # 会话键兜底链（P0-3）：记录内的真实 id 优先；（summary.md 场景）同
+    # artifact set 内 summary.json 的 ``info.id`` 次之；最后用 artifact 完整
+    # relative_path 的确定性键。**绝不从正文内容派生**——每份 Grok 导出的
+    # summary.md 都以同一个 ``# Summary`` 标题头开头（detect 本身就锚定它），
+    # 首行兜底曾把全部会话折叠成一个伪会话；也不能单用 ``parent.name``，
+    # 会话共享容器目录（``sessions/``、``export/``）时同样互相碰撞。
+    doc: dict = {}
+    info: dict = {}
+    if summary_json is not None:
+        try:
+            loaded = json.loads(
+                (artifact_root / summary_json.content_hash[:32]).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            doc = loaded
+            if isinstance(doc.get("info"), dict):
+                info = doc["info"]
+
+    anchor = None
+    if summary_json is not None:
+        native_session = (
+            str(info["id"]) if info.get("id")
+            else _path_session_key(summary_json.relative_path)
+        )
+        anchor = summary_json
+    elif summary_artifact is not None:
+        native_session = _path_session_key(summary_artifact.relative_path)
+        anchor = summary_artifact
+    else:
+        native_session = None
+
+    session_id = make_event_id(FAMILY, artifacts[0].artifact_id, CONTRACT_VERSION,
+                               None, kind=EventKind.SESSION_LIFECYCLE, native_locator="session")
+    if anchor is not None:
+        session_id = make_event_id(
+            FAMILY, anchor.artifact_id, CONTRACT_VERSION, native_session,
+            kind=EventKind.SESSION_LIFECYCLE,
+        )
+
     if summary_artifact is not None:
         try:
             summary_text = (artifact_root / summary_artifact.content_hash[:32]).read_text(encoding="utf-8")
         except OSError:
             summary_text = ""
-        native_session = _first_line(summary_text)
         events.append(_event(summary_artifact, session_id=session_id, kind=EventKind.SESSION_LIFECYCLE,
                              locator="summary.md#doc", native_id="summary",
                              summary=summary_text[:2048] or None, native_session=native_session))
 
-    summary_json = by_path.get("summary.json")
     if summary_json is not None:
-        try:
-            doc = json.loads(
-                (artifact_root / summary_json.content_hash[:32]).read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError):
-            doc = {}
-        info = doc.get("info") if isinstance(doc.get("info"), dict) else {}
-        native_session = str(info.get("id") or Path(summary_json.relative_path).parent.name)
-        session_id = make_event_id(
-            FAMILY, summary_json.artifact_id, CONTRACT_VERSION, native_session,
-            kind=EventKind.SESSION_LIFECYCLE,
-        )
         events.append(_event(
             summary_json, session_id=session_id, kind=EventKind.SESSION_LIFECYCLE,
             locator=f"{summary_json.relative_path}#info", native_id=native_session,
@@ -749,9 +775,11 @@ def _with_disposition(event, *, field_name, disposition, reason):
     )
 
 
-def _first_line(text: str) -> str | None:
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            return line[:128]
-    return None
+def _path_session_key(relative_path: str) -> str:
+    """稳定的 per-file 会话键：由 artifact 的完整 relative_path 派生。
+
+    只用路径、绝不用正文：正文会话间可能高度相似（所有 summary.md 共享同一
+    标题头），而同一份导出里每个文件只属于一个会话，完整路径天然不撞。
+    前缀用于与真实的原生会话 id（如 ``grok_session_*``）在目视排查时区分。
+    """
+    return f"grok-path:{relative_path}"

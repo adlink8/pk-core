@@ -1,4 +1,4 @@
-"""grok 家族（生产模块 ``grok``，ADAPTER_VERSION 1.3.0）适配契约。
+"""grok 家族（生产模块 ``grok``，ADAPTER_VERSION 1.4.0）适配契约。
 
 公开 seam 是 registry（``adapt_for`` / ``detect_family``）——生产代码只经它
 调用家族模块，所以断言也走同一入口，不直接摸 ``grok.adapt``。夹具来自
@@ -12,17 +12,20 @@ from pathlib import Path
 
 import pytest
 
+from personal_knowledge.adapters.conversation_sources import chatgpt as chatgpt_adapter
 from personal_knowledge.adapters.conversation_sources import registry
 from personal_knowledge.adapters.conversation_sources.contracts import (
     SourceArtifactSet,
 )
 from personal_knowledge.core.conversation_events import (
     EventKind,
+    FieldDisposition,
     FidelityDimension,
     FidelityLevel,
     RelationKind,
 )
 from tests.contract.conversation_sources.support import artifacts
+from tests.contract.conversation_sources.support import chatgpt as chatgpt_fixtures
 from tests.contract.conversation_sources.support import grok as grok_fixtures
 
 
@@ -330,3 +333,161 @@ def test_grok_rejects_agentsview_reconcile_scratch_db(tmp_path):
         tmp_path, name, b"", source_kind="sqlite"
     )
     assert registry.detect_family("grok", artifact, artifact_root=root) is False
+
+
+def test_grok_pathless_agentsview_captured_snapshot(tmp_path):
+    """抓取后的 AgentsView 快照按 ``content_hash[:32]`` 寻址 blob（P0-6 回归）。
+
+    ``grok.adapt`` 的 pathless 分支（单 artifact、``source_kind == "sqlite"``）
+    委托共享的 ``adapt_pathless_observation``，它是该共享通道的唯一调用方。旧
+    实现用 ``artifact_id`` 拼 blob 路径——抓取后的 blob 存放在内容寻址存储里
+    （键为 ``content_hash[:32]``，见 ``contracts.artifact_bytes_path`` 的
+    docstring），该路径必然不存在，对所有抓取 artifact 直接抛
+    "not resolvable SQLite"。夹具经真实 capture seam 抓取，正中这条路径。
+
+    顺带锁定共享映射的保真度诚实性：正文为空的观测必须写 UNAVAILABLE，不得
+    冒充 MAPPED（对齐 chatgpt pathless 适配器的口径）。
+    """
+    db = tmp_path / "sessions.db"
+    chatgpt_fixtures.make_agentsview_db(
+        db,
+        sessions=(
+            ("grok-chat-1", "grok", "2026-09-01T00:00:00Z", None, None, None),
+        ),
+        messages=(
+            (
+                "m-1", "grok-chat-1", 1, "user",
+                "grok pathless 正文", "2026-09-01T00:00:01Z", 0, 0,
+            ),
+            (
+                "m-2", "grok-chat-1", 2, "assistant",
+                None, "2026-09-01T00:00:02Z", 0, 0,
+            ),
+        ),
+    )
+    # 允许清单引用生产常量（AgentsView 形态由 chatgpt 家族声明），抓取归属
+    # 归 grok——pathless 通道的表结构是共享契约，不应在测试里复制一份。
+    # ``mirror_path`` 是关键：生产 v2_sync 抓取时同时给 family + mirror_path，
+    # artifact_id 因此是**槽位 id**（``make_slot_artifact_id``），不再是内容寻址
+    # 的 blob id——旧实现拿 artifact_id 拼 blob 路径正是在这条生产路径上必然
+    # 失效。缺了它，夹具会落进 legacy 回退（artifact_id == blob_id），测不出 bug。
+    artifact, root = artifacts.captured_sqlite(
+        db,
+        tmp_path,
+        allowed_tables=chatgpt_adapter.LIVE_ALLOWED_TABLES,
+        allowed_columns=chatgpt_adapter.LIVE_ALLOWED_COLUMNS,
+        family="grok",
+        mirror_path="agentsview/sessions.db",
+    )
+    result = registry.adapt_for(
+        "grok", artifacts.single(artifact), artifact_root=root
+    )
+
+    assert result.family == "grok"
+    assert len(result.sessions) == 1
+    assert result.sessions[0].native_session_id == "grok-chat-1"
+
+    filled = artifacts.event_with(result, EventKind.USER_MESSAGE)
+    assert filled.content == "grok pathless 正文"
+    assert {d.field_name: d.disposition for d in filled.field_dispositions}[
+        "content"
+    ] is FieldDisposition.MAPPED
+
+    missing = artifacts.event_with(result, EventKind.ASSISTANT_MESSAGE)
+    assert missing.content is None
+    assert {d.field_name: d.disposition for d in missing.field_dispositions}[
+        "content"
+    ] is FieldDisposition.UNAVAILABLE
+
+
+# ------------------------------------------------- 会话键兜底链（P0-3 回归）
+# 每份 Grok 导出的 summary.md 都以同一个 ``# Summary`` 标题头开头（detect
+# 本身就锚定它）。旧的兜底取正文首行当 native_session_id，导致全部会话共享
+# 同一个键、canonical 层折叠成一个伪会话。兜底链必须是：记录内真实 id →
+# 同集合 summary.json 的 info.id → artifact 完整 relative_path 的确定性键，
+# 绝不从正文内容派生。
+
+
+class TestGrokSessionKeyFallback:
+    @staticmethod
+    def _adapt_summary_md(tmp_path: Path, relative_path: str, body_line: str):
+        src = tmp_path / "src"
+        target = src / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # 标题头完全相同，正文不同——正是真实 Grok 导出的形态。
+        target.write_text(f"# Summary\n{body_line}\n", encoding="utf-8")
+        _manifest, captured = artifacts.captured_directory(
+            src, tmp_path, include_relative=(relative_path,),
+            byte_limit=1_000_000, count_limit=4,
+        )
+        return registry.adapt_for(
+            "grok", SourceArtifactSet(artifacts=captured),
+            artifact_root=tmp_path / "artifacts",
+        )
+
+    def test_same_heading_different_bodies_yield_distinct_session_ids(self, tmp_path):
+        first = self._adapt_summary_md(tmp_path, "sessions/a/summary.md", "正文一")
+        second = self._adapt_summary_md(tmp_path, "sessions/b/summary.md", "正文二")
+
+        ids_first = {s.native_session_id for s in first.sessions}
+        ids_second = {s.native_session_id for s in second.sessions}
+        assert ids_first and ids_second
+        assert ids_first != ids_second
+        # 旧 bug 的键正是标题头本身；新键必须与它脱离干系。
+        assert ids_first.isdisjoint(ids_second | {"# Summary"})
+
+    def test_session_key_uses_full_path_not_parent_name(self, tmp_path):
+        # 两个会话的父目录都叫 ``sessions/``：单用 parent.name 的旧兜底同样
+        # 会把它们折叠成一个伪会话。
+        first = self._adapt_summary_md(tmp_path, "exp-a/sessions/summary.md", "正文一")
+        second = self._adapt_summary_md(tmp_path, "exp-b/sessions/summary.md", "正文二")
+
+        ids_first = {s.native_session_id for s in first.sessions}
+        ids_second = {s.native_session_id for s in second.sessions}
+        assert ids_first and ids_second and ids_first != ids_second
+
+    def test_summary_md_inherits_summary_json_native_id(self, tmp_path):
+        """同集合里带 summary.json 时，summary.md 复用它的 ``info.id``。"""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "summary.md").write_text("# Summary\nshared heading\n", encoding="utf-8")
+        (src / "summary.json").write_text(
+            json.dumps({"info": {"id": "native-abc-123"}}), encoding="utf-8"
+        )
+        _manifest, captured = artifacts.captured_directory(
+            src, tmp_path, include_relative=("summary.md", "summary.json"),
+            byte_limit=1_000_000, count_limit=4,
+        )
+        result = registry.adapt_for(
+            "grok", SourceArtifactSet(artifacts=captured),
+            artifact_root=tmp_path / "artifacts",
+        )
+
+        assert result.sessions
+        assert all(s.native_session_id == "native-abc-123" for s in result.sessions)
+        # 整个 artifact set 是一个会话：summary.md 事件与 summary.json 事件
+        # 必须共享同一个 session_id，不允许各立门户。
+        assert {e.session_id for e in result.events} == {s.session_id for s in result.sessions}
+
+    def test_summary_json_falls_back_to_full_path_key(self, tmp_path):
+        """summary.json 缺 ``info.id`` 且父目录同名时，仍不得互相折叠。"""
+        ids_per_path = []
+        for relative in ("batch-x/sessions/summary.json", "batch-y/sessions/summary.json"):
+            src = tmp_path / "src"
+            target = src / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps({"info": {}}), encoding="utf-8")
+            _manifest, captured = artifacts.captured_directory(
+                src, tmp_path, include_relative=(relative,),
+                byte_limit=1_000_000, count_limit=4,
+            )
+            result = registry.adapt_for(
+                "grok", SourceArtifactSet(artifacts=captured),
+                artifact_root=tmp_path / "artifacts",
+            )
+            ids_per_path.append({s.native_session_id for s in result.sessions})
+
+        assert all(ids for ids in ids_per_path)
+        # 单用 parent.name 的旧兜底会把两把键都算成 ``sessions``。
+        assert ids_per_path[0] != ids_per_path[1]
+        assert all(id_ != "sessions" for ids in ids_per_path for id_ in ids)

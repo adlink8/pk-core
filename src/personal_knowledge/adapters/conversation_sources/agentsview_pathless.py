@@ -85,7 +85,11 @@ def adapt_pathless_observation(
             f"{family} pathless adapter requires exactly one AgentsView snapshot"
         )
     artifact = artifact_set.artifacts[0]
-    blob = artifact_root / artifact.artifact_id
+    # Captured artifacts live in the content-addressed blob store keyed by
+    # ``content_hash[:32]`` (never by the slot ``artifact_id``) -- same
+    # convention as the chatgpt pathless adapter; see
+    # ``contracts.artifact_bytes_path`` for the two rooting conventions.
+    blob = artifact_root / artifact.content_hash[:32]
     if artifact.source_kind != "sqlite" or not blob.is_file():
         raise EventContractError(
             f"{family} compatibility artifact is not resolvable SQLite"
@@ -188,7 +192,20 @@ def _map_rows(
         kind = EventKind.SYSTEM_MESSAGE if row["is_system"] else _MESSAGE_KINDS.get(
             role, EventKind.UNKNOWN_NATIVE
         )
-        content = None if row["content"] is None else str(row["content"])
+        raw_content = row["content"]
+        if raw_content is None or (
+            isinstance(raw_content, str) and not raw_content.strip()
+        ):
+            content = None
+            mapped_content = FieldDispositionRecord(
+                "content", FieldDisposition.UNAVAILABLE, "content missing",
+            )
+        else:
+            content = str(raw_content)
+            mapped_content = FieldDispositionRecord(
+                "content", FieldDisposition.MAPPED,
+                "exact AgentsView compatibility observation",
+            )
         events.append(TypedEvent(
             event_id=make_event_id(
                 family, artifact.artifact_id, contract_version, native_message_id,
@@ -204,10 +221,7 @@ def _map_rows(
             ordinal=row["ordinal"],
             native_payload_ref=f"{artifact.artifact_id}:messages:{native_message_id}",
             content=content,
-            field_dispositions=(FieldDispositionRecord(
-                "content", FieldDisposition.MAPPED,
-                "exact AgentsView compatibility observation",
-            ),),
+            field_dispositions=(mapped_content,),
         ))
 
     return AdaptationResult(
