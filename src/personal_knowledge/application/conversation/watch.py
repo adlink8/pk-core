@@ -31,14 +31,13 @@ Design decisions (all conservative; each one is a choice, not a default)
 * **The fingerprint set covers the source roots, not the mirror.** The mirror is
   written *by* staging, so fingerprinting it would let staging's own writes
   look like new client activity (an infinite trigger loop).
-* **The lock is a property of the long-lived listener.** ``--watch`` always
-  takes it; the one-shot ``once=True`` cycle takes it only when a caller passes
-  ``lock_path`` explicitly. Rationale: the documented deployment shapes are
-  "a resident watcher" *and* "a scheduled one-shot task", and a one-shot that
-  refuses to run whenever the watcher is up would silently never run. The
-  one-shot's database half is already serialized by the engine's single
-  ``BEGIN IMMEDIATE``; the remaining staging overlap is benign (identical
-  content, atomic publish for SQLite snapshots).
+* **The lock guards every real run, one-shot included.** ``--watch`` always
+  takes it, and so does the one-shot ``once=True`` cycle (P1-15a: when no
+  ``lock_path`` is passed, the one-shot uses the same default lock path, so a
+  scheduled task can never stage-and-apply concurrently with a resident
+  watcher). A run that finds the lock held reports ``status: "locked"``, runs
+  nothing, and the CLI exits non-zero — an explicit machine-readable refusal,
+  never silent overlap.
 * **A cycle failure is reported, never raised.** ``status: "partial"`` means the
   loop is alive but the last cycle did not complete; a dead loop is detectable
   from the heartbeat instead. ``once=True`` returns ``partial`` rather than
@@ -98,6 +97,17 @@ LOCK_FILE_NAME = "live-sync.lock"
 LOG_FILE_NAME = "live-sync.log"
 #: Suffix of the single kept log generation (``live-sync.log.1``).
 ROTATED_SUFFIX = ".1"
+
+#: P2 (Windows PID reuse): a lock record that has not beaten its heartbeat for
+#: this long is reclaimable even when its PID still looks alive. At production
+#: poll intervals the holder beats every cycle, so a day of silence means a
+#: frozen or abandoned process (or a legacy record without a start token) —
+#: waiting longer only converts a crashed holder into a permanent
+#: ``STATUS_LOCKED``. Deliberate trade-off: a holder that stalls without dying
+#: for over 24 h loses its lock; that is judged strictly less harmful than an
+#: unstealable lock, and the start-token rule below already reclaims the common
+#: PID-recycling case immediately.
+STALE_LOCK_MAX_AGE_S = 24 * 3600.0
 
 #: ``status`` values a caller can branch on.
 STATUS_OK = "ok"
@@ -197,6 +207,78 @@ def _pid_alive_windows(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def _process_start_token(pid: int) -> float | None:
+    """An opaque process-creation token for ``pid`` (identity by equality).
+
+    P2 (Windows PID reuse): a PID is recycled by the OS, so "the PID is alive"
+    no longer means "the recorded holder is alive". The holder's creation time
+    is an identity token that survives recycling: Windows uses the
+    ``GetProcessTimes`` creation ``FILETIME`` (epoch seconds); POSIX with
+    ``/proc`` uses field 22 of ``/proc/<pid>/stat`` (boot-relative ticks — not
+    an epoch value, but stable for one live process, which is all the equality
+    comparison needs). ``None`` when the platform or the probe cannot tell;
+    callers then fall back to the lock-age rule instead of guessing.
+    """
+
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(
+            process_query_limited_information, False, pid
+        )
+        if not handle:
+            return None
+        try:
+            creation = wintypes.FILETIME()
+            exit_ft, kernel_ft, user_ft = (
+                wintypes.FILETIME() for _ in range(3)
+            )
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_ft),
+                ctypes.byref(kernel_ft),
+                ctypes.byref(user_ft),
+            ):
+                return None
+            return (
+                (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            ) / 10_000_000.0 - 11644473600.0
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return float(stat_text.rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _parse_utc(value) -> float | None:  # noqa: ANN001 - record payload
+    """Epoch seconds for the ``_now()`` format, or ``None`` if unparseable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc).timestamp()
+
+
+def _record_age_s(record: dict) -> float | None:
+    """Seconds since the record last proved itself (heartbeat, else start)."""
+    for key in ("heartbeat_at", "started_at"):
+        stamp = _parse_utc(record.get(key))
+        if stamp is not None:
+            return max(0.0, time.time() - stamp)
+    return None
+
+
 class WatchLock:
     """Single-instance lock: a PID record that also carries the heartbeat.
 
@@ -204,7 +286,9 @@ class WatchLock:
     instance. A record whose PID is dead (crash, power loss, killed console) is
     stale and is reclaimed. The file is deliberately *not* a pure mutex: the
     holder rewrites ``heartbeat_at`` in it so an operator can tell a live idle
-    listener from an abandoned lock.
+    listener from an abandoned lock. The record also carries the holder's
+    process-creation token (``holder_proc_start``), which lets a reclaimer tell
+    a recycled PID from the original holder on Windows (P2).
     """
 
     def __init__(self, path: Path) -> None:
@@ -255,6 +339,7 @@ class WatchLock:
                 "pid": os.getpid(),
                 "started_at": self._started_at,
                 "heartbeat_at": self._started_at,
+                "holder_proc_start": _process_start_token(os.getpid()),
             }
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, sort_keys=True))
@@ -263,7 +348,21 @@ class WatchLock:
         return False
 
     def _reclaim_if_stale(self) -> bool:
-        """Drop the lock file only if it is stale and unchanged by then."""
+        """Drop the lock file only if it is provably stale, and unchanged by then.
+
+        Three reclaim rules, most specific first (P2 PID-reuse hardening):
+
+        1. the recorded PID is dead — the classic stale case;
+        2. the PID is alive but its process-creation token differs from the
+           recorded ``holder_proc_start`` — the PID was recycled onto an
+           unrelated process, so the real holder is gone; reclaim immediately;
+        3. the PID is alive (or a start token is unavailable on either side)
+           but the record has not beaten its heartbeat for
+           ``STALE_LOCK_MAX_AGE_S`` — see the constant's trade-off note.
+
+        Rule 3 is the conservative fallback: an unparseable record without any
+        usable timestamp keeps the lock rather than guessing.
+        """
         try:
             raw = self.path.read_bytes()
         except OSError:
@@ -281,10 +380,28 @@ class WatchLock:
             _unlink(self.path)
             return True
         try:
-            alive = _pid_alive(int(record.get("pid", -1)))
+            pid = int(record.get("pid", -1))
         except (TypeError, ValueError):
-            alive = False
-        if alive:
+            pid = -1
+        if not _pid_alive(pid):
+            reclaim = True
+        else:
+            holder_start = record.get("holder_proc_start")
+            current_start = _process_start_token(pid)
+            try:
+                recycled = (
+                    holder_start is not None
+                    and current_start is not None
+                    and float(holder_start) != float(current_start)
+                )
+            except (TypeError, ValueError):
+                recycled = False
+            if recycled:
+                reclaim = True
+            else:
+                age = _record_age_s(record)
+                reclaim = age is not None and age > STALE_LOCK_MAX_AGE_S
+        if not reclaim:
             return False
         try:
             if self.path.read_bytes() != raw:
@@ -536,6 +653,12 @@ def run_watch(
     )
     apply_fn = apply_fn or live_sync_once
     stop = stop_event if stop_event is not None else threading.Event()
+    if once and lock_path is None:
+        # P1-15a: a one-shot cycle races the resident watcher exactly like a
+        # second watcher would, so it takes the same default lock. When the
+        # lock is held it returns an explicit ``status: "locked"`` report and
+        # runs nothing — never a silent concurrent staging/apply.
+        lock_path = _default_paths(mirror_root)[0]
     lock = WatchLock(Path(lock_path)) if lock_path is not None else None
 
     if lock is not None and not lock.acquire():
@@ -883,6 +1006,12 @@ def cmd_conversations_live(args) -> int:  # noqa: ANN001 - argparse
         db=db, mirror_root=mirror_root, generation_id=generation_id, once=True
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    if report["status"] == STATUS_LOCKED:
+        print(
+            "[error] another live listener holds the live-sync lock; the "
+            "one-shot cycle refused to run"
+        )
+        return 1
     if report["status"] == STATUS_PARTIAL:
         print(f"[error] live sync cycle failed: {report.get('error')}")
         return 1

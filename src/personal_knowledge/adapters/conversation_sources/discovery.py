@@ -546,6 +546,34 @@ def _relative_to_root(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def _copy_file_atomically(src: Path, target: Path) -> None:
+    """``shutil.copy2`` semantics with an atomic publish (P1-15b).
+
+    The old ``shutil.copy2(src, target)`` wrote the target in place: a reader
+    walking the stage tree mid-copy (``live_sync.scan_mirror``, the v2 shadow
+    detector) could pick up a half-written file and treat it as a complete
+    source. The copy now lands on a same-directory ``.tmp-`` intermediate — a
+    prefix every stage consumer already refuses to treat as source data
+    (``CAPTURE_TEMP_PREFIXES``) — and is renamed into place only once the
+    bytes are complete, so ``target`` only ever exists whole. A failed copy
+    removes the intermediate and leaves any previous target untouched; the
+    caller records the file as skipped and the next staging run retries it.
+    """
+
+    import uuid
+
+    tmp = target.parent / f".tmp-{uuid.uuid4().hex}"
+    try:
+        shutil.copyfile(src, tmp)
+        shutil.copystat(src, tmp)
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def snapshot_sqlite_to_file(
     source: Path, target: Path, *,
     allowed_tables: tuple[str, ...],
@@ -720,7 +748,11 @@ def stage_client_sources(
                     skipped.append(f"{rel} (sqlite_snapshot:{type(exc).__name__})")
                     continue
             else:
-                shutil.copy2(src, target)
+                try:
+                    _copy_file_atomically(src, target)
+                except Exception as exc:  # noqa: BLE001 - fail closed per file
+                    skipped.append(f"{rel} (copy:{type(exc).__name__})")
+                    continue
             known[rel] = digest
             manifest.write_text(
                 json.dumps(known, sort_keys=True, indent=0),

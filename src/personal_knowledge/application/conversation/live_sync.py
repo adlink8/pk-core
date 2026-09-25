@@ -195,6 +195,16 @@ _SKIP_DIR_NAMES = frozenset({"artifacts", ".staging"})
 _BYTE_LIMIT = 600_000_000
 _COUNT_LIMIT = 2_000
 
+# P2 guard: an apply that sees more than this share of the active slots vanish
+# from the mirror in one pass is almost always looking at a staging accident (a
+# wiped or re-pointed mirror root, a failed stage run) rather than that many
+# real deletions at once — and deactivating every slot would mark the whole
+# live store stale in a single transaction. The apply raises instead. The
+# threshold is a fraction of the *currently* active slots, so a genuinely
+# intended mass removal can still be expressed by applying successive batches,
+# each below half of the slots still active at that point.
+REMOVED_SLOT_GUARD_RATIO = 0.5
+
 
 class LiveSyncError(RuntimeError):
     """Fail-closed live-sync contract violation."""
@@ -292,6 +302,58 @@ def scan_mirror(mirror_root: Path) -> dict[str, tuple[str, Path]]:
 def _fingerprint(path: Path) -> list:
     stat = path.stat()
     return [stat.st_mtime_ns, stat.st_size]
+
+
+def _classify_removed(
+    slots: dict[str, sqlite3.Row], scanned: dict[str, tuple[str, Path]]
+) -> tuple[list[tuple], set[str]]:
+    """Active slots whose mirror path vanished, plus unregistered-family strays.
+
+    P2: a slot whose family is no longer resolvable (deregistered or renamed in
+    the registry) never appears in ``scanned`` — ``scan_mirror`` refuses to
+    guess a family — so its absence from a scan is *not* evidence that the
+    source disappeared. Such slots are reported under the returned
+    ``unregistered_families`` set and are NOT deactivated; when the family is
+    registered again they line up with their files unchanged. A resolvable
+    family whose mirror path is gone is a real removal.
+    """
+
+    removed: list[tuple] = []
+    unregistered: set[str] = set()
+    for mirror_path, slot in slots.items():
+        if not slot["active"] or mirror_path in scanned:
+            continue
+        try:
+            resolve_family(str(slot["family"]))
+        except KeyError:
+            unregistered.add(str(slot["family"]))
+            continue
+        removed.append((slot["slot_id"], slot["family"], mirror_path))
+    return removed, unregistered
+
+
+def _assert_removal_guard(
+    removed: list[tuple], slots: dict[str, sqlite3.Row]
+) -> None:
+    """P2 guard: refuse to deactivate a suspicious share of the live slots.
+
+    See ``REMOVED_SLOT_GUARD_RATIO``. The raised ``LiveSyncError`` is the
+    operator's signal: nothing was written, the mirror must be inspected before
+    the next apply.
+    """
+
+    if not removed:
+        return
+    n_active = sum(1 for slot in slots.values() if slot["active"])
+    if n_active and len(removed) > n_active * REMOVED_SLOT_GUARD_RATIO:
+        raise LiveSyncError(
+            f"live-sync refused: {len(removed)} of {n_active} active slots "
+            f"disappeared from the mirror in one pass "
+            f"(> {REMOVED_SLOT_GUARD_RATIO:.0%} guard). A wiped or re-pointed "
+            f"mirror root is the usual cause; nothing was deactivated. A "
+            f"deliberate mass removal must be applied in successive batches, "
+            f"each below the guard against the slots still active."
+        )
 
 
 # ---------------------------------------------------------------- capture
@@ -1577,6 +1639,7 @@ def live_sync_once(
             n_unchanged=plan["n_unchanged"],
             per_family=plan["per_family"],
             slots=plan["slots"],
+            unregistered_families=plan["unregistered_families"],
         )
 
     # The schema (including every ce_live_* table) is owned by event_schema.
@@ -1588,16 +1651,13 @@ def live_sync_once(
         slots = _load_slots(con)
         fingerprints = json.loads(_get_state(con, FINGERPRINT_STATE_KEY) or "{}")
 
-        removed = [
-            (slot["slot_id"], slot["family"], mirror_path)
-            for mirror_path, slot in slots.items()
-            if slot["active"] and mirror_path not in scanned
-        ]
+        removed, unregistered_families = _classify_removed(slots, scanned)
         candidates = [
             (mirror_path, family, path)
             for mirror_path, (family, path) in sorted(scanned.items())
             if not _slot_is_current(slots.get(mirror_path), fingerprints, mirror_path, path)
         ]
+        _assert_removal_guard(removed, slots)
         if not candidates and not removed:
             # Idempotent no-op: nothing moved, so nothing is written at all.
             return _empty_report(
@@ -1605,13 +1665,26 @@ def live_sync_once(
                 generation_id,
                 started,
                 n_unchanged=len(scanned),
+                unregistered_families=sorted(unregistered_families),
             )
 
         # Capture/adapt outside the write lock; only blob files are produced and
         # they are content-addressed, so a rollback leaves at most a deduped
         # blob that the next run reuses.
+        #
+        # P1-13: fingerprint every candidate BEFORE capturing it. The rows this
+        # pass is about to write describe the file as it stood at that instant,
+        # so only that pre-capture (mtime_ns, size) may be persisted as the
+        # fast-path fingerprint (see ``_write_fingerprints``). Re-statting after
+        # the capture would freeze a later stat over bytes the store does not
+        # hold, permanently hiding a tail appended in the capture window.
         prepared: list[dict] = []
+        pre_captured: dict[str, list] = {}
         for mirror_path, family, path in candidates:
+            try:
+                pre_captured[mirror_path] = _fingerprint(path)
+            except OSError:
+                pass  # the capture below fails the run the same way it did before
             artifact, result = _capture_and_adapt(
                 path,
                 family=family,
@@ -1638,13 +1711,17 @@ def live_sync_once(
             # Only touch-only fingerprint movement: refresh the fast-path cache.
             con.execute("BEGIN IMMEDIATE")
             try:
-                _write_fingerprints(con, scanned)
+                _write_fingerprints(con, scanned, overrides=pre_captured)
                 con.execute("COMMIT")
             except BaseException:
                 _rollback(con)
                 raise
             return _empty_report(
-                "no-op", generation_id, started, n_unchanged=len(scanned)
+                "no-op",
+                generation_id,
+                started,
+                n_unchanged=len(scanned),
+                unregistered_families=sorted(unregistered_families),
             )
 
         n_added = sum(1 for item in prepared if item["kind"] == "added")
@@ -1729,7 +1806,7 @@ def live_sync_once(
                 emitted_session_ids=projected_sessions,
                 emitted_event_ids=emitted_events,
             )
-            _write_fingerprints(con, scanned)
+            _write_fingerprints(con, scanned, overrides=pre_captured)
             report = {
                 "status": "ok",
                 "generation_id": generation_id,
@@ -1751,6 +1828,7 @@ def live_sync_once(
                      "mirror_path": mirror_path}
                     for slot_id, family, mirror_path in removed
                 ],
+                "unregistered_families": sorted(unregistered_families),
                 "projection": projection,
                 "duration_s": round(time.monotonic() - started, 3),
             }
@@ -1825,11 +1903,7 @@ def _plan(
             slots_out.append({"mirror_path": mirror_path, "family": family, "kind": "changed"})
         else:
             n_unchanged += 1  # fingerprint moved, bytes identical (e.g. touch)
-    removed = [
-        mirror_path
-        for mirror_path, slot in slots.items()
-        if slot["active"] and mirror_path not in scanned
-    ]
+    removed, unregistered = _classify_removed(slots, scanned)
     for mirror_path in removed:
         _bump(per_family, str(slots[mirror_path]["family"]), removed=1)
     return {
@@ -1839,6 +1913,7 @@ def _plan(
         "n_unchanged": n_unchanged,
         "per_family": per_family,
         "slots": slots_out,
+        "unregistered_families": sorted(unregistered),
     }
 
 
@@ -1863,9 +1938,30 @@ def _ensure_generation(con: sqlite3.Connection, generation_id: str) -> None:
     )
 
 
-def _write_fingerprints(con: sqlite3.Connection, scanned: dict) -> None:
-    fingerprints = {}
+def _write_fingerprints(
+    con: sqlite3.Connection,
+    scanned: dict,
+    overrides: dict[str, list] | None = None,
+) -> None:
+    """Persist the fast-path ``(mtime_ns, size)`` fingerprints of the scan.
+
+    P1-13: ``overrides`` carries the fingerprint stat taken **before** each
+    captured candidate. The rows this pass wrote describe the file as it stood
+    at that instant, so the stored fingerprint must describe that same instant:
+    a file appended again during (or after) the capture then differs from the
+    stored fingerprint and is re-collected by the next pass. Re-statting after
+    the capture — the old behaviour — would freeze the post-capture stat over
+    rows that do not hold the appended tail, hiding it from every later pass.
+    Paths without an override were never captured; their fresh stat is exactly
+    the state the store already agrees with.
+    """
+
+    overrides = overrides or {}
+    fingerprints: dict[str, list] = {}
     for mirror_path, (_family, path) in sorted(scanned.items()):
+        if mirror_path in overrides:
+            fingerprints[mirror_path] = overrides[mirror_path]
+            continue
         try:
             fingerprints[mirror_path] = _fingerprint(path)
         except OSError:

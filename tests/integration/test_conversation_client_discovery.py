@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -901,3 +902,51 @@ def test_p1_4_env_override_roots_participate_in_nesting(
     found = discover_client_sources(roots=roots)
     assert hijacked not in found["gemini"]
     assert own in found["gemini"]
+
+
+def test_plain_file_staging_publishes_atomically(tmp_path: Path, monkeypatch) -> None:
+    """P1-15b: a plain-file stage write lands only via an atomic rename.
+
+    The old ``shutil.copy2`` wrote the target in place, so a reader walking the
+    stage tree mid-copy (``live_sync.scan_mirror``, the v2 shadow detector)
+    could pick up a half-written file as a complete source. Now the copy goes
+    through a same-directory ``.tmp-`` intermediate and ``os.replace``; a failed
+    copy leaves the previous target intact and no residue, and the file is
+    recorded as skipped for the next staging run to retry.
+    """
+    src = _write_codex_jsonl(tmp_path / "home" / ".codex", "s1.jsonl")
+    stage = tmp_path / "stage"
+    roots = {"codex": (tmp_path / "home" / ".codex",)}
+    target = stage / "codex" / "sessions" / "s1.jsonl"
+
+    first = stage_client_sources(roots=roots, stage_root=stage,
+                                 byte_limit=10_000, count_limit=100)
+    assert first["staged"] == 1
+    v1 = target.read_text(encoding="utf-8")
+
+    # mutate the source, then simulate a crash mid-copy on the next staging run
+    src.write_text(src.read_text(encoding="utf-8") + json.dumps({"x": 1}) + "\n",
+                   encoding="utf-8")
+    attempts: list[Path] = []
+
+    def failing_copyfile(_src, dst):
+        attempts.append(Path(dst))
+        raise OSError("disk full mid-copy")
+
+    monkeypatch.setattr(discovery.shutil, "copyfile", failing_copyfile)
+    second = stage_client_sources(roots=roots, stage_root=stage,
+                                  byte_limit=10_000, count_limit=100)
+    monkeypatch.undo()
+
+    skipped = second["families"]["codex"]["skipped_paths"]
+    assert skipped == ["sessions/s1.jsonl (copy:OSError)"]
+    # the previous target is untouched (never half-written) and no temp remains
+    assert target.read_text(encoding="utf-8") == v1
+    assert len(attempts) == 1 and not attempts[0].exists()
+    assert list(target.parent.glob(".tmp-*")) == []
+
+    # a later staging run completes the publish
+    third = stage_client_sources(roots=roots, stage_root=stage,
+                                 byte_limit=10_000, count_limit=100)
+    assert third["staged"] == 1
+    assert target.read_text(encoding="utf-8") != v1

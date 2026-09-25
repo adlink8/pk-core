@@ -26,11 +26,16 @@ import os
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from personal_knowledge.adapters.conversation_sources.claude_qoder import (
     CONTRACT_VERSION as CLAUDE_CONTRACT_VERSION,
 )
 from personal_knowledge.adapters.conversation_sources.snapshots import (
     make_slot_artifact_id,
+)
+from personal_knowledge.application.conversation import (
+    live_sync as live_sync_module,
 )
 from personal_knowledge.application.conversation.compatibility_projection import (
     MESSAGE_KINDS,
@@ -42,6 +47,7 @@ from personal_knowledge.application.conversation.event_schema import (
     create_v2_schema,
 )
 from personal_knowledge.application.conversation.live_sync import (
+    LiveSyncError,
     _slot_relation_ids,
     live_sync_once,
 )
@@ -1996,3 +2002,137 @@ def test_swallowed_cross_slot_relation_follows_the_current_copy(
     finally:
         con.close()
     assert _rows(db, "PRAGMA foreign_key_check") == []
+
+
+# ------------------------------------------------- batch B engine repairs
+#
+# P1-13 (fingerprint race), P2 (mirror-wipe guard), P2 (unregistered family
+# slots). Each test pins one repair of the engine, isolated from the oracle
+# tests above.
+
+
+def test_capture_then_append_is_not_hidden_by_the_new_fingerprint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """P1-13: a file appended during the capture window is re-collected next pass.
+
+    The fingerprint written by an apply must describe the *pre-capture* stat —
+    the instant whose bytes the store now holds. Re-statting after the capture
+    would freeze the post-capture stat over rows that do not contain the
+    appended tail, and the tail would be hidden from every later pass.
+    """
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror, names=("a.jsonl",))
+    db = tmp_path / "live.sqlite"
+
+    first = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert first["status"] == "ok"
+
+    # An external edit lands before the next pass: the file becomes a candidate.
+    path = mirror / FAMILY / "a.jsonl"
+    path.write_text(
+        path.read_text(encoding="utf-8") + _codex_session("sess_mid", 1),
+        encoding="utf-8",
+    )
+
+    # The race: the source keeps being appended while the engine captures it.
+    real_capture = live_sync_module._capture_and_adapt
+
+    def capture_then_append(file_path, **kwargs):
+        artifact, result = real_capture(file_path, **kwargs)
+        with file_path.open("a", encoding="utf-8") as handle:
+            handle.write(_codex_session("sess_tail", 1))
+        return artifact, result
+
+    monkeypatch.setattr(
+        live_sync_module, "_capture_and_adapt", capture_then_append
+    )
+    second = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    monkeypatch.undo()
+    assert second["status"] == "ok"
+
+    # The next pass must see the tail (the stored fingerprint describes the
+    # pre-capture instant, so the appended file no longer matches it).
+    third = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert third["status"] == "ok"
+    assert third["n_changed"] >= 1
+    tail_rows = _rows(
+        db,
+        "SELECT COUNT(*) FROM ce_events WHERE content LIKE ?",
+        ("%sess_tail%",),
+    )
+    assert tail_rows[0][0] >= 1
+
+
+def test_mass_removal_is_refused_by_the_guard(tmp_path: Path) -> None:
+    """P2: > half of the active slots vanishing in one pass refuses to apply.
+
+    A mirror that points at nothing (wiped root, failed stage) would otherwise
+    deactivate every slot — and mark the whole live store stale — in a single
+    transaction. The guard aborts before any write; the error text is the
+    operator's signal.
+    """
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror)
+    db = tmp_path / "live.sqlite"
+    first = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert first["status"] == "ok"
+
+    for name in ("b.jsonl", "c.jsonl", "d.jsonl"):
+        (mirror / FAMILY / name).unlink()
+
+    with pytest.raises(LiveSyncError) as excinfo:
+        live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert "refused" in str(excinfo.value)
+    assert "3 of 4" in str(excinfo.value)
+
+    # Nothing was written: no slot deactivated, no removal recorded.
+    assert _rows(
+        db, "SELECT COUNT(*) FROM ce_live_slots WHERE active=1"
+    ) == [(4,)]
+    assert _removal_records(db) == []
+
+
+def test_unregistered_family_slots_are_never_marked_removed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """P2: a family that stops resolving is reported, not deactivated.
+
+    ``scan_mirror`` refuses to guess an unregistered family, so the family's
+    files drop out of ``scanned``; without the fix its active slots looked like
+    removals and were deactivated (rows marked stale) by the next apply.
+    """
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror, names=("a.jsonl",))
+    db = tmp_path / "live.sqlite"
+    first = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert first["status"] == "ok"
+
+    real_resolve = live_sync_module.resolve_family
+
+    def deregistered(name):
+        if name == FAMILY:
+            raise KeyError(name)
+        return real_resolve(name)
+
+    monkeypatch.setattr(live_sync_module, "resolve_family", deregistered)
+    second = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert second["status"] == "no-op"
+    assert second["unregistered_families"] == [FAMILY]
+    assert _rows(
+        db,
+        "SELECT active FROM ce_live_slots WHERE slot_id=?",
+        (_slot_id("a.jsonl"),),
+    ) == [(1,)]
+    assert _removal_records(db) == []
+
+    # The family registers again (or the rename is undone): the slot lines up
+    # with its file unchanged and nothing was lost in between.
+    monkeypatch.undo()
+    third = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert third["status"] == "no-op"
+    assert third["n_removed"] == 0
+    assert third["unregistered_families"] == []
