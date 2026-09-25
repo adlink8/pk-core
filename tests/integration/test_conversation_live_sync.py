@@ -1544,3 +1544,96 @@ def test_stale_relation_and_disposition_rows_are_retained(
     finally:
         con.close()
     assert _rows(db, "PRAGMA foreign_key_check") == []
+
+
+# ------------------- 10. 变更槽位：先插入新事件，再刷新引用它们的派生行
+#
+# 真机事故（2026-09-25）：authority 的第一次增量 apply 直接抛
+# ``IntegrityError: FOREIGN KEY constraint failed``，整轮回滚（回滚本身是干净的：
+# integrity ok、``PRAGMA foreign_key_check`` 0 行、槽数与事件数分毫未动）。原因
+# 是 ``_apply_slot`` 的语句顺序 —— 它先把脏派生行 UPDATE 成新值，之后才 INSERT
+# 本文件新产出的事件行，而 ``ce_event_relations`` 的两个端点都被 FK 约束到
+# ``ce_events``。
+#
+# 「关系身份不变、端点指向新事件」是可达的：claude 的 call/result 关系 id 取自
+# 原生 ``call_id``（与行号无关），而事件 id 含 locator 里的行号。所以文件顶部插
+# 一行，就足以让这条关系保持同一个身份、两个端点全部搬家 —— 此时按原顺序 UPDATE
+# 会指向尚不存在的事件行。
+#
+# 断言落在「刷新后两个端点确实存在于事件表」上，而不是靠「没抛异常」。
+
+
+def _claude_tool_pair() -> str:
+    """一条 user + 一条 assistant：后者带同一 ``call_id`` 的 tool_use/tool_result。"""
+
+    records = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "parentUuid": None,
+            "sessionId": "s-pair",
+            "timestamp": "2026-07-01T10:00:00Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "q"}]},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "parentUuid": "u1",
+            "sessionId": "s-pair",
+            "timestamp": "2026-07-01T10:00:01Z",
+            "stop_reason": "tool_use",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "call-1", "name": "t",
+                     "input": {"command": "ls"}},
+                    {"type": "tool_result", "tool_use_id": "call-1", "content": "ok"},
+                ],
+            },
+        },
+    ]
+    return "\n".join(json.dumps(record) for record in records) + "\n"
+
+
+def _claude_tool_pair_shifted() -> str:
+    """同样的记录，但顶部多一行：其后每条 locator（``#L<行号>``）整体后移。"""
+
+    leading = {
+        "type": "runtime-config",
+        "uuid": "rc",
+        "parentUuid": None,
+        "sessionId": "s-pair",
+        "model": "m",
+    }
+    return json.dumps(leading) + "\n" + _claude_tool_pair()
+
+
+def test_changed_slot_refreshes_a_relation_whose_endpoints_moved(
+    tmp_path: Path,
+) -> None:
+    """关系 id 不变、端点全搬家的增量必须落地，而不是撞 FK 回滚。"""
+
+    mirror = tmp_path / "mirror"
+    _write_claude(mirror, CLAUDE_FILE, _claude_tool_pair())
+    db = tmp_path / "live.sqlite"
+    first = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert first["status"] == "ok"
+
+    pairs = [row for row in _relation_state(db) if row[3] == "call_result"]
+    assert len(pairs) == 1
+    relation_id, old_source, old_target = pairs[0][0], pairs[0][1], pairs[0][2]
+
+    _write_claude(mirror, CLAUDE_FILE, _claude_tool_pair_shifted())
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert report["status"] == "ok"
+
+    # 同一身份、不同值：端点真的搬家了（否则这条测试什么也没验证）。
+    state = {row[0]: row for row in _relation_state(db)}
+    assert state[relation_id][1] != old_source
+    assert state[relation_id][2] != old_target
+    # 旧端点按「同身份不同值」的契约进了历史表，没有被覆盖掉。
+    assert _relation_versions(db, relation_id)[0][2:4] == (old_source, old_target)
+    # FK 的实质：刷新后的两个端点确实在事件表里。
+    stored = {row[0] for row in _rows(db, "SELECT event_id FROM ce_events")}
+    assert {state[relation_id][1], state[relation_id][2]} <= stored
+    assert _rows(db, "PRAGMA foreign_key_check") == []

@@ -835,7 +835,39 @@ def _apply_slot(
         rows={key: old_dispositions[key] for key in dirty_dispositions},
     )
 
-    # 2) Refresh those rows in place (an UPDATE, never a delete + re-insert).
+    # 2) Rows the store sees for the first time. These must be written BEFORE the
+    #    in-place refreshes below and never after: a refreshed relation carries
+    #    its two endpoints, and both are FK-checked against ``ce_events`` at
+    #    UPDATE time. A relation's identity can outlive an endpoint move (claude's
+    #    call/result relation id comes from the native ``call_id``, while the
+    #    endpoint ids carry the record's line number), so refreshing first would
+    #    point at an event row this same apply has not inserted yet — which SQLite
+    #    rejects, aborting the whole cycle. A row that disappeared upstream is
+    #    kept as collected evidence in every one of the four families; a row whose
+    #    identity survived with different values gets archived below and then
+    #    refreshed, never silently kept at its first captured value.
+    new_event_ids = set(new_events)
+    new_session_ids = set(new_sessions)
+    old_event_ids = set(old_events)
+    old_session_ids = set(old_sessions)
+    rows_inserted = (
+        len(new_event_ids - old_event_ids)
+        + len(new_session_ids - old_session_ids)
+        + len(set(new_relations) - set(old_relations))
+        + len(set(new_dispositions) - set(old_dispositions))
+    )
+
+    gen = _generation_input(result)
+    _insert_artifacts(con, gen, generation_id)
+    _refresh_artifact_row(con, artifact, family)
+    _insert_sessions(con, gen, generation_id)
+    _insert_events(con, gen, generation_id)
+    _insert_relations(con, gen, generation_id)
+    _insert_dispositions(con, gen, generation_id)
+
+    # 3) Refresh the dirty rows in place (an UPDATE, never a delete + re-insert).
+    #    ``INSERT OR IGNORE`` above was a no-op for these ids, so an id that was
+    #    already stored is refreshed here and nowhere else.
     rows_updated = _update_rows(
         con,
         table="ce_events",
@@ -865,29 +897,6 @@ def _apply_slot(
         generation_id=generation_id,
         rows={key: new_dispositions[key] for key in dirty_dispositions},
     )
-
-    # Rows the store sees for the first time. A row that disappeared upstream is
-    # kept as collected evidence in every one of the four families; a row whose
-    # identity survived with different values has just been archived and
-    # refreshed above, never silently kept at its first captured value.
-    new_event_ids = set(new_events)
-    new_session_ids = set(new_sessions)
-    old_event_ids = set(old_events)
-    old_session_ids = set(old_sessions)
-    rows_inserted = (
-        len(new_event_ids - old_event_ids)
-        + len(new_session_ids - old_session_ids)
-        + len(set(new_relations) - set(old_relations))
-        + len(set(new_dispositions) - set(old_dispositions))
-    )
-
-    gen = _generation_input(result)
-    _insert_artifacts(con, gen, generation_id)
-    _refresh_artifact_row(con, artifact, family)
-    _insert_sessions(con, gen, generation_id)
-    _insert_events(con, gen, generation_id)
-    _insert_relations(con, gen, generation_id)
-    _insert_dispositions(con, gen, generation_id)
 
     _touch_slot(
         con,
