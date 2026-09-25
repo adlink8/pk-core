@@ -11,7 +11,8 @@ outcomes; unknown kinds stay ``unknown_native``.
 
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from personal_knowledge.adapters.conversation_sources.contracts import (
@@ -164,13 +165,57 @@ def _fidelity(**overrides) -> FidelityProfile:
     return FidelityProfile.from_levels(levels)
 
 
+# 13-digit values are epoch milliseconds; anything at or above the 10-digit
+# floor (2001-09) but below the ms floor is epoch seconds. Real kimi exports
+# carry both shapes (envelope timestamp ms, old-format `time` ms, and 10-digit
+# epoch seconds), so both must normalize instead of leaking through verbatim.
+_EPOCH_MS_FLOOR = 1_000_000_000_000
+_EPOCH_SECONDS_FLOOR = 1_000_000_000
+
+
+def _epoch_to_iso_z(seconds: float) -> str:
+    """Epoch seconds -> ISO-8601 UTC with the canonical ``Z`` suffix."""
+    dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    spec = "milliseconds" if dt.microsecond else "seconds"
+    return dt.isoformat(timespec=spec).replace("+00:00", "Z")
+
+
 def _timestamp(value) -> str | None:
-    """Normalize epoch-millisecond timestamps (real exports) or passthrough."""
+    """Normalize a native timestamp to canonical ISO-8601 UTC (``Z`` suffix).
+
+    Accepts epoch milliseconds and epoch seconds (int/float, bare or as a
+    digit string) plus ISO-8601 strings. The old implementation only knew
+    ``int > 1e12`` (ms); 10-digit epoch seconds and digit strings leaked
+    through as raw text like ``"1758768000"`` into ``occurred_at``. Values
+    below the epoch-seconds floor and non-ISO text are preserved verbatim
+    rather than guessed.
+    """
     if value is None:
         return None
-    if isinstance(value, int) and value > 1_000_000_000_000:
-        from datetime import datetime, timezone
-        return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat()
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        if value >= _EPOCH_MS_FLOOR:
+            return _epoch_to_iso_z(value / 1000)
+        if value >= _EPOCH_SECONDS_FLOOR:
+            return _epoch_to_iso_z(value)
+        return str(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return _timestamp(int(text))
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return text
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        spec = "milliseconds" if parsed.microsecond else "seconds"
+        return parsed.isoformat(timespec=spec).replace("+00:00", "Z")
     return str(value)
 
 
@@ -386,10 +431,51 @@ def _usage_text(record: dict, nested: dict) -> str | None:
     return " ".join(pairs) if pairs else None
 
 
-def _is_subagent_artifact(artifact) -> bool:
-    """True when an artifact lives under a native subagents/ directory."""
+def _is_subagent_artifact(artifact, *, family: str | None = None) -> bool:
+    """True when an artifact lives in a native subagent directory layout.
+
+    Two layouts coexist across the families this module serves:
+
+    * workbuddy: ``.../subagents/<agent>.jsonl``;
+    * kimi / kimi-work: ``sessions/<wd>_<hash>/session_<uuid>/agents/<agent>/...``
+      — where ``agents/main`` is the *main session's own* wire log and must
+      stay a main artifact, while ``agents/<any other name>`` (e.g.
+      ``agent-0``) is a child agent. Classifying those children as main
+      artifacts made a same-batch main+agents set fail the "exactly one
+      main artifact" check (2026-09-25: whole-session adapt failure).
+
+    The check is family-aware so the workbuddy ``subagents/`` behavior is
+    untouched; kimi paths without an ``agents/`` segment are also unaffected.
+    """
     parts = (artifact.relative_path or "").replace("\\", "/").split("/")
-    return "subagents" in parts
+    if "subagents" in parts:
+        return True
+    if family in ("kimi", "kimi-work"):
+        for index, part in enumerate(parts[:-1]):
+            if part == "agents" and parts[index + 1] != "main":
+                return True
+    return False
+
+
+_SESSION_DIR_RE = re.compile(
+    r"session_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+def _path_session_key(relative_path: str | None) -> str | None:
+    """Native session id embedded in a kimi path (``.../session_<uuid>/...``).
+
+    Historical wire.jsonl snapshots carry no session id in their records; the
+    owning session lives in the directory layout, not the file name. Falling
+    back to the file stem collapsed every agent wire log of every session onto
+    one pseudo-session ``wire`` (measured 2026-09-25: 97 of 105 kimi ce
+    sessions shared that key).
+    """
+    if not relative_path:
+        return None
+    match = _SESSION_DIR_RE.search(relative_path.replace("\\", "/"))
+    return f"session_{match.group(1)}" if match else None
 
 
 def _session_lifecycle_event(artifact, *, family: str, session_id: str, contract_version: str,
@@ -812,9 +898,9 @@ class _Family:
         artifacts = list(artifact_set.artifacts)
         if not artifacts:
             raise EventContractError(f"{self.family} adapter requires at least one artifact")
-        main_artifacts = [a for a in artifacts if not _is_subagent_artifact(a)]
+        main_artifacts = [a for a in artifacts if not _is_subagent_artifact(a, family=self.family)]
         sub_artifacts = sorted(
-            (a for a in artifacts if _is_subagent_artifact(a)),
+            (a for a in artifacts if _is_subagent_artifact(a, family=self.family)),
             key=lambda a: a.relative_path or "",
         )
         if len(main_artifacts) != 1:
@@ -845,8 +931,8 @@ class _Family:
 
         native_session = next(
             (_record_session_id(r) for r in records if _record_session_id(r)),
-            Path(artifact.relative_path).stem,
-        )
+            None,
+        ) or _path_session_key(artifact.relative_path) or Path(artifact.relative_path).stem
         cwd = _project_cwd(artifact.relative_path)
         title: str | None = None
 

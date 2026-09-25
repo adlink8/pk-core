@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from personal_knowledge.adapters.conversation_sources.contracts import SourceArtifact
+from personal_knowledge.adapters.conversation_sources.contracts import (
+    SourceArtifact,
+    SourceArtifactSet,
+)
 from tests.contract.conversation_sources.support import artifacts
 
 # 本模块服务的家族（共享同一个 ADAPTER_VERSION）。
@@ -37,6 +40,26 @@ def wire(
     return artifacts.file_artifact(
         tmp_path, label, relative_path, artifacts.jsonl(records), family=family,
     )
+
+
+def wire_set(
+    tmp_path: Path,
+    items: list[tuple[str, str, list[dict]]],
+    *,
+    family: str,
+) -> tuple[SourceArtifactSet, Path]:
+    """多份原生 JSONL 记录 -> ``(SourceArtifactSet, artifact_root)``。
+
+    ``items`` 是 ``(label, relative_path, records)`` 三元组；label 仍须唯一。
+    用于同批提交主会话 + 子代理 artifact 的布局回归。
+    """
+    set_artifacts: list[SourceArtifact] = []
+    root: Path | None = None
+    for label, relative_path, records in items:
+        artifact, root = wire(tmp_path, label, relative_path, records, family=family)
+        set_artifacts.append(artifact)
+    assert root is not None and set_artifacts
+    return SourceArtifactSet(tuple(set_artifacts)), root
 
 
 def record_events(result):

@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 import pytest
 
 from personal_knowledge.adapters.conversation_sources import registry
-from personal_knowledge.core.conversation_events import EventKind
+from personal_knowledge.core.conversation_events import EventKind, RelationKind
 from tests.contract.conversation_sources.support import artifacts
 from tests.contract.conversation_sources.support import workbuddy_kimi as wbk
 
@@ -312,6 +312,160 @@ def test_kimi_session_time_bounds_empty(tmp_path):
         assert (
             result.sessions[0].started_at, result.sessions[0].ended_at,
         ) == (None, None)
+
+
+def test_kimi_wire_session_key_from_path_not_stem(tmp_path):
+    """wire 日志记录里没有 session id 时，会话键取路径里的 session_<uuid>。
+
+    实测 2026-09-25：97 份 agents/<agent>/wire.jsonl 历史快照的记录均无
+    session id，旧的文件名词干兜底把全部快照折叠成一个伪会话 ``wire``。
+    """
+    session_uuid = "691f0a59-371f-498c-bda4-a5c5fa3ceb3a"
+    records = [
+        {"type": "metadata", "protocol_version": "1.5", "created_at": 1_786_153_201_779},
+        {
+            "type": "turn.prompt",
+            "input": [{"type": "text", "text": "夹具路径会话键提问"}],
+            "time": 1_700_000_000_000,
+        },
+    ]
+    artifact, root = wbk.wire(
+        tmp_path, "kimi.wire_path_key",
+        f"sessions/wd_career-os_eb4239af38e6/session_{session_uuid}/agents/main/wire.jsonl",
+        records, family="kimi",
+    )
+    result = registry.adapt_for("kimi", artifacts.single(artifact), artifact_root=root)
+    anchors = [
+        event for event in result.events
+        if (event.provenance.native_locator or "").endswith("#session")
+    ]
+    assert anchors, "会话生命周期锚点缺失"
+    assert all(
+        event.provenance.native_session_id == f"session_{session_uuid}"
+        for event in anchors
+    )
+    assert result.sessions[0].native_session_id == f"session_{session_uuid}"
+
+
+# ---------------------------------------- kimi agents/ 布局：子代理不再冒充主会话
+
+def test_kimi_agents_layout_subfiles_are_subagents_not_main(tmp_path):
+    """kimi 真实布局 ``agents/main`` 是主会话，``agents/agent-N`` 是子代理。
+
+    同批提交主会话 + 子代理 wire 时不得再抛 "exactly one main artifact"
+    （旧判定只认 ``subagents/`` 段，把 agent 文件当主 artifact，导致整批
+    适配失败）；agent 文件走子代理路径：SUBAGENT_BOUNDARY 事件 + SUBAGENT
+    关系指向主会话生命周期锚点。
+    """
+    session_uuid = "9aa399e2-ed55-4cdf-82c8-f6db235b3f0c"
+    base = f"sessions/wd_fixture_eb4239af38e6/session_{session_uuid}/agents"
+    artifact_set, root = wbk.wire_set(tmp_path, [
+        (
+            "kimi.agents.main", f"{base}/main/wire.jsonl",
+            [{"type": "turn.prompt",
+              "input": [{"type": "text", "text": "主会话提问"}],
+              "time": 1_758_768_000_000}],
+        ),
+        (
+            "kimi.agents.agent0", f"{base}/agent-0/wire.jsonl",
+            [{"type": "turn.prompt",
+              "input": [{"type": "text", "text": "子代理零提问"}],
+              "time": 1_758_768_010_000}],
+        ),
+        (
+            "kimi.agents.agent1", f"{base}/agent-1/wire.jsonl",
+            [{"type": "turn.prompt",
+              "input": [{"type": "text", "text": "子代理一提问"}],
+              "time": 1_758_768_020_000}],
+        ),
+    ], family="kimi")
+
+    result = registry.adapt_for("kimi", artifact_set, artifact_root=root)
+
+    boundary_locators = [
+        event.provenance.native_locator for event in result.events
+        if event.kind is EventKind.SUBAGENT_BOUNDARY
+        and (event.provenance.native_locator or "").endswith("#boundary")
+    ]
+    assert any("agent-0" in locator for locator in boundary_locators)
+    assert any("agent-1" in locator for locator in boundary_locators)
+    assert not any(f"{base}/main" in locator for locator in boundary_locators), (
+        "agents/main 是主会话自身的 wire，不得判成子代理"
+    )
+
+    main_anchor = next(
+        event for event in result.events
+        if (event.provenance.native_locator or "").endswith("#session")
+        and f"{base}/main" in event.provenance.native_locator
+    )
+    subagent_relations = [
+        relation for relation in result.relations
+        if relation.relation_kind is RelationKind.SUBAGENT
+    ]
+    assert len(subagent_relations) == 2
+    assert all(
+        relation.target_event_id == main_anchor.event_id
+        for relation in subagent_relations
+    )
+    assert result.sessions
+    assert result.sessions[0].native_session_id == f"session_{session_uuid}"
+
+
+def test_workbuddy_subagents_layout_still_routes_subagent_files(tmp_path):
+    """workbuddy 的 ``subagents/`` 布局行为不变：子代理文件不冒充主会话。"""
+    artifact_set, root = wbk.wire_set(tmp_path, [
+        (
+            "workbuddy.subagents.main", "projects/fixture/session.jsonl",
+            [{"type": "message", "role": "user",
+              "content": [{"type": "input_text", "text": "主会话提问"}]}],
+        ),
+        (
+            "workbuddy.subagents.agent", "projects/fixture/subagents/agent-1.jsonl",
+            [{"type": "message", "role": "user", "text": "子代理提问"}],
+        ),
+    ], family="workbuddy")
+
+    result = registry.adapt_for("workbuddy", artifact_set, artifact_root=root)
+
+    assert any(
+        relation.relation_kind is RelationKind.SUBAGENT
+        for relation in result.relations
+    )
+    assert any(
+        "subagents/agent-1.jsonl" in (event.provenance.native_locator or "")
+        and event.kind is EventKind.SUBAGENT_BOUNDARY
+        for event in result.events
+    )
+
+
+# --------------------------------------------- 时间戳规范化（秒 / 字符串 / ISO）
+
+def test_timestamp_normalizes_seconds_digit_strings_and_iso(tmp_path):
+    """occurred_at 统一为 ISO-8601 UTC（Z 后缀）。
+
+    旧实现只认 ``int > 1e12``（毫秒）：10 位纪元秒（int 或数字字符串）与
+    数字字符串毫秒原样透传成 ``"1758768000"`` 这类垃圾 occurred_at。
+    """
+    records = [
+        {"type": "turn.prompt", "input": [{"type": "text", "text": "秒级整数"}],
+         "time": 1_758_768_000},
+        {"type": "turn.prompt", "input": [{"type": "text", "text": "秒级字符串"}],
+         "time": "1758768060"},
+        {"type": "turn.prompt", "input": [{"type": "text", "text": "毫秒字符串"}],
+         "time": "1758768120000"},
+        {"type": "turn.prompt", "input": [{"type": "text", "text": "带偏移ISO"}],
+         "time": "2026-01-01T08:00:00+08:00"},
+    ]
+    artifact, root = wbk.wire(
+        tmp_path, "kimi.timestamps", "wire.jsonl", records, family="kimi",
+    )
+    result = registry.adapt_for("kimi", artifacts.single(artifact), artifact_root=root)
+
+    by_content = wbk.content_index(wbk.record_events(result))
+    assert by_content["秒级整数"].occurred_at == "2025-09-25T02:40:00Z"
+    assert by_content["秒级字符串"].occurred_at == "2025-09-25T02:41:00Z"
+    assert by_content["毫秒字符串"].occurred_at == "2025-09-25T02:42:00Z"
+    assert by_content["带偏移ISO"].occurred_at == "2026-01-01T00:00:00Z"
 
 
 # --------------------------------------------------------------- 超限正文
