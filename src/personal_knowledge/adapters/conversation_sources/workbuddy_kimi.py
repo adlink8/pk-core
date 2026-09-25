@@ -23,6 +23,7 @@ from personal_knowledge.adapters.conversation_sources.contracts import (
     artifact_bytes_path,
 )
 from personal_knowledge.adapters.conversation_sources.jsonl_stream import (
+    JSONLLineError,
     iter_jsonl_lines,
 )
 from personal_knowledge.core.conversation_events import (
@@ -232,25 +233,58 @@ def _record_time(record) -> str | None:
     return None
 
 
+def _first_record_time(records) -> str | None:
+    """ISO timestamp of a stream's first record, whichever shape it uses.
+
+    envelope 格式（journal event 流）的时间在 ``envelope.timestamp``，老格式在
+    顶层 ``time`` / ``timestamp`` / ``created_at``；只走老格式会把 envelope 流
+    的首条时间取成 None。
+    """
+    if not records:
+        return None
+    env = _envelope(records[0])
+    if env is not None:
+        return _timestamp(env.get("timestamp"))
+    return _record_time(records[0])
+
+
+def _parse_utc(stamp: str) -> datetime | None:
+    """Parse a stamp to an aware-UTC datetime; unparseable text yields None.
+
+    naive 时间戳假定 UTC（与本模块 ``_timestamp`` 的既有约定一致）：
+    ``datetime.fromisoformat(...).timestamp()`` 会把 naive 值按本地时区解释、
+    aware 值按各自偏移解释，混排时 min/max 直接在错误的时间线上比较。
+    """
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _session_time_bounds(records) -> tuple[str | None, str | None]:
     """会话起止时间：对全部记录取时间 min/max。
 
     不同记录的时间戳来源不一致（部分用 ``time`` 毫秒纪元、部分用
     ``created_at`` 字符串），直接取 ``records[0]`` / ``records[-1]`` 会在短会话
     里出现 ``started_at > ended_at`` 的倒挂（实测约 1.2 秒）。统一取极值可修正。
-    空 records 或全 None 时返回 ``(None, None)``。
+    极值只在解析成功的 aware-UTC 时间线上比较；无法解析的时间戳不参与
+    （否则 ``max`` 的元组序会让垃圾串反而压过合法时间）。空 records 或没有
+    可解析时间时返回 ``(None, None)``。
     """
 
-    def _sort_key(stamp: str):
-        try:
-            return (0, datetime.fromisoformat(stamp).timestamp(), stamp)
-        except (ValueError, TypeError):
-            return (1, 0.0, stamp)
-
-    stamps = [t for t in (_record_time(r) for r in records) if t is not None]
-    if not stamps:
+    parsed: list[tuple[datetime, str]] = []
+    for stamp in (t for t in (_record_time(r) for r in records) if t is not None):
+        dt = _parse_utc(stamp)
+        if dt is not None:
+            parsed.append((dt, stamp))
+    if not parsed:
         return None, None
-    return min(stamps, key=_sort_key), max(stamps, key=_sort_key)
+    started = min(parsed, key=lambda item: (item[0], item[1]))
+    ended = max(parsed, key=lambda item: (item[0], item[1]))
+    return started[1], ended[1]
 
 
 def _text_blocks(value) -> str | None:
@@ -496,10 +530,14 @@ def _session_lifecycle_event(artifact, *, family: str, session_id: str, contract
 class _Family:
     """Shared JSONL adapter machinery for one family of this module."""
 
-    def __init__(self, family: str, *, markers: tuple[str, ...], kinds: dict | None):
+    def __init__(self, family: str, *, markers: tuple[str, ...], kinds: dict | None,
+                 regex_markers: tuple[str, ...] = ()):
         self.family = family
         self.markers = markers
         self.kinds = kinds or {}
+        # 正则标记：子串标记假定紧凑 JSON（冒号后无空格），真实导出两种
+        # 缩进都出现，放宽为容忍任意空白。
+        self.regex_markers = tuple(re.compile(r) for r in regex_markers)
 
     def capability(self) -> CapabilityDescriptor:
         kinds = {k for k in (self.kinds.values() if self.kinds else ()) if k is not None}
@@ -538,7 +576,10 @@ class _Family:
             with artifact_bytes_path(artifact_root, artifact).open("r", encoding="utf-8") as h:
                 for raw in h:
                     line = raw.strip()
-                    if line and any(m in line for m in self.markers):
+                    if line and (
+                        any(m in line for m in self.markers)
+                        or any(rx.search(line) for rx in self.regex_markers)
+                    ):
                         return True
         except (OSError, ValueError):
             # ValueError 覆盖 UnicodeDecodeError：非 UTF-8 字节的轨迹必须判为
@@ -642,7 +683,11 @@ class _Family:
             if kind is EventKind.TOOL_RESULT and native_id:
                 native_id = f"{native_id}#result"
         elif etype and etype.startswith("subagent."):
-            native_id = payload.get("subagentId")
+            sub_id = payload.get("subagentId")
+            if sub_id:
+                # started/completed/failed 共享同一个 subagentId；裸 id 会被
+                # 下游按 native_event_id 去重折叠成一条边界，加生命周期后缀。
+                native_id = f"{sub_id}#{etype.split('.', 1)[1]}"
         elif etype == "error":
             native_id = seq
         elif etype is not None:
@@ -938,13 +983,7 @@ class _Family:
 
         # The main session always owns an explicit lifecycle anchor so subagent
         # relations can target it deterministically.
-        _first_ts = None
-        if records:
-            _env0 = _envelope(records[0])
-            _first_ts = (
-                _timestamp(_env0.get("timestamp")) if _env0 is not None
-                else _record_time(records[0])
-            )
+        _first_ts = _first_record_time(records)
         events.append(_session_lifecycle_event(
             artifact, family=self.family, session_id=session_id,
             contract_version=CONTRACT_VERSION,
@@ -1052,6 +1091,13 @@ class _Family:
             except OSError:
                 warnings.append(f"subagent artifact {sub_artifact.artifact_id} unreadable")
                 continue
+            except JSONLLineError as exc:
+                # 一个坏掉的 agent-*.jsonl 只说明这一份子代理轨迹不可读，
+                # 不得让整场适配失败、连累主会话。
+                warnings.append(
+                    f"subagent artifact {sub_artifact.artifact_id} skipped: {exc}"
+                )
+                continue
             child_native = next(
                 (r.get("session_id") or r.get("sessionId") for r in sub_records
                  if r.get("session_id") or r.get("sessionId")),
@@ -1065,7 +1111,7 @@ class _Family:
                 sub_artifact, family=self.family, session_id=child_session_id,
                 contract_version=CONTRACT_VERSION,
                 locator=f"{sub_artifact.relative_path}#session", native_session=child_native,
-                occurred_at=_record_time(sub_records[0]) if sub_records else None,
+                occurred_at=_first_record_time(sub_records),
             )
             events.append(child_lifecycle)
             events.append(self._event(
@@ -1127,10 +1173,13 @@ class _Family:
 
 _FAMILIES = {
     "workbuddy": _Family("workbuddy", markers=("function_call_result",), kinds=_WORKBUDDY_KINDS),
-    # The "kind":"event" marker covers the new-format journal stream
-    # ({"kind":"event","seq":N,"envelope":{...}}).
-    "kimi": _Family("kimi", markers=("loop_iteration", "context_append", "task_complete", "context.append_loop_event", "turn.prompt", "\"kind\":\"event\""), kinds=None),
-    "kimi-work": _Family("kimi-work", markers=("loop_iteration", "context_append", "task_complete", "context.append_loop_event", "turn.prompt", "\"kind\":\"event\""), kinds=None),
+    # The regex marker covers the new-format journal stream both compact
+    # ({"kind":"event",...}) and spaced ({"kind": "event",...}); the plain
+    # substring marker assumed the compact shape only.
+    "kimi": _Family("kimi", markers=("loop_iteration", "context_append", "task_complete", "context.append_loop_event", "turn.prompt"), kinds=None,
+                    regex_markers=(r'"kind"\s*:\s*"event"',)),
+    "kimi-work": _Family("kimi-work", markers=("loop_iteration", "context_append", "task_complete", "context.append_loop_event", "turn.prompt"), kinds=None,
+                         regex_markers=(r'"kind"\s*:\s*"event"',)),
 }
 
 

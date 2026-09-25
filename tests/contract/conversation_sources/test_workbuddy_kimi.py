@@ -538,3 +538,172 @@ def test_workbuddy_kimi_detector_rejects_malformed_bytes_without_raising(
 ):
     artifact, root = artifacts.probe_file(tmp_path, name, raw)
     assert registry.detect_family(family, artifact, artifact_root=root) is False
+
+
+# ------------------------------- 批次 B 修复包回归（P1-11 / P2 x4）
+
+def test_session_time_bounds_mixed_naive_and_aware(tmp_path):
+    """P1-11：naive / aware / 带偏移 / 毫秒纪元混排时起止仍按同一时间线取极值。
+
+    naive 时间戳假定 UTC（与本模块 _timestamp 的既有约定一致）。
+    """
+    epoch_ms = int(datetime(2026, 7, 1, 10, 0, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    records = [
+        {"created_at": "2026-07-01T10:00:03"},            # naive，最晚
+        {"time": epoch_ms},                               # 毫秒纪元，最早
+        {"timestamp": "2026-07-01T12:00:02+02:00"},       # 带偏移，居中
+    ]
+    artifact, root = wbk.wire(
+        tmp_path, "kimi.time_bounds_tz", "wire.jsonl", records, family="kimi",
+    )
+    result = registry.adapt_for("kimi", artifacts.single(artifact), artifact_root=root)
+    started, ended = result.sessions[0].started_at, result.sessions[0].ended_at
+    assert started == "2026-07-01T10:00:01Z"
+    assert ended == "2026-07-01T10:00:03Z"
+
+
+def test_session_time_bounds_compares_naive_as_utc(monkeypatch):
+    """P1-11 比较层单测：绕过 _timestamp 归一，直接喂 naive/aware 混排串。
+
+    naive 若被按本地时区解释（本机 UTC+8 时 ``12:00:03`` 会被算成 04:00Z），
+    min/max 就在错误时间线上取值；必须统一转 aware-UTC 后比较。
+    """
+    from personal_knowledge.adapters.conversation_sources import (
+        workbuddy_kimi as wbk_module,
+    )
+
+    monkeypatch.setattr(wbk_module, "_record_time", lambda record: record["raw"])
+    started, ended = wbk_module._session_time_bounds([
+        {"raw": "2026-07-01T12:00:03"},        # naive，实际是全天最晚
+        {"raw": "2026-07-01T10:00:01+00:00"},  # aware，实际最早
+    ])
+    assert started == "2026-07-01T10:00:01+00:00"
+    assert ended == "2026-07-01T12:00:03"
+
+
+def test_envelope_subagent_boundaries_keep_distinct_native_ids(tmp_path):
+    """P2：subagent.started/completed/failed 共享 subagentId，native_event_id
+    必须带生命周期后缀区分，否则下游按 native_event_id 去重会把三条折叠。"""
+    def boundary(seq: int, phase: str) -> dict:
+        return {
+            "kind": "event",
+            "seq": seq,
+            "envelope": {
+                "type": f"subagent.{phase}", "seq": seq,
+                "session_id": "fixture-session",
+                "timestamp": f"2026-01-01T00:00:0{seq}Z",
+                "payload": {"subagentId": "agent-9"},
+            },
+        }
+
+    records = [boundary(1, "started"), boundary(2, "completed"), boundary(3, "failed")]
+    artifact, root = wbk.wire(
+        tmp_path, "kimi.subagent_ids", "server/events/session_fixture.jsonl",
+        records, family="kimi",
+    )
+    result = registry.adapt_for("kimi", artifacts.single(artifact), artifact_root=root)
+    sub_events = [
+        event for event in wbk.record_events(result)
+        if event.kind is EventKind.SUBAGENT_BOUNDARY
+        and (event.provenance.native_event_id or "").startswith("agent-9")
+    ]
+    assert len(sub_events) == 3
+    assert {event.provenance.native_event_id for event in sub_events} == {
+        "agent-9#started", "agent-9#completed", "agent-9#failed",
+    }
+    assert len({event.event_id for event in sub_events}) == 3
+    # 关系层仍按 subagentId 每个子代理一条，不随后缀膨胀。
+    subagent_relations = [
+        relation for relation in result.relations
+        if relation.relation_kind is RelationKind.SUBAGENT
+    ]
+    assert len(subagent_relations) == 1
+
+
+def test_kimi_bad_json_subagent_file_does_not_break_main_session(tmp_path):
+    """P2：一份坏 JSON 的 agent-*.jsonl 只计入 warnings，不炸整场适配。"""
+    base = "sessions/wd_fixture_eb4239af38e6/session_691f0a59-371f-498c-bda4-a5c5fa3ceb3a/agents"
+    artifact_set, root = wbk.wire_set(tmp_path, [
+        (
+            "kimi.badjson.main", f"{base}/main/wire.jsonl",
+            [{"type": "turn.prompt",
+              "input": [{"type": "text", "text": "主会话提问"}],
+              "time": 1_758_768_000_000}],
+        ),
+        (
+            "kimi.badjson.agent0", f"{base}/agent-0/wire.jsonl",
+            '{"type": "turn.prompt", "time": 1758768010000\n{"broken": \n',
+        ),
+    ], family="kimi")
+
+    result = registry.adapt_for("kimi", artifact_set, artifact_root=root)
+
+    assert result.sessions, "主会话必须照常产出"
+    assert any(
+        event.kind is EventKind.USER_MESSAGE and "主会话提问" in (event.content or "")
+        for event in wbk.record_events(result)
+    )
+    assert any("agent0" in warning for warning in result.warnings), result.warnings
+    # 坏文件整体跳过：不产出子代理边界，也不产出子代理关系。
+    assert not any(
+        relation.relation_kind is RelationKind.SUBAGENT
+        for relation in result.relations
+    )
+
+
+def test_kimi_envelope_subagent_child_lifecycle_uses_envelope_timestamp(tmp_path):
+    """P2：envelope 格式子代理文件的首条时间在 envelope.timestamp，子代理
+    lifecycle 锚点不得取成 None。"""
+    base = "sessions/wd_fixture_eb4239af38e6/session_691f0a59-371f-498c-bda4-a5c5fa3ceb3a/agents"
+    artifact_set, root = wbk.wire_set(tmp_path, [
+        (
+            "kimi.envsub.main", f"{base}/main/wire.jsonl",
+            [{"type": "turn.prompt",
+              "input": [{"type": "text", "text": "主会话提问"}],
+              "time": 1_758_768_000_000}],
+        ),
+        (
+            "kimi.envsub.agent0", f"{base}/agent-0/events.jsonl",
+            [{
+                "kind": "event",
+                "seq": 1,
+                "envelope": {
+                    "type": "turn.started", "seq": 1,
+                    "session_id": "child-fixture",
+                    "timestamp": "2026-01-01T00:00:05Z",
+                    "payload": {"prompt": "子代理提问", "turnId": 1},
+                },
+            }],
+        ),
+    ], family="kimi")
+
+    result = registry.adapt_for("kimi", artifact_set, artifact_root=root)
+
+    child_anchor = next(
+        event for event in result.events
+        if (event.provenance.native_locator or "").endswith("#session")
+        and "agent-0" in event.provenance.native_locator
+    )
+    assert child_anchor.occurred_at == "2026-01-01T00:00:05Z"
+
+
+@pytest.mark.parametrize("family", wbk.LOOP_FAMILIES)
+@pytest.mark.parametrize(
+    "name,kind_pair",
+    [
+        ("compact", '"kind":"event"'),
+        ("single_space", '"kind": "event"'),
+        ("wide_space", '"kind"  :  "event"'),
+        ("tab", '"kind":\t"event"'),
+    ],
+)
+def test_kimi_detector_tolerates_whitespace_around_kind_colon(
+    tmp_path, family, name, kind_pair
+):
+    """P2：detect 的 kind:event 标记不得假定紧凑 JSON（冒号后无空格）。"""
+    raw = "{" + kind_pair + ',"seq":1,"envelope":{"type":"turn.started"}}\n'
+    artifact, root = artifacts.file_artifact(
+        tmp_path, f"{family}.detect_ws_{name}", "server/events/session_fixture.jsonl",
+        raw, family=family,
+    )
+    assert registry.detect_family(family, artifact, artifact_root=root) is True

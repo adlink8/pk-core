@@ -29,16 +29,19 @@ def wire(
     tmp_path: Path,
     label: str,
     relative_path: str,
-    records: list[dict],
+    records: list[dict] | str | bytes,
     *,
     family: str,
 ) -> tuple[SourceArtifact, Path]:
     """一份原生 JSONL 记录 -> ``(artifact, artifact_root)``。
 
     ``label`` 在该次适配的 artifact set 内必须唯一（它决定 blob 名与 artifact id）。
+    ``records`` 传 list[dict] 时按 JSONL 编码；传 str/bytes 时原样落盘，
+    用于坏 JSON / 非紧凑缩进等畸形字节夹具。
     """
+    raw = artifacts.jsonl(records) if isinstance(records, list) else records
     return artifacts.file_artifact(
-        tmp_path, label, relative_path, artifacts.jsonl(records), family=family,
+        tmp_path, label, relative_path, raw, family=family,
     )
 
 
@@ -51,6 +54,8 @@ def wire_set(
     """多份原生 JSONL 记录 -> ``(SourceArtifactSet, artifact_root)``。
 
     ``items`` 是 ``(label, relative_path, records)`` 三元组；label 仍须唯一。
+    ``records`` 可为 list[dict]（JSONL 编码）或 str/bytes（原样落盘，用于
+    坏 JSON / 非紧凑缩进等畸形子代理夹具）。
     用于同批提交主会话 + 子代理 artifact 的布局回归。
     """
     set_artifacts: list[SourceArtifact] = []
