@@ -654,13 +654,50 @@ def _merge_messages(g: _Group, ev_attr: dict, gen_of_v2_csid: dict,
             plan.adapter_new_ids.add(new_id)
             plan.own_row_ids.add(row["canonical_message_id"])
         new_rows.append(_message_row(g.new_session_id, new_id, rows[0]))
+    # Survivor id collisions: two v1 snapshot copies of the same native session
+    # (the merged db holds more than one v1 row per native id since the 09-23
+    # publish) both carry ``av<N>`` ordinals starting at 0, so both copies'
+    # av1 map to the same target id. Two cases:
+    #   * same content tuple  -> a true captured duplicate; collapse to one
+    #     row and count it (``snapshot_survivor_duplicates_dropped``);
+    #   * diverged content at the same ordinal (AgentsView re-captured an
+    #     edited session) -> BOTH survive: the later copy's address gets a
+    #     ``#dup-<n>`` suffix, mirroring the tools-side occurrence rule.
+    # Nothing else is dropped: this pass is a renumbering, not a cleanup.
+    _CONTENT_TUPLE = ("role", "content_hash", "content_length", "timestamp")
+
+    def _tuple_of(row: dict) -> tuple:
+        return tuple(row.get(c) for c in _CONTENT_TUPLE)
+
+    survivor_by_id: dict[str, dict] = {}
+    dropped_duplicates = 0
     for row in survivors:
         addr, form = _snapshot_message_address(row, stats)
         forms[(fam, "message", form)] += 1
         new_id = make_message_id(fam, g.native_key, addr)
+        prior = survivor_by_id.get(new_id)
+        if prior is not None:
+            if _tuple_of(prior) == _tuple_of(row):
+                old_to_new[row["canonical_message_id"]] = new_id
+                dropped_duplicates += 1
+                continue
+            serial = 2
+            while True:
+                disambiguated = make_message_id(
+                    fam, g.native_key, f"{addr}#dup-{serial}")
+                if disambiguated not in survivor_by_id:
+                    new_id = disambiguated
+                    break
+                serial += 1
+        survivor_by_id[new_id] = row
         old_to_new[row["canonical_message_id"]] = new_id
         plan.own_row_ids.add(row["canonical_message_id"])
-        new_rows.append(_message_row(g.new_session_id, new_id, row))
+    if dropped_duplicates:
+        stats["snapshot_survivor_duplicates_dropped"] += dropped_duplicates
+    for new_id in sorted(survivor_by_id):
+        new_rows.append(
+            _message_row(g.new_session_id, new_id, survivor_by_id[new_id])
+        )
     old_to_new.update(cover_pairs)
     return new_rows, old_to_new
 
