@@ -35,7 +35,18 @@ discovery.py 的 `FAMILY_CLIENT_ROOTS` 也已配置好本机根路径。所谓"�
 验证方式：`python -m personal_knowledge.application.sync conversations --live-sync --live-db <临时库>`
 全流程试点（不碰权威库），进行中。
 
-## 实施步骤（每步带验证闸）
+## 实施进度（2026-09-25 深夜更新）
+
+- **P0 家族覆盖 ✅**、**stale 撤回 ✅**（用户拍板收藏语义，78852709）、**批次 A/B/C 修复 ✅**（48 项清单关闭，464 绿）。
+- **P3 前置·id 收敛 ✅（2026-09-25）**：`uniform_id_migration --apply` 成功（log: var/logs/uniform-id-apply.log）。
+  - 备份：`agent_conversations.sqlite.bak-uniform-ids-20260925`（7.3GB，可回滚）。
+  - 结果：会话 2,382 不变；消息 226,555→226,547（仅 8 条字节级重复塌缩）；工具 545,093 不变；id_map 774,030 条。
+  - 会话级 id 已全部为原生派生式（cs|family|native-uuid）——live 并轨的同键前提成立。
+  - 消息地址保留 av<N> 形态（权威库行全是 AV 快照，无 ce 轨行）；分叉内容以 #dup-N 后缀共存，零内容丢失（verify 双闸：重复 id + 内容多重集）。
+  - 计划器修复（9c1f159a）：同 id 同内容塌缩、同 id 异内容 #dup-N 共存。
+  - FTS 全量重建随后执行（旧索引存老 id）。
+- **注意**：live_sync 上线后，原生 uuid 地址行与 av 行会在同一 canonical 会话内共存（同一条消息两种地址）——这是 P4"AV 行让位"要清理的对象，清理时用 ce_fts_invalidate/哨兵机制通知 FTS。
+- 待办：P3 并轨演练（live_sync 指权威库试跑一轮，核对投影合并）→ P4 AV 行清理 → P5 调度切换。
 
 1. **P0 家族覆盖验证 ✅（2026-09-25 完成）**：临时库 `var/db/live-pilot-scratch.sqlite` 全流程试点通过
    （1,107 秒，stage 126 新 / 1,601 跳过）。**15 家族全部采到**，6 个"缺口家族"零缺口：
