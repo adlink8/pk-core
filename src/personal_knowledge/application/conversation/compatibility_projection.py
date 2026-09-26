@@ -43,9 +43,14 @@ import json
 import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from personal_knowledge.core.conversation_events import EventKind
+from personal_knowledge.application.conversation.event_schema import (
+    CE_FTS_INVALIDATE_TABLE,
+    FTS_REBUILD_MARKER,
+)
 from personal_knowledge.application.conversation.uniform_id_migration import (
     adapter_address,
     make_message_id,
@@ -152,6 +157,10 @@ class CompatibilityProjectionReport:
     excluded: tuple[dict, ...]
     fingerprint: ProjectionFingerprint
     collapsed_duplicate_ids: int = 0
+    # P1-20: 本批内有多少对"不同的原始键"被 _sanitize 折叠到同一个
+    # canonical id（``|``→``/`` 替换的已知碰撞面）。id 公式固化在存量数据里
+    # 不能改，碰撞只能观测：计数暴露在这里，让静默覆盖变成可审计事件。
+    sanitized_id_collisions: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -161,6 +170,7 @@ class CompatibilityProjectionReport:
             "tools": list(self.tools),
             "excluded": list(self.excluded),
             "fingerprint": self.fingerprint.to_dict(),
+            "sanitized_id_collisions": self.sanitized_id_collisions,
         }
 
 
@@ -190,21 +200,32 @@ def compute_projection(
 
     sessions_by_id = {s["session_id"]: s for s in session_rows}
     family_by_session = {s["session_id"]: s.get("family", "") for s in session_rows}
-    key_by_session = {sid: _session_key(srow)
-                      for sid, srow in sessions_by_id.items()}
     messages, tools, excluded = _classify_events(
         generation_id, sessions_by_id, event_rows
     )
+    # Keys need each session's own events (P1-19 content digest fallback), so
+    # they are derived after classification. ``_classify_events`` fails closed
+    # on orphan events, so every session here has (possibly empty) buckets.
+    key_by_session = {
+        sid: _session_key(sessions_by_id[sid], messages.get(sid, []),
+                          tools.get(sid, []))
+        for sid in sessions_by_id
+    }
+    # P1-20: raw key -> canonical id, to observe ``_sanitize`` collisions.
+    raw_key_by_id: dict[str, set] = {}
+    collisions = [0]
     projected_sessions = _merge_session_copies(_project_sessions(
-        sessions_by_id, family_by_session, key_by_session, messages
+        sessions_by_id, family_by_session, key_by_session, messages,
+        raw_key_by_id, collisions,
     ))
     collapsed = [0]
     seen_messages: dict = {}
     seen_tools: dict = {}
     projected_messages = _project_messages(key_by_session, messages,
-                                           collapsed, seen_messages)
+                                           collapsed, seen_messages,
+                                           raw_key_by_id, collisions)
     projected_tools = _project_tools(key_by_session, tools, collapsed,
-                                     seen_tools)
+                                     seen_tools, raw_key_by_id, collisions)
 
     fingerprint = _make_fingerprint(
         generation_id, projected_sessions, projected_messages, projected_tools
@@ -217,6 +238,7 @@ def compute_projection(
         excluded=tuple(excluded),
         fingerprint=fingerprint,
         collapsed_duplicate_ids=collapsed[0],
+        sanitized_id_collisions=collisions[0],
     )
 
 
@@ -287,11 +309,94 @@ def _richer(candidate: dict, prior: dict) -> bool:
         prior["_event"].get("event_id") or "")
 
 
-def _session_key(srow: dict) -> tuple[str, str]:
-    """(family, native session key) — the same rule uniform_id_migration uses."""
+def _event_body(event: dict) -> str:
+    """The resolved body an event projects with (same rule as _project_messages).
+
+    ``content`` is the exact mapped source body; ``None`` (older adapter, no
+    optional field) falls back to the bounded summary. Kept in one place so
+    the P1-19 session digest and the message rows can never diverge.
+    """
+    content = event.get("content")
+    if content is None:
+        return event.get("summary") or ""
+    return content
+
+
+def _content_digest_key(events: list[dict]) -> str:
+    """P1-19: deterministic content identity of one ce session's own events.
+
+    The per-event parts are sorted before hashing, so the key is a *set*
+    digest: it depends on which events a capture saw, not on their order or
+    the ce-internal ids (which embed the slot/artifact identity — exactly the
+    taint the old ``ce:{session_id}`` fallback carried).
+    """
+    parts = sorted(
+        f"{event.get('kind') or ''}|{_event_body(event)}" for event in events
+    )
+    digest = hashlib.sha256("\x1e".join(parts).encode("utf-8")).hexdigest()[:16]
+    return f"ced:{digest}"
+
+
+def _session_key(
+    srow: dict,
+    message_events: list[dict] = (),
+    tool_events: list[dict] = (),
+) -> tuple[str, str]:
+    """(family, native session key) — the same rule uniform_id_migration uses.
+
+    P1-19: when the source records no ``native_session_id``, the key used to
+    be the ce session id itself (``ce:{session_id}``). That id embeds the
+    mirror-slot identity, so the same conversation staged through two slots
+    (or re-staged after a mirror reshuffle) could NEVER collapse — one
+    canonical session per slot forever. The fallback is now a deterministic
+    digest of the session's own event content (kind + resolved body per
+    event), so same-content copies share a key and collapse, while any
+    difference in the captured event set keeps sessions separate.
+
+    Documented trade-offs of content identity (there is no third option once
+    the source provides no native id):
+
+      - Collapse requires the *same captured event set*. A partial capture
+        (one copy missed a turn) and a still-growing session (each round sees
+        one more event) derive different keys; the collection writer never
+        deletes, so such prefixes leave one canonical session row per distinct
+        prefix until the capture stabilises. This is the price of replacing a
+        per-slot key that could never merge anything.
+      - Two genuinely different conversations with byte-identical event sets
+        merge into one row. Practically indistinguishable from re-staging;
+        accepted.
+
+    A session with no events at all has no content identity to collapse on,
+    so it keeps the historical slot key (collapsing empty shells would be
+    arbitrary).
+    """
     family = (srow.get("family") or "unknown").strip().lower()
-    native = (srow.get("native_session_id") or "").strip() or f"ce:{srow['session_id']}"
-    return family, native
+    native = (srow.get("native_session_id") or "").strip()
+    if native:
+        return family, native
+    events = [e for e in (*message_events, *tool_events) if e]
+    if not events:
+        return family, f"ce:{srow['session_id']}"
+    return family, _content_digest_key(events)
+
+
+def _note_id_collision(
+    raw_key_by_id: dict[str, set], new_id: str, raw_key: tuple
+) -> int:
+    """P1-20: count distinct raw keys folded onto one canonical id (1/extra key).
+
+    ``_sanitize`` maps ``|`` to ``/`` because ids are ``|``-joined; two
+    different raw parts (one containing ``|``, one containing ``/``) therefore
+    hash onto the same id. The id formula is frozen in 610k+ stored rows and
+    must not change, so the collision cannot be prevented — only observed.
+    Each raw key beyond the first that lands on an already-taken id counts 1;
+    the same raw key recurring (a legitimate re-capture) does not.
+    """
+    raws = raw_key_by_id.setdefault(new_id, set())
+    if raws and raw_key not in raws:
+        return 1
+    raws.add(raw_key)
+    return 0
 
 
 def _project_sessions(
@@ -299,6 +404,8 @@ def _project_sessions(
     family_by_session: dict[str, str],
     key_by_session: dict[str, tuple[str, str]],
     messages: dict[str, list[dict]],
+    raw_key_by_id: dict[str, set],
+    collisions: list[int],
 ) -> list[dict]:
     """Map each generation session to one lossy canonical session row."""
     projected: list[dict] = []
@@ -308,11 +415,15 @@ def _project_sessions(
             1 for m in msgs if MESSAGE_KINDS[EventKind(m["kind"])] == "user"
         )
         family, _native = key_by_session[sid]
+        canonical_session_id = make_session_id(*key_by_session[sid])
+        collisions[0] += _note_id_collision(
+            raw_key_by_id, canonical_session_id, key_by_session[sid]
+        )
         projected.append({
             # Origin-derived id (uniform_id_migration): a re-capture of the
             # same native session must reproduce this id so it updates the
             # existing row instead of creating a second one.
-            "canonical_session_id": make_session_id(*key_by_session[sid]),
+            "canonical_session_id": canonical_session_id,
             # Live canonical_sessions has CHECK(primary_source IN
             # ('agentsview','legacy')); 'v2' is not admissible, so projection
             # rows are tagged 'legacy' (the v2|cs| session-id prefix
@@ -468,6 +579,8 @@ def _project_messages(
     messages: dict[str, list[dict]],
     collapsed: list[int],
     seen: dict,
+    raw_key_by_id: dict[str, set],
+    collisions: list[int],
 ) -> list[dict]:
     """Map message-kind events to canonical_messages rows (documented lossy)."""
     projected: list[dict] = []
@@ -480,6 +593,7 @@ def _project_messages(
         for ordinal, event in enumerate(sorted(
             events, key=lambda e: (e.get("ordinal") or 0, e.get("event_id") or "")
         ), start=1):
+            role = MESSAGE_KINDS[EventKind(event["kind"])]
             # ``content`` is the exact mapped source body.  ``None`` means an
             # older adapter did not emit the optional field, so the bounded
             # summary remains a backward-compatible fallback.  An explicit
@@ -488,13 +602,15 @@ def _project_messages(
             content = event.get("content")
             if content is None:
                 content = event.get("summary") or None
-            role = MESSAGE_KINDS[EventKind(event["kind"])]
-            new_id = make_message_id(
-                family, native,
+            address = (
                 adapter_address(event.get("native_event_id"),
                                 event.get("native_locator"),
                                 address_family)
                 or event["event_id"])
+            new_id = make_message_id(family, native, address)
+            collisions[0] += _note_id_collision(
+                raw_key_by_id, new_id, (family, native, address)
+            )
             # One native session can be discovered as several ce sessions in
             # one generation (the same file staged twice, a session plus its
             # subagent artifact). Their rows then share an id, and a blind
@@ -538,6 +654,8 @@ def _project_tools(
     tools: dict[str, list[dict]],
     collapsed: list[int],
     seen: dict,
+    raw_key_by_id: dict[str, set],
+    collisions: list[int],
 ) -> list[dict]:
     """Map tool-kind events to canonical_tool_events rows (documented lossy)."""
     projected: list[dict] = []
@@ -548,11 +666,14 @@ def _project_tools(
         ):
             source_kind = TOOL_KINDS[EventKind(event["kind"])]
             summary = event.get("summary") or None
-            new_id = make_tool_id(
-                family, native,
+            address = (
                 adapter_address(event.get("native_event_id"),
                                 event.get("native_locator"))
                 or event["event_id"])
+            new_id = make_tool_id(family, native, address)
+            collisions[0] += _note_id_collision(
+                raw_key_by_id, new_id, (family, native, address)
+            )
             prior = seen.get(new_id)
             if prior is not None:
                 collapsed[0] += 1
@@ -786,6 +907,13 @@ def _upsert_rows(
 
     to_insert = []
     to_update = []
+    # P1-14a: canonical_messages ids whose UPDATE actually rewrites the
+    # content column. An in-place UPDATE keeps the row's rowid, and the FTS
+    # layer's incremental cursor only sees ``rowid > watermark`` — without
+    # this ledger a rewritten body would never reach the FTS index. Only a
+    # content change invalidates (FTS indexes content alone); a timestamp /
+    # ordinal-only refresh does not.
+    fts_invalidated: list[str] = []
     for row_id, row in incoming.items():
         prior = stored.get(row_id)
         if prior is None:
@@ -797,6 +925,11 @@ def _upsert_rows(
         )
         if merged != prior:
             to_update.append(merged)
+            if (
+                table == "canonical_messages"
+                and merged[_MESSAGE_CONTENT_IDX] != prior[_MESSAGE_CONTENT_IDX]
+            ):
+                fts_invalidated.append(row_id)
     if to_insert:
         con.executemany(
             f"INSERT INTO {table} ({', '.join(columns)}) "
@@ -808,6 +941,12 @@ def _upsert_rows(
         con.executemany(
             f"UPDATE {table} SET {assignments} WHERE {id_column}=?",
             [(*row[1:], row[0]) for row in to_update],
+        )
+    if fts_invalidated:
+        con.executemany(
+            f"INSERT OR IGNORE INTO {CE_FTS_INVALIDATE_TABLE} "
+            "(canonical_message_id, changed_at) VALUES (?, ?)",
+            [(mid, _utc_now()) for mid in fts_invalidated],
         )
     return len(to_insert), len(to_update)
 
@@ -838,6 +977,10 @@ def upsert_compatibility_projection(
       - A row this projection no longer produces (the source disappeared, the
         native id changed) is left exactly as collected. The store is a
         collection, not a mirror of whatever the sources currently contain.
+      - P1-14a: an ``UPDATE`` that rewrites a ``canonical_messages`` content
+        column records the id in ``ce_fts_invalidate`` (same transaction), so
+        the rowid-cursor FTS layer can pick the new body up on its next
+        incremental build.
 
     Projected ids are recorded in ``ce_projected_ids`` with ``INSERT OR IGNORE``
     so the activation/rollback owner still knows which rows the projection wrote;
@@ -866,6 +1009,10 @@ def upsert_compatibility_projection(
     return counts
 
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
 def clear_compatibility_projection(con: sqlite3.Connection) -> None:
     """Delete every row the projection ever wrote (rollback owner only).
 
@@ -879,6 +1026,15 @@ def clear_compatibility_projection(con: sqlite3.Connection) -> None:
     row that was written once and is now retained as part of the collection is
     still reported as owned here. That is the correct set for deactivation, which
     removes the whole projection rather than one round of it.
+
+    P1-14b: after the DELETE, re-inserted rows recycle low rowids behind the
+    monotonic rowid cursor ``retrieval/conversation_fts.py`` indexes by — an
+    incremental refresh could neither see the new rows (rowid <= watermark) nor
+    know that index rows under recycled rowids now denote other messages. So
+    clear also resets the FTS invalidation ledger and writes the
+    ``FTS_REBUILD_MARKER`` sentinel row into ``ce_fts_invalidate``: the next
+    FTS build reads it and forces a full rebuild, which is the only state that
+    is guaranteed consistent with a from-scratch store.
     """
     _ensure_tables(con)
     owned = con.execute(
@@ -899,6 +1055,12 @@ def clear_compatibility_projection(con: sqlite3.Connection) -> None:
             con.execute(f"DELETE FROM {table_name} WHERE {column} IN ({marks})",
                         chunk)
     con.execute("DELETE FROM ce_projected_ids")
+    con.execute(f"DELETE FROM {CE_FTS_INVALIDATE_TABLE}")
+    con.execute(
+        f"INSERT OR REPLACE INTO {CE_FTS_INVALIDATE_TABLE} "
+        "(canonical_message_id, changed_at) VALUES (?, ?)",
+        (FTS_REBUILD_MARKER, _utc_now()),
+    )
 
 
 def _ensure_tables(con: sqlite3.Connection) -> None:
@@ -928,6 +1090,11 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS ce_projected_ids ("
         " table_name TEXT NOT NULL, row_id TEXT NOT NULL,"
         " PRIMARY KEY (table_name, row_id))")
+    # P1-14: FTS 失效台账（DDL 与 event_schema.create_v2_schema 一致；本模块
+    # 自带建表使投影写路径在未跑过 v2 schema 迁移的库上同样自足）。
+    con.execute(
+        f"CREATE TABLE IF NOT EXISTS {CE_FTS_INVALIDATE_TABLE} ("
+        " canonical_message_id TEXT PRIMARY KEY, changed_at TEXT NOT NULL)")
     con.execute(
         """CREATE TABLE IF NOT EXISTS canonical_tool_events (
             canonical_tool_id TEXT PRIMARY KEY,

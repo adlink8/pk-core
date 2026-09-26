@@ -30,6 +30,19 @@ FTS 运算符（AND/OR/NOT/NEAR/^/$/*/-/: 等）全部退化为字面量，语�
 整体重建。canonical_messages 是只增不改的权威库（行不删不改），rowid 单调
 递增，游标因此成立；若未来权威库发生重写/回退，需 full=True 重建。
 
+P1-14 失效台账：该前提有一个写侧例外——兼容投影会按 id 对 canonical_messages
+做 in-place UPDATE（P1-3 富者胜合并），rowid 不变，游标永远看不到新正文。
+投影写侧因此把"内容实际变化"的消息 id 记入权威库 ce_fts_invalidate
+（event_schema 定义，含 changed_at）；build() 增量路径每次先只读消费该台账：
+逐 id 取权威库当前内容与索引行比对，不一致则重写该 rowid 的索引行（删除旧
+token + 重插）。台账行不被 FTS 侧清空（权威库只读契约，md5 前后校验），
+每次构建对其做幂等校验，内容一致即跳过；台账在两次 clear 之间缓慢累积，
+代价是每次增量构建 |台账| 次主键查询。ce_fts_invalidate 中的
+``*full-rebuild*`` 哨兵行（clear_compatibility_projection 写入）表示整个
+存储已被清空重建——重插行的 rowid 回收跌破 watermark，增量无从弥补，build()
+检测到未消费的哨兵即强制 full=True 整体重建，完成后把哨兵的 changed_at 记入
+索引库 index_meta（fts_rebuild_done_at）防止重复重建。
+
 canonical_messages 的实际列名以 PRAGMA table_info 实测为准，缺失必需列直接
 报错，不做任何假设（timestamp/source 缺失时降级为空值）。
 
@@ -58,6 +71,10 @@ from personal_knowledge.core.project_paths import (  # noqa: E402
     AGENT_CONVERSATIONS_DB,
     VAR_DB,
 )
+from personal_knowledge.application.conversation.event_schema import (  # noqa: E402
+    CE_FTS_INVALIDATE_TABLE,
+    FTS_REBUILD_MARKER,
+)
 
 SCHEMA_VERSION = "1"
 TOKENIZER = "unicode61 + cjk-separate"
@@ -66,6 +83,10 @@ MESSAGES_TABLE = "messages"
 FTS_TABLE = "messages_fts"
 SESSIONS_META_TABLE = "sessions_meta"
 INDEX_META_TABLE = "index_meta"
+
+# P1-14b: index_meta 里记录"已消费的全量重建哨兵 changed_at"，防止同一次
+# clear 触发的哨兵让每次构建都全量重建。
+REBUILD_DONE_META_KEY = "fts_rebuild_done_at"
 
 DEFAULT_INDEX_DB = VAR_DB / "conversation_fts.sqlite"
 DEFAULT_AUTHORITY_DB = AGENT_CONVERSATIONS_DB
@@ -316,6 +337,113 @@ def _clamp_limit(limit: int) -> int:
     return max(1, min(n, MAX_LIMIT))
 
 
+# ---------------------------------------------------------------- 失效台账（P1-14）
+
+
+def _fts_rebuild_requested(auth: sqlite3.Connection) -> str | None:
+    """全量重建哨兵的 changed_at；无哨兵（或权威库尚无台账表）返回 None。"""
+    if not _table_exists(auth, CE_FTS_INVALIDATE_TABLE):
+        return None
+    row = auth.execute(
+        f"SELECT changed_at FROM {CE_FTS_INVALIDATE_TABLE} "
+        "WHERE canonical_message_id = ?",
+        (FTS_REBUILD_MARKER,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _load_invalidate_entries(auth: sqlite3.Connection) -> list[str]:
+    """台账中的待校验消息 id（不含哨兵行）；权威库无台账表视为空（旧库）。"""
+    if not _table_exists(auth, CE_FTS_INVALIDATE_TABLE):
+        return []
+    return [
+        row[0]
+        for row in auth.execute(
+            f"SELECT canonical_message_id FROM {CE_FTS_INVALIDATE_TABLE} "
+            "WHERE canonical_message_id != ?",
+            (FTS_REBUILD_MARKER,),
+        )
+    ]
+
+
+def _refresh_indexed_message(
+    auth: sqlite3.Connection,
+    idx: sqlite3.Connection,
+    select_cols: list[str],
+    message_id: str,
+) -> bool:
+    """把一个失效 id 的索引行对齐到权威库当前内容；有写动作返回 True。
+
+    权威库行已不存在（如 clear 后重插换了 rowid）时返回 False——该形态由
+    全量重建兜底，单行修补无法定位旧 rowid 上的残留索引行。
+    """
+    row = auth.execute(
+        f"SELECT {', '.join(select_cols)} FROM canonical_messages "
+        "WHERE canonical_message_id = ?",
+        (message_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    rec = dict(zip(select_cols, row))
+    rid = rec["rowid"]
+    content = rec.get("content")
+    should_index = bool(content and content.strip())
+    have = idx.execute(
+        f"SELECT content FROM {MESSAGES_TABLE} WHERE id = ?", (rid,)
+    ).fetchone()
+    if have is not None and should_index and have[0] == content:
+        return False  # 索引已一致（台账幂等重放，例如改写后又改回同文）
+    if have is not None:
+        # 外部内容表（content='messages'）：必须先用 'delete' 命令显式丢掉旧
+        # token（传入与当初索引一致的 cjk 分字文本），再删 messages 行；直接
+        # DELETE FROM messages_fts 会让 FTS5 回读内容表取旧值，而行即将不存在。
+        idx.execute(
+            f"INSERT INTO {FTS_TABLE}({FTS_TABLE}, rowid, content) "
+            "VALUES ('delete', ?, ?)",
+            (rid, cjk_separate(have[0] or "")),
+        )
+        idx.execute(f"DELETE FROM {MESSAGES_TABLE} WHERE id = ?", (rid,))
+    if should_index:
+        idx.execute(
+            f"INSERT INTO {MESSAGES_TABLE} "
+            "(id, session_id, ordinal, role, timestamp, source, content) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                rid,
+                rec["canonical_session_id"],
+                rec["ordinal"],
+                rec["role"],
+                rec.get("timestamp"),
+                rec.get("source"),
+                content,
+            ),
+        )
+        idx.execute(
+            f"INSERT INTO {FTS_TABLE} (rowid, content) VALUES (?, ?)",
+            (rid, cjk_separate(content)),
+        )
+    return True
+
+
+def _consume_invalidations(
+    auth: sqlite3.Connection,
+    idx: sqlite3.Connection,
+    select_cols: list[str],
+    entries: list[str],
+) -> int:
+    """增量消费失效台账：逐 id 幂等校验并对齐索引行，返回实际重写条数。
+
+    台账只增不清（权威库只读契约）：同一 id 反复出现在台账上是常态，比对
+    内容一致即零成本跳过，因此消费天然幂等，不依赖 changed_at 游标。
+    """
+    refreshed = 0
+    for message_id in entries:
+        if _refresh_indexed_message(auth, idx, select_cols, message_id):
+            refreshed += 1
+    idx.commit()
+    return refreshed
+
+
 # ---------------------------------------------------------------- 构建
 
 
@@ -362,7 +490,9 @@ def build(
 
     权威库只读打开，逐批（BATCH_ROWS）读 canonical_messages 中 rowid 大于
     watermark 的新行写入索引库；空 content 行跳过但 watermark 照常推进。
-    full=True 或 schema 不匹配时先整体重建。
+    full=True 或 schema 不匹配时先整体重建。P1-14：增量路径先只读消费
+    ce_fts_invalidate 失效台账（内容被 in-place UPDATE 改写的消息 id）；
+    台账中的全量重建哨兵（clear 写入）未被消费过时强制整体重建。
     """
     index_path = Path(index_db) if index_db else DEFAULT_INDEX_DB
     authority_path = Path(authority_db) if authority_db else DEFAULT_AUTHORITY_DB
@@ -370,12 +500,26 @@ def build(
     auth = _open_authority(authority_path)
     idx = _open_index(index_path)
     try:
+        # P1-14b：哨兵表示存储被 clear 过（重插行 rowid 跌破 watermark），
+        # 只有整体重建能保证索引一致；哨兵的 changed_at 已记入索引库 meta
+        # 则视为消费过，不再重复重建。
+        rebuild_marker = _fts_rebuild_requested(auth)
+        rebuild_forced = (
+            rebuild_marker is not None
+            and _schema_ready(idx)
+            and rebuild_marker != _get_meta(idx, REBUILD_DONE_META_KEY)
+        )
+        if rebuild_forced:
+            full = True
         if (
             full
             or not _schema_ready(idx)
             or _get_meta(idx, "schema_version") != SCHEMA_VERSION
         ):
             _reset_index(idx)
+            reindexed_all = True
+        else:
+            reindexed_all = False
         # 权威库列名以实测为准：缺必需列直接失败，不做任何假设
         cols = {r[1] for r in auth.execute("PRAGMA table_info(canonical_messages)")}
         missing = [c for c in _REQUIRED_MESSAGE_COLUMNS if c not in cols]
@@ -432,6 +576,17 @@ def build(
                     new_rows += 1
                 last_rowid = rec["rowid"]
             idx.commit()
+        # P1-14：全量路径（含哨兵强制）已重读所有行，把哨兵记为已消费；
+        # 否则先增量消费失效台账，再同步会话元数据。
+        invalidate_entries = _load_invalidate_entries(auth)
+        invalidated_refreshed = 0
+        if full or reindexed_all:
+            if rebuild_marker is not None:
+                _set_meta(idx, REBUILD_DONE_META_KEY, rebuild_marker)
+        else:
+            invalidated_refreshed = _consume_invalidations(
+                auth, idx, select_cols, invalidate_entries
+            )
         _sync_sessions_meta(auth, idx)
         total = idx.execute(f"SELECT COUNT(*) FROM {MESSAGES_TABLE}").fetchone()[0]
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -439,6 +594,7 @@ def build(
         _set_meta(idx, "indexed_messages", total)
         _set_meta(idx, "last_build_new_rows", new_rows)
         _set_meta(idx, "last_build_skipped_empty", skipped_empty)
+        _set_meta(idx, "last_build_invalidated", invalidated_refreshed)
         _set_meta(idx, "last_build_at", now)
         if full:
             _set_meta(idx, "full_built_at", now)
@@ -453,6 +609,9 @@ def build(
             "full": bool(full),
             "new_rows": new_rows,
             "skipped_empty": skipped_empty,
+            "invalidations_pending": len(invalidate_entries),
+            "invalidations_refreshed": invalidated_refreshed,
+            "fts_rebuild_forced": bool(rebuild_forced),
             "indexed_messages": total,
             "watermark_rowid": last_rowid,
             "elapsed_seconds": round(elapsed, 3),
@@ -660,10 +819,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(
                 f"build {'full' if result['full'] else 'incremental'}: "
                 f"new_rows={result['new_rows']} skipped_empty={result['skipped_empty']} "
+                f"invalidated={result['invalidations_refreshed']}"
+                f"/{result['invalidations_pending']} "
                 f"indexed_messages={result['indexed_messages']} "
                 f"watermark_rowid={result['watermark_rowid']} "
                 f"elapsed={result['elapsed_seconds']}s"
             )
+            if result["fts_rebuild_forced"]:
+                print("fts rebuild forced by clear sentinel (ce_fts_invalidate)")
             print(f"index_db={result['index_db']}")
         elif args.command == "search":
             if args.mode == "content":

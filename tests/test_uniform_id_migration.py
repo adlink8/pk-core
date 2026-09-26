@@ -1278,3 +1278,236 @@ def test_upsert_reconcile_can_be_disabled(tmp_path, monkeypatch):
         " WHERE canonical_message_id=?", (mid,)).fetchone()
     con.close()
     assert body == ("truncated",), body
+
+
+# --------------------------------------------------------------------------
+# P1-14a: 内容被 UPDATE 实际改写的 canonical_messages 行记入 ce_fts_invalidate。
+# 同 id in-place UPDATE 不动 rowid，而 retrieval/conversation_fts 的增量游标
+# 只读 rowid > watermark 的新行——没有这张失效台账，改写后的正文永远进不了
+# FTS 索引。消费端（FTS 只读消费）的用例见 tests/test_conversation_fts.py。
+# --------------------------------------------------------------------------
+
+def test_upsert_content_change_records_fts_invalidation(tmp_path):
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        upsert_compatibility_projection,
+    )
+
+    mid = "cm|codex|S1|rollout.jsonl#L10"
+    con = _upsert_con(tmp_path)
+    upsert_compatibility_projection(
+        con, _reconcile_report(messages=[_projection_message(mid, "first")]))
+    counts = upsert_compatibility_projection(
+        con, _reconcile_report(
+            messages=[_projection_message(mid, "the rewritten longer body")]))
+    rows = con.execute(
+        "SELECT canonical_message_id FROM ce_fts_invalidate").fetchall()
+    con.close()
+    assert counts["canonical_messages"] == {"inserted": 0, "updated": 1}, counts
+    assert rows == [(mid,)], rows
+
+
+def test_upsert_without_content_change_writes_no_invalidation(tmp_path):
+    """三种"内容没变"的形态都不得进失效台账：幂等重放、只变时间戳、更穷重捕获。"""
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        upsert_compatibility_projection,
+    )
+
+    mid = "cm|codex|S1|rollout.jsonl#L10"
+    con = _upsert_con(tmp_path)
+    upsert_compatibility_projection(
+        con, _reconcile_report(
+            messages=[_projection_message(mid, "stable body", timestamp="t1")]))
+
+    # 幂等重放：merged == prior，连 UPDATE 都不发
+    counts = upsert_compatibility_projection(
+        con, _reconcile_report(
+            messages=[_projection_message(mid, "stable body", timestamp="t1")]))
+    assert counts["canonical_messages"] == {"inserted": 0, "updated": 0}, counts
+    # 只变时间戳：UPDATE 发生，但 content 列未变，FTS 无需重索引
+    counts = upsert_compatibility_projection(
+        con, _reconcile_report(
+            messages=[_projection_message(mid, "stable body", timestamp="t2")]))
+    assert counts["canonical_messages"] == {"inserted": 0, "updated": 1}, counts
+    # 更穷的重捕获：P1-3 富者胜，stored 原样保留，无写动作
+    counts = upsert_compatibility_projection(
+        con, _reconcile_report(messages=[_projection_message(mid, "poor")]))
+    assert counts["canonical_messages"] == {"inserted": 0, "updated": 0}, counts
+
+    rows = con.execute(
+        "SELECT canonical_message_id FROM ce_fts_invalidate").fetchall()
+    con.close()
+    assert rows == [], rows
+
+
+# --------------------------------------------------------------------------
+# P1-19: 无 native_session_id 会话的回退键改为该会话自身事件内容的确定性
+# 摘要（ced:<sha256 前 16 位>）。旧回退键 ce:{session_id} 内嵌槽位身份，
+# 同内容多副本永不塌缩。
+# --------------------------------------------------------------------------
+
+
+def _no_native_ce_session(sid):
+    return {"session_id": sid, "family": "grok", "native_session_id": None}
+
+
+def _proj_event(eid, sid, kind, content, ordinal=1):
+    return {"event_id": eid, "session_id": sid, "kind": kind,
+            "native_event_id": None,
+            "native_locator": f"chat-{sid}.jsonl#L{ordinal}",
+            "occurred_at": "2026-08-03T02:00:00Z", "ordinal": ordinal,
+            "content": content}
+
+
+def test_no_native_session_copies_with_same_content_collapse():
+    """同内容的无原生会话副本必须塌缩成一个 canonical 会话。
+
+    两个 ce 会话的 event_id / session_id / locator 全不相同（各自经不同槽位
+    捕获），但事件内容集合一致——回退键只取 (kind, body) 集合摘要，与槽位
+    身份无关，因此两副本共享一个 canonical_session_id 并合并。
+    """
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [_no_native_ce_session("ce-slot-a"),
+                    _no_native_ce_session("ce-slot-b")]
+    event_rows = [
+        _proj_event("e1", "ce-slot-a", "user_message", "hello"),
+        _proj_event("e2", "ce-slot-a", "assistant_message", "hi there",
+                    ordinal=2),
+        _proj_event("e9", "ce-slot-b", "user_message", "hello"),
+        _proj_event("e8", "ce-slot-b", "assistant_message", "hi there",
+                    ordinal=2),
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    assert len(report.sessions) == 1, report.sessions
+    csid = report.sessions[0]["canonical_session_id"]
+    assert csid.startswith("cs|grok|ced:"), csid
+    # 合并规则照旧：started/ended 取窗口，计数取各副本最大值
+    assert report.sessions[0]["message_count"] == 2
+    # 两副本的消息都落在同一个 canonical 会话下（grok locator-first，消息
+    # 行仍按各自 locator 分行——塌缩的是会话身份，不是消息地址）
+    assert {m["canonical_session_id"] for m in report.messages} == {csid}
+    assert len(report.messages) == 4
+    # 可复算：同样的输入必须得到同一个键
+    again = compute_projection("gen-1", session_rows, event_rows)
+    assert again.sessions == report.sessions
+
+
+def test_no_native_sessions_with_different_content_stay_separate():
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [_no_native_ce_session("ce-slot-a"),
+                    _no_native_ce_session("ce-slot-b")]
+    event_rows = [
+        _proj_event("e1", "ce-slot-a", "user_message", "hello"),
+        _proj_event("e2", "ce-slot-b", "user_message", "a different talk"),
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    ids = {s["canonical_session_id"] for s in report.sessions}
+    assert len(ids) == 2, ids
+    assert all(i.startswith("cs|grok|ced:") for i in ids)
+
+
+def test_no_native_empty_session_keeps_slot_key():
+    """空事件会话没有内容身份可塌缩，保留旧槽位键（合并空壳是任意的）。"""
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    report = compute_projection("gen-1", [_no_native_ce_session("ce-empty")], [])
+    assert report.sessions[0]["canonical_session_id"] == "cs|grok|ce:ce-empty"
+
+
+# --------------------------------------------------------------------------
+# P1-20: _sanitize 的 '|'→'/' 替换可把不同原始键折叠到同一 canonical id。
+# id 公式固化在 61 万+ 存量 id 里不能改，碰撞只能观测：投影报告暴露
+# sanitized_id_collisions，迁移规划写 stats['id_collisions']。
+# --------------------------------------------------------------------------
+
+
+def test_projection_counts_sanitized_id_collision():
+    """a|b 与 a/b 两个原始地址 → 同一 id：公式不变，碰撞计数=1。"""
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [{"session_id": "ce-a", "family": "codex",
+                     "native_session_id": "S1"}]
+    event_rows = [
+        {"event_id": "e1", "session_id": "ce-a", "kind": "user_message",
+         "native_event_id": None, "native_locator": "rollout.jsonl#a|b",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1, "content": "one"},
+        {"event_id": "e2", "session_id": "ce-a", "kind": "user_message",
+         "native_event_id": None, "native_locator": "rollout.jsonl#a/b",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 2, "content": "two"},
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    # 公式不变：两个不同原始地址得到同一个 id
+    ids = {m["canonical_message_id"] for m in report.messages}
+    assert ids == {"cm|codex|S1|rollout.jsonl#a/b"}, ids
+    # 碰撞可观测：第二个"新"原始键落 在已被占用的 id 上，计 1；同址塌缩
+    # 机制照常计数 collapsed_duplicate_ids 并保留富者/字典序胜者
+    assert report.sanitized_id_collisions == 1
+    assert report.collapsed_duplicate_ids == 1
+    assert report.messages[0]["content"] == "one"
+    assert report.to_dict()["sanitized_id_collisions"] == 1
+
+
+def test_projection_same_raw_key_recurrence_is_not_a_collision():
+    """同址重捕获（原始键完全相同）是合法塌缩，不得计入碰撞。"""
+    from personal_knowledge.application.conversation.compatibility_projection import (
+        compute_projection,
+    )
+
+    session_rows = [
+        {"session_id": "ce-a", "family": "claude", "native_session_id": "S1"},
+        {"session_id": "ce-b", "family": "claude", "native_session_id": "S1"},
+    ]
+    event_rows = [
+        {"event_id": "e1", "session_id": "ce-a", "kind": "user_message",
+         "native_event_id": "uuid-u1", "native_locator": "mirror-a/x.jsonl#L1",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1, "content": "hi"},
+        {"event_id": "e2", "session_id": "ce-b", "kind": "user_message",
+         "native_event_id": "uuid-u1", "native_locator": "mirror-b/x.jsonl#L1",
+         "occurred_at": "2026-08-03T02:00:00Z", "ordinal": 1, "content": "hi"},
+    ]
+    report = compute_projection("gen-1", session_rows, event_rows)
+    assert len(report.messages) == 1
+    assert report.collapsed_duplicate_ids == 1
+    assert report.sanitized_id_collisions == 0
+
+
+def test_plan_reports_sanitized_id_collisions(tmp_path):
+    """迁移规划路径同样计数；重复 id 本就被 verify fail-closed，报告说明成因。"""
+    path = tmp_path / "collide.sqlite"
+    con = sqlite3.connect(path)
+    for stmt in DDL:
+        con.execute(stmt)
+    con.execute("INSERT INTO ce_generation_authority VALUES ('g',1,"
+                "'2026-01-01T00:00:00Z')")
+    _insert_ce(con, "ceK", "codex", "K1", "g")
+    _insert_event(con, "ek1", "ceK", "user_message", None,
+                  "rollout.jsonl#a|b", "2026-01-01T01:00:00Z")
+    _insert_event(con, "ek2", "ceK", "user_message", None,
+                  "rollout.jsonl#a/b", "2026-01-01T01:01:00Z")
+    cs_k = u.v2_session_hash("ceK")
+    _insert_session(con, cs_k, "legacy", "codex", "2026-01-01T01:00:00Z")
+    _insert_message(con, u.v2_message_hash("ek1"), cs_k, "legacy",
+                    "rollout.jsonl#a|b", 1, "user", "one",
+                    "2026-01-01T01:00:00Z", "h1")
+    _insert_message(con, u.v2_message_hash("ek2"), cs_k, "legacy",
+                    "rollout.jsonl#a/b", 2, "user", "two",
+                    "2026-01-01T01:01:00Z", "h2")
+    con.commit()
+    con.close()
+
+    plan, problems = _plan(path)
+    assert plan.stats["id_collisions"] == 1
+    # 公式不变：两个原始地址映射到同一个新 id
+    new_ids = {n for t, _o, n in plan.id_map if t == "canonical_messages"}
+    assert new_ids == {"cm|codex|K1|rollout.jsonl#a/b"}
+    # 规划结果含重复 id 时 verify 必须拦下（fail-closed 不因计数而放宽）
+    assert any("duplicate new messages ids" in p for p in problems), problems

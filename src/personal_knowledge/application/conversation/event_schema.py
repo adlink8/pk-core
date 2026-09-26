@@ -39,6 +39,9 @@ Tables:
                                     one row per (session, defect) the gates
                                     flagged; written inside the apply
                                     transaction, never blocks a batch
+  - ``ce_fts_invalidate``        — P1-14 FTS 失效台账：canonical_messages 行
+                                    内容被 UPDATE 改写时记录待重索引 id；
+                                    ``retrieval/conversation_fts.py`` 只读消费
 """
 
 from __future__ import annotations
@@ -47,6 +50,14 @@ import sqlite3
 from pathlib import Path
 
 SCHEMA_VERSION = "v2.2.0"
+
+# P1-14: FTS 失效台账表名与全量重建哨兵。conversation_fts.py（独立索引库的
+# 构建器）按同名常量读取本表；常量定义在 schema 归属模块，避免两边漂移。
+CE_FTS_INVALIDATE_TABLE = "ce_fts_invalidate"
+# canonical_messages 的主键形态是 ``cm|family|native|address``，永远不会等于
+# 该哨兵值；它不是消息 id，而是"整个存储被 clear 过，FTS 必须全量重建"的
+# generation 级标记（由 clear_compatibility_projection 写入）。
+FTS_REBUILD_MARKER = "*full-rebuild*"
 
 V2_TABLES = (
     "ce_source_artifacts",
@@ -66,6 +77,7 @@ V2_TABLES = (
     "ce_live_sync_log",
     "ce_live_state",
     "ce_ingest_quarantine",
+    "ce_fts_invalidate",
 )
 
 _DDL: tuple[str, ...] = (
@@ -363,6 +375,29 @@ _DDL: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS ix_ce_quarantine_session
         ON ce_ingest_quarantine(session_id)
+    """,
+    # ---- P1-14 FTS 失效台账 ------------------------------------------------
+    # 权威库 canonical_messages 行按 id 做 in-place UPDATE（P1-3 富者胜合并
+    # 写）时 rowid 不变，而 ``retrieval/conversation_fts.py`` 的增量游标只读
+    # ``rowid > watermark`` 的新行——改写过的正文永远不会进入 FTS 索引。本表
+    # 是写侧留下的"待重索引"台账：
+    #   - ``compatibility_projection._upsert_rows`` 检测到内容实际变化的
+    #     UPDATE 时 INSERT OR IGNORE 一行（同事务）；
+    #   - ``clear_compatibility_projection`` 清空本表并写入
+    #     ``FTS_REBUILD_MARKER`` 哨兵行，表示"整个存储已清空，FTS 必须全量
+    #     重建"（clear 后重插的行 rowid 回收会跌破游标 watermark，增量无从
+    #     弥补，只有全量重建是稳的）；
+    #   - conversation_fts.build() 以 mode=ro 只读消费本表（把失效 id 对应的
+    #     索引行按当前权威库内容重写），因此本表不由 FTS 侧清空——读侧契约
+    #     是权威库零写路径（md5 前后校验）。台账行在两次 clear 之间累积，
+    #     每次增量构建对其做幂等校验（内容一致即跳过），代价是每次构建
+    #     |台账| 次主键查询；内容改写的 UPDATE 在 P1-3 合并下本就稀少。
+    # changed_at 仅为观测信息（写入时刻），消费判定不依赖时间戳。
+    """
+    CREATE TABLE IF NOT EXISTS ce_fts_invalidate (
+        canonical_message_id TEXT PRIMARY KEY,
+        changed_at           TEXT NOT NULL
+    )
     """,
     """
     CREATE INDEX IF NOT EXISTS ix_ce_events_gen_art

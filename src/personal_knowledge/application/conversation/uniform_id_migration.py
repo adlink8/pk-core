@@ -76,6 +76,14 @@ decided on ``(source_kind, tool_name, content_length, timestamp, category,
 status)``. Two genuinely different tool results agreeing on all six fields would
 be merged; the run report counts the exposed sessions.
 
+Second known trade-off (P1-20): ``_sanitize`` maps ``|`` to ``/`` because ids
+are ``|``-joined, so two different raw keys (one containing ``|``, one
+containing ``/``) fold onto the same id. The formula is frozen in 610k+ stored
+ids and must not change; both the migration planner and the live projection
+therefore only *count* such collisions (``stats['id_collisions']`` /
+``CompatibilityProjectionReport.sanitized_id_collisions``) so a silent
+overwrite becomes an observable, auditable event.
+
 Safety
 ======
 
@@ -149,6 +157,23 @@ INDEX_DDL = (
 )
 
 LEGACY_REF_RE = re.compile(r"^legacy:(.+):(\d+)$")
+
+
+def _note_id_collision(raw_by_id: dict, new_id: str, raw_key: tuple,
+                       stats: Counter) -> None:
+    """P1-20: 观测 ``_sanitize`` 把不同原始键折叠到同一 canonical id 的碰撞。
+
+    id 以 ``|`` 连接，``_sanitize`` 因此把部件里的 ``|`` 替换成 ``/``——含
+    ``|`` 与含 ``/`` 的两个不同原始键会得到同一个 id。该公式已固化在 61 万+
+    存量 id 里，绝不能改（改 = 全库重编 id），碰撞无法消除、只能观测：每个
+    落到已占用 id 上的"新"原始键计 1 次，写入 ``stats['id_collisions']``；
+    同一原始键的合法重现（同址重捕获）不计。规划路径上 verify_plan 本就会对
+    plan 内重复 id fail-closed，这个计数让报告能直接说明重复的成因。
+    """
+    raws = raw_by_id.setdefault(new_id, set())
+    if raws and raw_key not in raws:
+        stats["id_collisions"] += 1
+    raws.add(raw_key)
 
 # Families whose adapters record a reliable per-message native id (a client
 # uuid unique within the native session): for these the native id is the
@@ -224,6 +249,8 @@ class MigrationPlan:
         self.own_row_ids: set[str] = set()           # old ids that kept own row
         self.policy: list[tuple] = []    # (family, entity, address_form, rows)
         self.stats: dict = {}
+        # P1-20: canonical id -> set(raw keys)，碰撞检测的临时账本（不进报告）。
+        self.raw_keys_by_id: dict[str, set] = {}
 
     def report(self) -> dict:
         return {
@@ -316,6 +343,7 @@ def plan_migration(con: sqlite3.Connection) -> MigrationPlan:
     new_session_of_old: dict[str, str] = {}
     for (fam, nk), g in groups.items():
         new_csid = g.new_session_id
+        _note_id_collision(plan.raw_keys_by_id, new_csid, (fam, nk), stats)
         for row in g.v1_sessions:
             new_session_of_old[row["canonical_session_id"]] = new_csid
         for csid in g.v2_csids:
@@ -618,6 +646,8 @@ def _merge_messages(g: _Group, ev_attr: dict, gen_of_v2_csid: dict,
     old_to_new: dict[str, str] = {}
     for addr, rows in by_addr.items():
         new_id = make_message_id(fam, g.native_key, addr)
+        _note_id_collision(plan.raw_keys_by_id, new_id,
+                           (fam, g.native_key, addr), stats)
         for row in rows:
             old_to_new[row["canonical_message_id"]] = new_id
             plan.adapter_addresses[row["canonical_message_id"]] = addr
@@ -710,6 +740,8 @@ def _merge_tools(g: _Group, ev_attr: dict, stats: Counter, forms: Counter,
     old_to_new: dict[str, str] = {}
     for addr, rows in by_addr.items():
         new_id = make_tool_id(fam, g.native_key, addr)
+        _note_id_collision(plan.raw_keys_by_id, new_id,
+                           (fam, g.native_key, addr), stats)
         for row in rows:
             old_to_new[row["canonical_tool_id"]] = new_id
             plan.adapter_addresses[row["canonical_tool_id"]] = addr
