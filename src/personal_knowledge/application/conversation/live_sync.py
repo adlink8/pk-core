@@ -184,6 +184,7 @@ from personal_knowledge.application.conversation.event_repository import (
 from personal_knowledge.application.conversation.live_gates import (
     GateFinding,
     LiveGateError,
+    collect_content_quarantine_findings,
     collect_timestamp_quarantine_findings,
     detect_empty_sessions,
     detect_message_count_mismatch,
@@ -1554,7 +1555,12 @@ def live_sync_once(
         gate_hard = run_hard_gates(prepared)
         if gate_hard:
             raise LiveGateError(gate_hard)
-        gate_soft = collect_timestamp_quarantine_findings(prepared)
+        # 内容级缺陷（secret / 事件时间越界）→ 单会话隔离，不中止批次。
+        gate_soft = (
+            collect_content_quarantine_findings(prepared)
+            + collect_timestamp_quarantine_findings(prepared)
+        )
+        gated_sessions = {f.session_id for f in gate_soft}
         covered_sessions = {
             str(session.session_id)
             for item in prepared
@@ -1635,7 +1641,11 @@ def live_sync_once(
             quarantine_findings: list[GateFinding] = (
                 list(gate_soft) + empty_findings
             )
-            projectable = touched - empty_sessions
+            # 被内容级软门命中的会话（secret / 时间越界 / 时间戳缺陷）剔除出
+            # 本轮投影：它们的数据留在 ce 收集层，但不进 canonical、不进检索。
+            projectable = (
+                touched - empty_sessions - gated_sessions
+            )
             projection = _project_sessions(con, generation_id, projectable)
             quarantine_findings += detect_message_count_mismatch(
                 con, generation_id, projectable

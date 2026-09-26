@@ -2113,11 +2113,12 @@ def _assert_zero_data_rows(db: Path) -> None:
         assert _rows(db, f"SELECT 1 FROM {table}") == [], table
 
 
-def test_hard_gate_secret_leak_aborts_apply_with_zero_writes(tmp_path: Path) -> None:
-    """(a) Poisoned content: apply aborts, the store is untouched.
+def test_secret_leak_quarantines_session_and_batch_proceeds(tmp_path: Path) -> None:
+    """(a) Poisoned content: the poisoned session is quarantined, not the batch.
 
-    Rewriting the file without the secret and re-applying must then succeed —
-    a hard gate leaves no residue to clean up.
+    The secret must not reach canonical (no projection row, no search hit), the
+    rest of the batch lands normally, and rewriting the file without the secret
+    clears the quarantine on the next pass (self-healing).
     """
 
     mirror = tmp_path / "mirror"
@@ -2125,24 +2126,34 @@ def test_hard_gate_secret_leak_aborts_apply_with_zero_writes(tmp_path: Path) -> 
     _write(mirror, "poison.jsonl", _poisoned_session("sess_poison"))
     db = tmp_path / "live.sqlite"
 
-    with pytest.raises(LiveGateError) as excinfo:
-        live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-    codes = {f.code for f in excinfo.value.findings}
-    assert "secret_content_leak" in codes
-    finding = next(f for f in excinfo.value.findings if f.code == "secret_content_leak")
-    assert POISON_KEY not in finding.detail  # the report must not leak the secret
-    _assert_zero_data_rows(db)
-
-    # No residue: the fixed batch applies cleanly afterwards.
-    _write(mirror, "poison.jsonl", _codex_session("sess_poison", 1))
     report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
     assert report["status"] == "ok"
     assert report["hard_gate_failures"] == []
+    findings = report["quarantined"]["findings"]
+    secret_findings = [f for f in findings if f["code"] == "secret_content_leak"]
+    assert secret_findings
+    assert all(POISON_KEY not in f["detail"] for f in secret_findings)
+
+    # The rest of the batch is untouched: the healthy session is projected.
+    healthy = _canonical_session_for_content(db, "question 1 of sess_a")
+    assert healthy
+    # The poisoned session never reached canonical...
+    assert _rows(
+        db,
+        "SELECT canonical_session_id FROM canonical_sessions "
+        "WHERE canonical_session_id LIKE '%sess_poison%'",
+    ) == []
+
+    # Self-healing: the fixed file clears the quarantine on the next pass.
+    _write(mirror, "poison.jsonl", _codex_session("sess_poison", 1))
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert report["status"] == "ok"
     assert report["quarantined"]["count"] == 0
+    assert _canonical_session_for_content(db, "question 1 of sess_poison")
 
 
 def test_hard_gate_temporal_inversion_aborts_apply(tmp_path: Path) -> None:
-    """(b) ended_at < started_at: fail closed, zero writes."""
+    """(b) ended_at < started_at: structural, fail closed, zero writes."""
 
     mirror = tmp_path / "mirror"
     _build_corpus(mirror, names=("a.jsonl",))
@@ -2153,7 +2164,6 @@ def test_hard_gate_temporal_inversion_aborts_apply(tmp_path: Path) -> None:
         live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
     codes = {f.code for f in excinfo.value.findings}
     assert "temporal_inversion" in codes
-    assert "event_time_out_of_range" in codes  # events before the window too
     _assert_zero_data_rows(db)
 
 

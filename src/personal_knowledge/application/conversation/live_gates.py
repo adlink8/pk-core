@@ -17,23 +17,27 @@ live_sync 的增量 apply 路径——在那之前 live 是绕过全部数据质
 ------------------
 
 硬门（任一不过 → :class:`LiveGateError`，整个 apply 中止，权威库零写入；
-在 ``BEGIN IMMEDIATE`` 之前跑，只看本批次 prepared 槽位的适配结果）：
+在 ``BEGIN IMMEDIATE`` 之前跑，只看本批次 prepared 槽位的适配结果）——
+只拦**结构性/身份级**缺陷，那类问题继续写没有意义：
 
-* ``secret_content_leak``  — 批次事件 content 命中 credential 模式。
 * ``temporal_inversion``   — 同一会话 ``ended_at < started_at``（两侧都可
   解析才比较；按时间值比较，不做字符串比较）。
-* ``event_time_out_of_range`` — 事件 ``occurred_at`` 落在
-  ``[started_at - 容差, ended_at + 容差]`` 之外。容差
-  ``EVENT_TIME_TOLERANCE_SECONDS = 300``：容忍 5 分钟时钟漂移（NTP 未同步
-  的本机导出、跨时区换算误差），避免把正常会话误杀成硬门。
 * ``duplicate_source_session`` — 本批次内同一 ``(family, native_session_id)``
   被两个不同槽位（mirror_path）emit，且两者都是"完整不同的会话"。判定标准：
   两份拷贝都有事件、各自的事件 content 集合都非空、且两个集合**完全不相交**
   （uuid 碰撞/两个真实会话共享 native id）。有任何内容交集即视为"同一会话被
   收集了两份"——那是投影塌缩的正常输入（cross-slot duplicate），不拦。
 
-软门（quarantine，写隔离表、不阻断批次；批次其余照常）：
+内容级软门（quarantine，写隔离表 + 该会话剔除出本轮投影；批次其余照常）——
+一条坏会话不挟持整批 2,000 个槽位（对齐 authority_ingest 的 excluded 语义，
+P3 演练实测：整批中止会让历史存量里的正常内容也被卡死）：
 
+* ``secret_content_leak``  — 批次事件 content 命中 credential 模式。密钥
+  不进 canonical、不进检索；ce 收集层照常留档（collection 语义）。
+* ``event_time_out_of_range`` — 事件 ``occurred_at`` 落在
+  ``[started_at - 容差, ended_at + 容差]`` 之外。容差
+  ``EVENT_TIME_TOLERANCE_SECONDS = 300``：容忍 5 分钟时钟漂移（NTP 未同步
+  的本机导出、跨时区换算误差），避免把正常会话误杀。
 * 时间戳缺陷 — 会话 ``started_at`` / ``ended_at``、事件 ``occurred_at`` 为
   null/''/'0'/epoch 秒/epoch 毫秒/不可解析（``bad_timestamp`` 的六种缺陷，
   与 authority_ingest 同语义）。ended_at 为 null 不算缺陷（进行中的会话
@@ -198,16 +202,35 @@ class LiveGateError(RuntimeError):
 
 
 def run_hard_gates(prepared: list[dict]) -> list[GateFinding]:
-    """对本批次 prepared 槽位跑全部硬门，返回全部发现（不是首个即停）。
+    """结构性硬门（整批中止）：时间倒挂 + 原生会话身份碰撞。
+
+    只拦"身份/结构坏了"的批次——那种情况下继续写没有意义。内容级缺陷
+    （secret、事件时间越界）走 :func:`collect_content_quarantine_findings`
+    的**单会话隔离**：一条坏会话不该挟持整批 2,000 个槽位（对齐
+    authority_ingest 的 excluded 语义——带密钥的会话不发布，其余照常）。
 
     ``prepared`` 是 ``live_sync.live_sync_once`` 的捕获/适配产物列表（dict，
     键 ``mirror_path`` / ``family`` / ``artifact`` / ``result``）。调用方拿到
     非空返回即应抛 :class:`LiveGateError`，且必须在 ``BEGIN IMMEDIATE`` 之前。
     """
     findings: list[GateFinding] = []
-    findings.extend(_gate_secret_leak(prepared))
     findings.extend(_gate_temporal_order(prepared))
     findings.extend(_gate_duplicate_native_session(prepared))
+    return findings
+
+
+def collect_content_quarantine_findings(
+    prepared: list[dict],
+) -> list[GateFinding]:
+    """内容级软门（单会话隔离）：secret 泄漏 + 事件时间越界。
+
+    命中会话写入 ``ce_ingest_quarantine`` 并被排除出本轮投影——密钥和可疑
+    时间线不进 canonical、不进检索，但 ce 收集层照常留档（collection 语义），
+    批次其余会话不受影响。
+    """
+    findings: list[GateFinding] = []
+    findings.extend(_gate_secret_leak(prepared))
+    findings.extend(_gate_event_time_range(prepared))
     return findings
 
 
@@ -233,7 +256,7 @@ def _gate_secret_leak(prepared: list[dict]) -> list[GateFinding]:
                 event_ids[sid].append(str(event.event_id))
         for sid in sorted(hits):
             findings.append(GateFinding(
-                "secret_content_leak", "hard", result.family, sid,
+                "secret_content_leak", "soft", result.family, sid,
                 item["mirror_path"],
                 f"credential pattern(s) {hits[sid]} in event content "
                 f"(events: {event_ids[sid]}); rule names only, match text "
@@ -265,9 +288,19 @@ def _gate_temporal_order(prepared: list[dict]) -> list[GateFinding]:
                     str(session_id), item["mirror_path"],
                     f"ended_at {ended_at!r} < started_at {started_at!r}",
                 ))
+    return findings
 
-        # 事件落在会话时间窗之外（带容差）。started/ended 任一不可解析则
-        # 无从比较，跳过（那种缺陷走软门 quarantine）。
+
+def _gate_event_time_range(prepared: list[dict]) -> list[GateFinding]:
+    """事件落在会话时间窗之外（带容差）→ 单会话隔离（内容级软门）。"""
+    tolerance = timedelta(seconds=EVENT_TIME_TOLERANCE_SECONDS)
+    findings: list[GateFinding] = []
+    for item in prepared:
+        result = item["result"]
+        bounds = {
+            str(s.session_id): (s.started_at, s.ended_at) for s in result.sessions
+        }
+        # started/ended 任一不可解析则无从比较，跳过（那种缺陷走软门 quarantine）。
         windows: dict[str, tuple[datetime, datetime]] = {}
         for session_id, (started_at, ended_at) in bounds.items():
             if (
@@ -297,9 +330,9 @@ def _gate_temporal_order(prepared: list[dict]) -> list[GateFinding]:
                     )
         for session_id in sorted(out_of_range):
             findings.append(GateFinding(
-                "event_time_out_of_range", "hard", result.family, session_id,
+                "event_time_out_of_range", "soft", result.family, session_id,
                 item["mirror_path"],
-                f"event occurred_at outside [{started_at!r}, {ended_at!r}] "
+                f"event occurred_at outside session window "
                 f"+/- {EVENT_TIME_TOLERANCE_SECONDS}s drift tolerance "
                 f"(events: {out_of_range[session_id]})",
             ))
