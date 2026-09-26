@@ -46,7 +46,14 @@ discovery.py 的 `FAMILY_CLIENT_ROOTS` 也已配置好本机根路径。所谓"�
   - 计划器修复（9c1f159a）：同 id 同内容塌缩、同 id 异内容 #dup-N 共存。
   - FTS 全量重建随后执行（旧索引存老 id）。
 - **注意**：live_sync 上线后，原生 uuid 地址行与 av 行会在同一 canonical 会话内共存（同一条消息两种地址）——这是 P4"AV 行让位"要清理的对象，清理时用 ce_fts_invalidate/哨兵机制通知 FTS。
-- 待办：P3 并轨演练（live_sync 指权威库试跑一轮，核对投影合并）→ P4 AV 行清理 → P5 调度切换。
+- 待办：**P3 并轨演练 ✅（2026-09-26）**：live-sync 直写权威库两轮增量成功（log: var/logs/p3-rehearsal2/3.log）。
+  - 关键发现：权威库本来就带着旧 live_sync 链路（09-23 前）的 2,060 槽位 + 245 万 ce 事件 + 指纹状态——增量引擎正确识别并跳过未变槽位，只应用变更（4+1 槽位）。
+  - 合并验证：canonical 2,382→2,756 会话（+374 新原生会话）；消息 226,547→244,791（+18,244 uuid 地址行）；新旧行同会话共存符合预期。
+  - 门禁实战：首轮 33 项发现（29 secret + 4 时间越界）正确触发 fail-closed 整批拒绝；随后策略修正（232db762）为单会话隔离（对齐 authority_ingest excluded 语义），二轮 33 会话隔离、批次照常。
+  - stage 的 once 模式滞后一轮（先扫后拷），watch 常驻模式无此问题。
+  - FTS 增量索引 18,122 条 / 3.9s——rowid 契约实证生效。
+  - 备份：`agent_conversations.sqlite.bak-p3-rehearsal-20260925`（演练前状态）。
+- 待办：P4 AV 行清理（内容分叉 #dup-N 行 + av 地址行让位 + cs|legacy| 孤儿，需集合差分守卫）→ P5 调度切换（watch 常驻或高频 once）。
 
 1. **P0 家族覆盖验证 ✅（2026-09-25 完成）**：临时库 `var/db/live-pilot-scratch.sqlite` 全流程试点通过
    （1,107 秒，stage 126 新 / 1,601 跳过）。**15 家族全部采到**，6 个"缺口家族"零缺口：
