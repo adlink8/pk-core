@@ -642,14 +642,12 @@ def test_stale_event_is_retained_in_ce_events(tmp_path: Path) -> None:
                          "WHERE content LIKE ?", ("%answer 4 of sess_b%",))) == 1
 
 
-# --------------------------------------------- 4b. P0-1 staleness markers
+# ------------------------------------- 4b. source-side deletion semantics
 #
-# The retention tests above prove the collection contract: nothing is deleted.
-# P0-1 adds the other half: a row the source no longer emits is *marked*
-# (``stale_at``), so readers can tell collected evidence from current data, and
-# the projection stops counting stale events into ``message_count``. The stale
-# ``canonical_*`` rows that were already projected stay (the upsert never
-# deletes) — that reclaim is the documented P4 boundary.
+# Collection semantics (user decision 2026-09-25, P0-1 withdrawn): a row the
+# source no longer emits is kept exactly as collected — no marker, no filter.
+# The tests below pin that contract: truncation keeps the lost rows collected
+# AND counted; nothing tracks staleness anywhere.
 
 
 def _projected_message_count(db: Path, session_b: str) -> int:
@@ -661,10 +659,10 @@ def _projected_message_count(db: Path, session_b: str) -> int:
     )[0][0]
 
 
-def test_truncation_marks_lost_events_stale_and_projection_drops_them(
+def test_truncation_keeps_lost_events_collected_and_counted(
     tmp_path: Path,
 ) -> None:
-    """A truncated file: its lost events are marked, the projection follows."""
+    """A truncated file: lost events stay collected rows, still counted."""
 
     mirror = tmp_path / "mirror"
     db = tmp_path / "live.sqlite"
@@ -680,128 +678,22 @@ def test_truncation_marks_lost_events_stale_and_projection_drops_them(
     _write(mirror, "b.jsonl", _codex_session("sess_b", 2))
     report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
     assert report["n_changed"] == 1
-    assert report["rows_stale_marked"] > 0
 
-    # Every turn-3 row the source stopped emitting is still collected (the
-    # append-only contract) but is now marked stale...
+    # Every turn-3 row the source stopped emitting is still collected, with no
+    # marker anywhere (collection semantics: no stale_at column exists).
     lost = _rows(
         db,
-        "SELECT event_id, kind, stale_at FROM ce_events WHERE artifact_id=? AND "
+        "SELECT event_id FROM ce_events WHERE artifact_id=? AND "
         "(content LIKE '%question 3 of sess_b%' "
         " OR content LIKE '%answer 3 of sess_b%')",
         (slot_b,),
     )
-    assert lost and all(stale_at is not None for _, _, stale_at in lost)
-    # ...while the rows the source still emits stay current.
-    assert _rows(
-        db,
-        "SELECT event_id FROM ce_events WHERE artifact_id=? "
-        "AND stale_at IS NULL AND content LIKE '%of sess_b%'",
-        (slot_b,),
-    )
+    assert lost
 
-    # And the projection no longer counts the stale events: message_count drops
-    # by exactly the stale events that project as messages (measured on the
-    # store, not derived from the engine's own arithmetic).
-    stale_message_ids = {
-        event_id
-        for event_id, kind, _ in lost
-        if kind in MESSAGE_KINDS
-    }
+    # The projection keeps counting every collected message row: the count does
+    # not drop just because the source deleted its copy.
     count_after = _projected_message_count(db, session_b)
-    assert count_after == count_before - len(stale_message_ids)
-    # The already-projected canonical_messages rows are the P4 boundary: they
-    # stay until P4 reclaims them.
-    assert len(_rows(
-        db,
-        "SELECT canonical_message_id FROM canonical_messages "
-        "WHERE canonical_session_id=?",
-        (session_b,),
-    )) >= count_before
-
-
-def test_restored_turns_clear_the_stale_marker(tmp_path: Path) -> None:
-    """A file that regrows re-emits the stale ids: their marker goes back NULL."""
-
-    mirror = tmp_path / "mirror"
-    db = tmp_path / "live.sqlite"
-    full = _codex_session("sess_b", 3)
-    _write(mirror, "b.jsonl", full)
-    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-
-    slot_b = _slot_id("b.jsonl")
-    session_b = _canonical_session_for_content(db, "of sess_b")
-    count_before = _projected_message_count(db, session_b)
-
-    _write(mirror, "b.jsonl", _codex_session("sess_b", 2))
-    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-    assert _rows(
-        db,
-        "SELECT COUNT(*) FROM ce_events WHERE artifact_id=? AND stale_at IS NOT NULL",
-        (slot_b,),
-    )[0][0] > 0
-
-    # The file is restored to its exact former content: every stale id is
-    # re-emitted unchanged (dirty or unchanged bucket — either way current).
-    _write(mirror, "b.jsonl", full)
-    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-    assert report["rows_stale_cleared"] > 0
-
-    # Nothing is stale anymore, and nothing was duplicated.
-    assert _rows(
-        db,
-        "SELECT COUNT(*) FROM ce_events WHERE artifact_id=? AND stale_at IS NOT NULL",
-        (slot_b,),
-    ) == [(0,)]
-    assert _rows(
-        db,
-        "SELECT COUNT(*) FROM ce_sessions WHERE artifact_id=? AND stale_at IS NOT NULL",
-        (slot_b,),
-    ) == [(0,)]
-    # No duplicates were created by the restore: every id was already collected.
-    assert report["rows_inserted"] == 0
-    # And the projection is back to the pre-truncation count.
-    assert _projected_message_count(db, session_b) == count_before
-
-
-def test_removed_slot_marks_all_its_rows_stale(tmp_path: Path) -> None:
-    """A vanished slot: every event and session row it owns is marked stale."""
-
-    mirror = tmp_path / "mirror"
-    db = tmp_path / "live.sqlite"
-    _build_corpus(mirror)
-    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-
-    slot_b = _slot_id("b.jsonl")
-    assert _slot_event_count(db, slot_b) > 0
-    assert _slot_session_count(db, slot_b) > 0
-
-    (mirror / FAMILY / "b.jsonl").unlink()
-    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-    assert report["n_removed"] == 1
-
-    # Not one row lost, every one of them marked.
-    assert _rows(
-        db,
-        "SELECT COUNT(*) FROM ce_events WHERE artifact_id=? AND stale_at IS NULL",
-        (slot_b,),
-    ) == [(0,)]
-    assert _rows(
-        db,
-        "SELECT COUNT(*) FROM ce_sessions WHERE artifact_id=? AND stale_at IS NULL",
-        (slot_b,),
-    ) == [(0,)]
-    assert _slot_event_count(db, slot_b) > 0
-    assert _slot_session_count(db, slot_b) > 0
-    # P4 boundary: the already-projected canonical rows of the removed slot
-    # keep their projection (nothing is deleted).
-    session_b = _canonical_session_for_content(db, "of sess_b")
-    assert _rows(
-        db,
-        "SELECT canonical_session_id FROM canonical_sessions "
-        "WHERE canonical_session_id=?",
-        (session_b,),
-    )
+    assert count_after == count_before
 
 
 def test_removed_slot_rows_are_retained_and_still_queryable(
@@ -1913,10 +1805,9 @@ def test_swallowed_cross_slot_relation_is_counted_and_keeps_the_current_anchor(
     assert report["status"] == "ok"
     assert report["n_added"] == 1
     assert report["relations_ignored_duplicates"] == 1
-    assert report["relations_endpoint_refreshed"] == 0
     assert report["per_family"][CLAUDE]["relations_ignored_duplicates"] == 1
 
-    # A 现行 → 边不动：仍然锚在先到副本的端点上。
+    # A 现行 → 边不动：仍然锚在先到副本的端点上（collection 语义：先到为锚）。
     assert _relation_endpoints(db, relation_id) == anchor_a
 
     # 计数是诚实的：被吞掉的那条没有计入 rows_inserted。B 的实际落库行 =
@@ -1941,66 +1832,6 @@ def test_swallowed_cross_slot_relation_is_counted_and_keeps_the_current_anchor(
     )
     assert report["rows_inserted"] == expected_inserted
 
-    assert _rows(db, "PRAGMA foreign_key_check") == []
-
-
-def test_swallowed_cross_slot_relation_follows_the_current_copy(
-    tmp_path: Path,
-) -> None:
-    """(b) A 的端点事件 stale 后再 apply B：关系边迁到 B 且全程可见。"""
-
-    mirror = tmp_path / "mirror"
-    _write_claude(mirror, CLAUDE_FILE, _claude_tool_pair())
-    db = tmp_path / "live.sqlite"
-    live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-
-    slot_b = _claude_slot("t.jsonl")
-    relation_id = _seed_call_result_relation(db, slot_b)
-    anchor_a = _relation_endpoints(db, relation_id)
-    assert _table(db, "ce_relation_versions") == []
-
-    # P0-1 的 stale 路径：A 的文件丢掉 tool 对，其两个端点事件离开当前计算
-    # （关系行本身没有 stale_at，现行与否只能看端点事件）。
-    _write_claude(mirror, CLAUDE_FILE, _claude_tool_pair_user_only())
-    truncated = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-    assert truncated["rows_stale_marked"] >= 2
-    stale_states = _rows(
-        db,
-        "SELECT stale_at FROM ce_events WHERE event_id IN (?,?)",
-        anchor_a,
-    )
-    assert len(stale_states) == 2 and all(row[0] is not None for row in stale_states)
-
-    _write_claude(mirror, "t.jsonl", _claude_tool_pair())
-    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
-    assert report["status"] == "ok"
-    assert report["relations_ignored_duplicates"] == 1
-    assert report["relations_endpoint_refreshed"] == 1
-    assert report["per_family"][CLAUDE]["relations_endpoint_refreshed"] == 1
-
-    # 边跟随现行副本：端点已刷新为 slot B 的事件。
-    anchor_after = _relation_endpoints(db, relation_id)
-    assert anchor_after != anchor_a
-    b_events = {
-        row[0]
-        for row in _rows(
-            db, "SELECT event_id FROM ce_events WHERE artifact_id=?", (slot_b,)
-        )
-    }
-    assert set(anchor_after) <= b_events
-
-    # 被替换的锚点按 append-only 契约进了历史表，没有无痕丢失。
-    versions = _relation_versions(db, relation_id)
-    assert [row[0] for row in versions] == [0]
-    assert (versions[0][2], versions[0][3]) == anchor_a
-
-    # 择优后该关系归属 slot B（双端点都在 B 的事件集内），归属判定与引擎
-    # 读取 slot 关系集用的是同一条查询。
-    con = _connect(db)
-    try:
-        assert relation_id in _slot_relation_ids(con, GENERATION, slot_b)
-    finally:
-        con.close()
     assert _rows(db, "PRAGMA foreign_key_check") == []
 
 

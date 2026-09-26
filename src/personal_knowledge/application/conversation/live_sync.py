@@ -40,11 +40,9 @@ Correctness notes
   buckets are:
   - **stale ids** (the id is stored but the source no longer emits it: a
     truncated/edited file, a vanished source file, a deactivated slot) — the
-    collected row is kept exactly as it was captured and additionally marked
-    with ``stale_at = now`` (P0-1: NULL = current, non-NULL = left the current
-    computation); a later apply that sees the source emit the id again clears
-    the marker back to NULL (dirty or unchanged, either way the row is current
-    again);
+    collected row is kept exactly as it was captured, with no marker and no
+    filter (collection semantics; P0-1's staleness markers were withdrawn by
+    user decision 2026-09-25);
   - **dirty ids** (the id is stored and its row values changed) — the row's
     *current* values are appended to ``ce_event_versions`` /
     ``ce_session_versions`` / ``ce_relation_versions`` /
@@ -54,17 +52,14 @@ Correctness notes
     no-op for a present id, which is how stale *content* used to survive
     unnoticed;
   - **new ids** — ``INSERT OR IGNORE``.
-  The only writes this engine performs are INSERT, UPDATE and state markers.
+  The only writes this engine performs are INSERT and UPDATE.
 * **Cross-slot relation duplicates are counted, not silent (P1-5).** A
   relation id derived from native identity can reach the store twice — once
   per slot that collected the same native session — with different endpoint
   event ids. The second apply's ``INSERT OR IGNORE`` cannot land it; the
   swallowed row is counted into the apply report
-  (``relations_ignored_duplicates``, per family too) and its endpoints are
-  moved to the incoming copy only when that copy is fully current and the
-  stored anchor is fully stale (``relations_endpoint_refreshed``; the replaced
-  value is archived first). Otherwise the stored row — and therefore the copy
-  the edge follows — is exactly what arrived first.
+  (``relations_ignored_duplicates``, per family too). The stored row — and
+  therefore the copy the edge follows — is exactly what arrived first.
 * **No FK cascade to worry about.** Because nothing is deleted, the deletes once
   ordered ``ce_event_relations -> ce_field_dispositions -> ce_events ->
   ce_sessions`` no longer exist; ``ce_source_artifacts`` rows are likewise kept
@@ -75,9 +70,9 @@ Correctness notes
   (insert missing, ``UPDATE`` changed — never delete). That is exact, not
   approximate: every projected row is a pure function of one session and that
   session's own events (``canonical_session_id = f(session_id)``,
-  ``canonical_message_id = f(event_id)``). The projection reads filter
-  ``stale_at IS NULL`` (P0-1), so a stale event no longer counts into
-  ``message_count`` or reaches the canonical rows as current data. The whole
+  ``canonical_message_id = f(event_id)``). The projection reads every collected
+  event of the touched sessions — there is no staleness filter (collection
+  semantics). The whole
   generation is never re-projected, the rows of a deactivated slot keep the
   exact projection they were collected with, and no ``canonical_*`` rowid moves
   or gets recycled — which is the contract the rowid cursor in
@@ -133,13 +128,10 @@ Known limits (deliberate, documented rather than hidden)
   ``ce_live_state['removed_slots']`` (append-only) and in the run's
   ``ce_live_sync_log.detail``, so "which source disappeared and when" stays
   auditable without removing its rows.
-* **Stale projection residue is a P4 boundary, not hidden debt.** A stale
-  ``ce_events`` row that was already projected keeps its ``canonical_messages``
-  row (the projection upsert never deletes), and a deactivated slot keeps the
-  canonical rows it was collected with. This milestone buys: the *current*
-  computation (projection reads, ``message_count``) is no longer fed stale
-  events, and staleness itself is queryable (``stale_at``). Reclaiming the
-  already-projected canonical rows is P4.
+* **Source-side deletions are deliberately not tracked.** Collection semantics
+  (user decision 2026-09-25): rows the source no longer emits stay as
+  collected, projection reads them like any other row, and no reclamation step
+  exists. What the store holds is what was collected, period.
 
 The CLI (``pk-sync conversations --live-sync``) and the watch loop are later
 milestones; this module is the engine only. No live canonical store is ever
@@ -858,100 +850,13 @@ def _update_rows(
     return len(payload)
 
 
-# ---- P0-1 staleness markers ------------------------------------------------
+# ---- Collection semantics (P0-1 withdrawn) ---------------------------------
 #
-# The store is a collection, so the stale bucket still keeps every row it ever
-# captured — but "kept as collected evidence" must be distinguishable from
-# "still current", or the projection would keep counting messages the source no
-# longer emits. Both markers are plain in-place UPDATEs on the row's ``stale_at``
-# column (``event_schema`` DDL): NULL = current, non-NULL = the moment the apply
-# observed the source no longer emitting it. They run inside the same
-# ``BEGIN IMMEDIATE`` transaction as every other write of the apply, so a crash
-# rolls the marker back with the rows it describes.
-#
-# Honest boundary (P4, deliberately out of scope here): canonical_* rows that
-# were already projected from a now-stale event are not removed by this engine
-# (the projection upsert is insert/refresh, never delete). What this buys is
-# that the *current* computation is no longer fed stale events, and that
-# staleness itself is queryable.
-
-def _mark_stale_rows(
-    con: sqlite3.Connection,
-    generation_id: str,
-    *,
-    slot_id: str,
-    event_ids: set[str],
-    session_ids: set[str],
-) -> int:
-    """Mark the slot's rows that the source no longer emits as stale.
-
-    ``stale_at`` is set only where it is still NULL, so a re-apply of the same
-    truncated file does not rewrite the timestamp every run (the first
-    observation is the one that stays). Rows already marked keep their original
-    marker; the collected values are never rewritten.
-    """
-
-    now = _now()
-    marked = 0
-    for chunk in _chunks(sorted(event_ids)):
-        marks = _placeholders(len(chunk))
-        cur = con.execute(
-            f"UPDATE ce_events SET stale_at=? "
-            f"WHERE generation_id=? AND artifact_id=? AND stale_at IS NULL "
-            f"AND event_id IN ({marks})",
-            (now, generation_id, slot_id, *chunk),
-        )
-        marked += max(cur.rowcount, 0)
-    for chunk in _chunks(sorted(session_ids)):
-        marks = _placeholders(len(chunk))
-        cur = con.execute(
-            f"UPDATE ce_sessions SET stale_at=? "
-            f"WHERE generation_id=? AND artifact_id=? AND stale_at IS NULL "
-            f"AND session_id IN ({marks})",
-            (now, generation_id, slot_id, *chunk),
-        )
-        marked += max(cur.rowcount, 0)
-    return marked
-
-
-def _clear_stale_rows(
-    con: sqlite3.Connection,
-    generation_id: str,
-    *,
-    slot_id: str,
-    event_ids: set[str],
-    session_ids: set[str],
-) -> int:
-    """Clear the stale marker of the slot's rows the source emits again.
-
-    Round-trip of ``_mark_stale_rows``: a file that regrows (or reappears after
-    a removal) re-emits ids the store already holds as stale rows. Whatever the
-    bucket — dirty (values changed, archived + refreshed above) or unchanged
-    (identical signature, no other write touched it) — the row is current
-    again, so ``stale_at`` goes back to NULL. Only rows actually marked are
-    written, so a healthy apply never touches this path.
-    """
-
-    cleared = 0
-    for chunk in _chunks(sorted(event_ids)):
-        marks = _placeholders(len(chunk))
-        cur = con.execute(
-            f"UPDATE ce_events SET stale_at=NULL "
-            f"WHERE generation_id=? AND artifact_id=? AND stale_at IS NOT NULL "
-            f"AND event_id IN ({marks})",
-            (generation_id, slot_id, *chunk),
-        )
-        cleared += max(cur.rowcount, 0)
-    for chunk in _chunks(sorted(session_ids)):
-        marks = _placeholders(len(chunk))
-        cur = con.execute(
-            f"UPDATE ce_sessions SET stale_at=NULL "
-            f"WHERE generation_id=? AND artifact_id=? AND stale_at IS NOT NULL "
-            f"AND session_id IN ({marks})",
-            (generation_id, slot_id, *chunk),
-        )
-        cleared += max(cur.rowcount, 0)
-    return cleared
+# The store is a collection, not a mirror: rows the source stops emitting are
+# kept exactly as they were captured — no staleness marker, no filter, no
+# reclamation. That is the intended semantic (user decision 2026-09-25, P0-1
+# withdrawn): what has been collected stays collected, and historical rows are
+# queryable evidence, not pollution.
 
 
 # ---- P1-5 cross-slot relation duplicates -----------------------------------
@@ -967,94 +872,38 @@ def _clear_stale_rows(
 # ``rows_inserted`` overcounts. Which copy a relation edge follows was
 # therefore decided by apply order alone.
 #
-# The minimal honest repair has two halves, both inside the apply transaction:
-# count what the ignore swallowed, and let the edge follow the *current* copy —
-# but only when that is unambiguous (the incoming endpoints are all current and
-# the stored ones are all stale). Anything else keeps the stored row and only
-# counts. No replay, no relation rewrite beyond the two endpoint columns.
-
-def _endpoint_staleness(
-    con: sqlite3.Connection, generation_id: str, event_ids: list[str]
-) -> tuple[str, ...]:
-    """``("current" | "stale" | "absent", ...)`` for the given event ids.
-
-    Relations carry no ``stale_at`` of their own (P0-1 marked events and
-    sessions only), so a relation's currency is inferred from its endpoints:
-    an edge pointing at stale events has left the current computation even
-    though the row itself is unmarked.
-    """
-
-    states: list[str] = []
-    for chunk in _chunks(event_ids):
-        found = {
-            str(row[0]): ("stale" if row[1] is not None else "current")
-            for row in con.execute(
-                "SELECT event_id, stale_at FROM ce_events "
-                f"WHERE generation_id=? AND event_id IN ({_placeholders(len(chunk))})",
-                (generation_id, *chunk),
-            )
-        }
-        states.extend(found.get(event_id, "absent") for event_id in chunk)
-    return tuple(states)
-
+# The minimal honest repair: count what the ignore swallowed, inside the apply
+# transaction, so ``rows_inserted`` stays truthful and the divergence is
+# observable. The edge follows whichever copy applied first — with collection
+# semantics (no staleness markers) there is no "prefer the current copy" rule
+# to apply; first arrival is the anchor, by design.
 
 def _resolve_swallowed_relations(
     con: sqlite3.Connection,
     generation_id: str,
     *,
     candidates: dict[str, tuple],
-) -> tuple[int, int]:
-    """Count (and prefer-current) the relations ``INSERT OR IGNORE`` swallowed.
+) -> int:
+    """Count the relations ``INSERT OR IGNORE`` will swallow.
 
     Runs *between* the event and relation inserts of :func:`_apply_slot`: the
-    slot's own endpoint events are already stored (their ``stale_at`` state is
-    final for this apply, and a repoint's UPDATE is FK-checked against them),
-    while the fresh relation rows are not yet written — so a candidate found in
-    ``ce_event_relations`` here was stored by an earlier apply of another slot,
-    never by this one. ``candidates`` maps relation id to the freshly adapted
-    ``(source, target, kind)`` signature. Returns ``(swallowed, repointed)``.
-
-    A repoint refreshes only the two endpoint columns, and only under the
-    unambiguous rule of the section comment; the replaced value is archived to
-    ``ce_relation_versions`` first (the same "no value is rewritten away"
-    contract the dirty bucket follows). A mixed endpoint state — one side
-    current, one stale, an endpoint absent — keeps the stored row untouched.
+    slot's own endpoint events are already stored, while the fresh relation
+    rows are not yet written — so a candidate found in ``ce_event_relations``
+    here was stored by an earlier apply of another slot, never by this one.
+    ``candidates`` maps relation id to the freshly adapted
+    ``(source, target, kind)`` signature. Returns the swallowed count.
     """
 
     swallowed = 0
-    repointed = 0
     for chunk in _chunks(sorted(candidates)):
-        for rid, src_stored, tgt_stored, kind in con.execute(
-            "SELECT relation_id, source_event_id, target_event_id, relation_kind "
-            "FROM ce_event_relations WHERE generation_id=? "
+        for row in con.execute(
+            "SELECT relation_id FROM ce_event_relations WHERE generation_id=? "
             f"AND relation_id IN ({_placeholders(len(chunk))})",
             (generation_id, *chunk),
         ).fetchall():
-            swallowed += 1
-            src_new, tgt_new, _kind = candidates[str(rid)]
-            stored_state = _endpoint_staleness(
-                con, generation_id, [src_stored, tgt_stored]
-            )
-            fresh_state = _endpoint_staleness(
-                con, generation_id, [src_new, tgt_new]
-            )
-            if stored_state != ("stale", "stale") or fresh_state != ("current", "current"):
-                continue
-            _archive_rows(
-                con,
-                table="ce_relation_versions",
-                key_columns=_RELATION_KEY,
-                columns=_RELATION_VERSION_COLUMNS,
-                generation_id=generation_id,
-                rows={(str(rid),): (src_stored, tgt_stored, kind)},
-            )
-            con.execute(
-                "UPDATE ce_event_relations SET source_event_id=?, target_event_id=? "
-                "WHERE generation_id=? AND relation_id=?",
-                (src_new, tgt_new, generation_id, str(rid)),
-            )
-            repointed += 1
-    return swallowed, repointed
+            if row is not None:
+                swallowed += 1
+    return swallowed
 
 
 def _apply_slot(
@@ -1065,7 +914,7 @@ def _apply_slot(
     artifact,
     result,
 ) -> dict:
-    """Grow one slot's rows in place (added / changed / marked stale).
+    """Grow one slot's rows in place (added / changed).
 
     ``artifact`` / ``result`` are the already-captured, already-adapted outputs
     of this file: the caller needed them to classify added vs changed, so they
@@ -1083,10 +932,8 @@ def _apply_slot(
     new_relations = _new_relation_sigs(result)
     new_dispositions = _new_disposition_sigs(result)
 
-    # Three buckets, and no deletion anywhere:
-    #   stale  — stored id, no longer emitted -> kept as collected, but marked
-    #            with ``stale_at = now`` (step 4 below) so the projection stops
-    #            feeding on it;
+    # Buckets, and no deletion anywhere:
+    #   stale  — stored id, no longer emitted -> kept as collected, untouched;
     #   dirty  — stored id, different row values -> archived, then UPDATEd;
     #   new    — id the store has never seen -> INSERT OR IGNORE below.
     dirty_events = {
@@ -1172,15 +1019,14 @@ def _apply_slot(
 
     # 2b) P1-5: relations the ignore below would silently drop (same relation
     #     id already stored from another slot's copy of the same native
-    #     session). Must run here — after the event inserts (the slot's
-    #     endpoints exist for the staleness check and for a repoint's FK) but
-    #     before the relation inserts (a candidate found in the table was
-    #     stored by an earlier slot's apply, never by this one). Count them,
-    #     and prefer the current copy's endpoints when the stored anchor is
-    #     fully stale. ``rows_inserted`` above was set arithmetic and assumed
-    #     every new id landed; the swallowed ones did not, so they are
-    #     subtracted to keep the counter honest.
-    relations_ignored, relations_repointed = _resolve_swallowed_relations(
+    #     session). Must run here — after the event inserts but before the
+    #     relation inserts (a candidate found in the table was stored by an
+    #     earlier slot's apply, never by this one). Count them only: the edge
+    #     follows whichever copy applied first (collection semantics, no
+    #     staleness-based repoint). ``rows_inserted`` above was set arithmetic
+    #     and assumed every new id landed; the swallowed ones did not, so they
+    #     are subtracted to keep the counter honest.
+    relations_ignored = _resolve_swallowed_relations(
         con,
         generation_id,
         candidates={
@@ -1226,32 +1072,6 @@ def _apply_slot(
         rows={key: new_dispositions[key] for key in dirty_dispositions},
     )
 
-    # 4) P0-1 staleness markers, in the same transaction as every write above.
-    #    ``stale``  = stored ids this slot no longer emits (truncated/edited
-    #    file): marked, never removed. ``resurrect`` = stored ids the source
-    #    emits again (a file that regrows or reappears): the marker goes back to
-    #    NULL — for dirty ids the row was just refreshed in place, for unchanged
-    #    ids this is the only write they get. Read scoping note: ``old_events`` /
-    #    ``old_sessions`` were read WITHOUT a stale filter, on purpose — a stale
-    #    row must stay visible to this comparison or a re-emitted id could never
-    #    be recognized and resurrected.
-    stale_event_ids = old_event_ids - new_event_ids
-    stale_session_ids = old_session_ids - new_session_ids
-    rows_stale_marked = _mark_stale_rows(
-        con,
-        generation_id,
-        slot_id=slot_id,
-        event_ids=stale_event_ids,
-        session_ids=stale_session_ids,
-    )
-    rows_stale_cleared = _clear_stale_rows(
-        con,
-        generation_id,
-        slot_id=slot_id,
-        event_ids=old_event_ids & new_event_ids,
-        session_ids=old_session_ids & new_session_ids,
-    )
-
     _touch_slot(
         con,
         slot_id=slot_id,
@@ -1266,10 +1086,7 @@ def _apply_slot(
         "rows_inserted": rows_inserted,
         "rows_updated": rows_updated,
         "rows_versioned": rows_versioned,
-        "rows_stale_marked": rows_stale_marked,
-        "rows_stale_cleared": rows_stale_cleared,
         "relations_ignored_duplicates": relations_ignored,
-        "relations_endpoint_refreshed": relations_repointed,
         "new_sessions": set(new_sessions),
         "new_event_ids": new_event_ids,
         "new_session_ids": new_session_ids,
@@ -1285,36 +1102,23 @@ def _remove_slot(
     family: str,
     mirror_path: str,
 ) -> None:
-    """Mark a vanished slot inactive and stale. No row of it is deleted.
+    """Mark a vanished slot inactive. No row of it is deleted.
 
     A source that disappeared is a *state* change, not a reason to erase what was
     collected from it: the slot's sessions, events (and their dispositions),
     relations and ``ce_source_artifacts`` provenance row all stay exactly as
-    they were. But they are all marked ``stale_at = now`` (P0-1): the slot can
-    no longer re-emit anything, so every row it owns has left the current
-    computation and must stop being read as if it had not. The compatibility
-    projection rows that were derived from them are NOT re-projected or removed
-    here (the caller does not ask for this slot's sessions at all) — clearing
-    those already-projected canonical rows is the P4 boundary.
+    they were — collected evidence, no staleness marker (collection semantics,
+    P0-1 withdrawn). The compatibility projection rows derived from them are
+    NOT re-projected or removed here (the caller does not ask for this slot's
+    sessions at all).
 
     Only ``ce_live_slots.active`` flips to 0, and the removal — with the mirror
     path it happened to — is appended to ``ce_live_state['removed_slots']``
     (plus the run's sync-log detail) so it stays auditable. If the source
-    reappears, the slot reactivates and :func:`_apply_slot` clears the stale
-    markers of every id it emits again.
+    reappears, the slot reactivates and :func:`_apply_slot` grows it again.
     """
 
     now = _now()
-    con.execute(
-        "UPDATE ce_events SET stale_at=? "
-        "WHERE generation_id=? AND artifact_id=? AND stale_at IS NULL",
-        (now, generation_id, slot_id),
-    )
-    con.execute(
-        "UPDATE ce_sessions SET stale_at=? "
-        "WHERE generation_id=? AND artifact_id=? AND stale_at IS NULL",
-        (now, generation_id, slot_id),
-    )
     con.execute(
         "UPDATE ce_live_slots SET active=0, last_synced_at=? WHERE slot_id=?",
         (now, slot_id),
@@ -1453,12 +1257,8 @@ def _project_sessions(
       ``retrieval/conversation_fts.py`` relies on.
 
     Reads go through ``con`` so rows written earlier in this transaction are
-    visible.
-
-    P0-1: both reads filter ``stale_at IS NULL`` — events (and sessions) the
-    source no longer emits must not be counted into ``message_count`` or reach
-    the canonical projection as current data. The stale ``canonical_*`` rows
-    this leaves behind are the documented P4 boundary (see module docstring).
+    visible. No staleness filter: every collected row of the touched sessions
+    participates (collection semantics).
     """
 
     if not session_ids:
@@ -1478,7 +1278,6 @@ def _project_sessions(
                 "ended_at, native_locator, contract_version, fidelity_json, "
                 "cwd, git_branch, model, title, stop_reason "
                 f"FROM ce_sessions WHERE generation_id=? AND session_id IN ({marks}) "
-                "AND stale_at IS NULL "
                 "ORDER BY session_id",
                 (generation_id, *chunk),
             )
@@ -1490,7 +1289,6 @@ def _project_sessions(
                 "native_event_id, occurred_at, ordinal, native_payload_ref, "
                 "content, summary, contract_version, fidelity_json "
                 f"FROM ce_events WHERE generation_id=? AND session_id IN ({marks}) "
-                "AND stale_at IS NULL "
                 "ORDER BY ordinal, event_id",
                 (generation_id, *chunk),
             )
@@ -1597,10 +1395,7 @@ def _empty_report(status: str, generation_id: str, started: float, **extra) -> d
         "rows_inserted": 0,
         "rows_updated": 0,
         "rows_versioned": 0,
-        "rows_stale_marked": 0,
-        "rows_stale_cleared": 0,
         "relations_ignored_duplicates": 0,
-        "relations_endpoint_refreshed": 0,
         "hard_gate_failures": [],
         "quarantined": {"count": 0, "findings": []},
         "per_family": {},
@@ -1772,10 +1567,7 @@ def live_sync_once(
         rows_inserted = 0
         rows_updated = 0
         rows_versioned = 0
-        rows_stale_marked = 0
-        rows_stale_cleared = 0
         relations_ignored_duplicates = 0
-        relations_endpoint_refreshed = 0
         touched: set[str] = set()
         projected_sessions: list[str] = []
         emitted_events: list[str] = []
@@ -1813,13 +1605,8 @@ def live_sync_once(
                 rows_inserted += outcome["rows_inserted"]
                 rows_updated += outcome["rows_updated"]
                 rows_versioned += outcome["rows_versioned"]
-                rows_stale_marked += outcome["rows_stale_marked"]
-                rows_stale_cleared += outcome["rows_stale_cleared"]
                 relations_ignored_duplicates += outcome[
                     "relations_ignored_duplicates"
-                ]
-                relations_endpoint_refreshed += outcome[
-                    "relations_endpoint_refreshed"
                 ]
                 projected_sessions.extend(sorted(outcome["new_session_ids"]))
                 emitted_events.extend(sorted(outcome["new_event_ids"]))
@@ -1831,13 +1618,8 @@ def live_sync_once(
                     rows_inserted=outcome["rows_inserted"],
                     rows_updated=outcome["rows_updated"],
                     rows_versioned=outcome["rows_versioned"],
-                    rows_stale_marked=outcome["rows_stale_marked"],
-                    rows_stale_cleared=outcome["rows_stale_cleared"],
                     relations_ignored_duplicates=outcome[
                         "relations_ignored_duplicates"
-                    ],
-                    relations_endpoint_refreshed=outcome[
-                        "relations_endpoint_refreshed"
                     ],
                 )
 
@@ -1878,10 +1660,7 @@ def live_sync_once(
                 "rows_inserted": rows_inserted,
                 "rows_updated": rows_updated,
                 "rows_versioned": rows_versioned,
-                "rows_stale_marked": rows_stale_marked,
-                "rows_stale_cleared": rows_stale_cleared,
                 "relations_ignored_duplicates": relations_ignored_duplicates,
-                "relations_endpoint_refreshed": relations_endpoint_refreshed,
                 "per_family": per_family,
                 "touched_sessions": sorted(touched),
                 "removed_slots": [
@@ -2072,13 +1851,8 @@ def _write_sync_log(con: sqlite3.Connection, report: dict) -> None:
                     "removed_slots": report.get("removed_slots", []),
                     "rows_updated": report.get("rows_updated", 0),
                     "rows_versioned": report.get("rows_versioned", 0),
-                    "rows_stale_marked": report.get("rows_stale_marked", 0),
-                    "rows_stale_cleared": report.get("rows_stale_cleared", 0),
                     "relations_ignored_duplicates": report.get(
                         "relations_ignored_duplicates", 0
-                    ),
-                    "relations_endpoint_refreshed": report.get(
-                        "relations_endpoint_refreshed", 0
                     ),
                     "hard_gate_failures": report.get("hard_gate_failures", []),
                     "quarantined": report.get(

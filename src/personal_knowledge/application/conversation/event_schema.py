@@ -138,8 +138,6 @@ _DDL: tuple[str, ...] = (
         model              TEXT,
         title              TEXT,
         stop_reason        TEXT,
-        -- P0-1 staleness marker, same contract as ce_events.stale_at.
-        stale_at           TEXT,
         PRIMARY KEY (generation_id, session_id)
     )
     """,
@@ -159,11 +157,6 @@ _DDL: tuple[str, ...] = (
         summary            TEXT,
         contract_version   TEXT NOT NULL,
         fidelity_json      TEXT NOT NULL,
-        -- P0-1 staleness marker: NULL = current, non-NULL = the source no
-        -- longer emits this row (truncated/edited file, vanished slot). The
-        -- collected row itself is never deleted; readers that want only the
-        -- current computation filter on stale_at IS NULL.
-        stale_at           TEXT,
         PRIMARY KEY (generation_id, event_id),
         FOREIGN KEY (generation_id, session_id)
             REFERENCES ce_sessions(generation_id, session_id),
@@ -426,16 +419,6 @@ def create_v2_schema(db: Path) -> None:
         }
         if "content" not in event_columns:
             con.execute("ALTER TABLE ce_events ADD COLUMN content TEXT")
-        # P0-1: additive staleness marker (NULL = current). Existing databases
-        # get the column via this idempotent ALTER; new ones via the DDL above.
-        # No backfill: every stored row stays current (NULL) until an apply
-        # observes that its source no longer emits it.
-        for table in ("ce_events", "ce_sessions"):
-            columns = {
-                row[1] for row in con.execute(f"PRAGMA table_info({table})")
-            }
-            if "stale_at" not in columns:
-                con.execute(f"ALTER TABLE {table} ADD COLUMN stale_at TEXT")
         session_columns = {
             row[1] for row in con.execute("PRAGMA table_info(ce_sessions)")
         }

@@ -38,14 +38,14 @@ live_sync 的增量 apply 路径——在那之前 live 是绕过全部数据质
   null/''/'0'/epoch 秒/epoch 毫秒/不可解析（``bad_timestamp`` 的六种缺陷，
   与 authority_ingest 同语义）。ended_at 为 null 不算缺陷（进行中的会话
   合法没有结束时间）。
-* ``empty_session`` — 触达会话在当前计算（stale 过滤后）里 0 条消息事件。
+* ``empty_session`` — 触达会话在已采集事件里 0 条消息事件。
   选择：软处理（隔离 + 从本轮投影集合剔除，不写/不刷新它的 canonical 行），
   不硬拦——只有工具事件的会话是合法输入，硬拦会把正常批次炸掉。已在库里的
   canonical 行按既定 P4 边界保留（投影 upsert 从不删除）。
 * ``message_count_mismatch`` — 投影 upsert 之后，``canonical_sessions``
   的 ``message_count`` 与本轮投影输入里同 canonical id 各 ce 会话的实际
-  消息事件数（stale 过滤后取 max，与投影 merge 规则一致）不一致。P0-1/P1-3
-  之后两者应恒等，此门纯作守卫存在，触发即说明投影或 staleness 有回归。
+  消息事件数（取 max，与投影 merge 规则一致）不一致。P1-3 之后两者应恒
+  等，此门纯作守卫存在，触发即说明投影有回归。
 
 性能边界：secret 扫描只对**本批次新增/变更**（prepared）的 content 做，
 不重扫全库——prepared 之外的槽位走指纹快路径，本来就不被本轮改写。
@@ -414,15 +414,14 @@ _MESSAGE_KIND_VALUES = tuple(kind.value for kind in MESSAGE_KINDS)
 def _message_counts(
     con: sqlite3.Connection, generation_id: str, session_ids: set[str]
 ) -> dict[str, int]:
-    """``{session_id: 当前消息事件数}``（stale 过滤，仅消息 kind）。"""
+    """``{session_id: 消息事件数}``（全部已采集行，仅消息 kind）。"""
     counts: dict[str, int] = {}
     marks = ",".join("?" * len(_MESSAGE_KIND_VALUES))
     for chunk in _chunks(sorted(session_ids)):
         id_marks = ",".join("?" * len(chunk))
         for row in con.execute(
             "SELECT session_id, COUNT(*) FROM ce_events "
-            f"WHERE generation_id=? AND stale_at IS NULL "
-            f"AND kind IN ({marks}) AND session_id IN ({id_marks}) "
+            f"WHERE generation_id=? AND kind IN ({marks}) AND session_id IN ({id_marks}) "
             "GROUP BY session_id",
             (generation_id, *_MESSAGE_KIND_VALUES, *chunk),
         ):
@@ -433,10 +432,10 @@ def _message_counts(
 def detect_empty_sessions(
     con: sqlite3.Connection, generation_id: str, session_ids: set[str]
 ) -> tuple[set[str], list[GateFinding]]:
-    """触达会话里当前 0 条消息事件者：返回（空会话 id 集, 隔离发现）。
+    """触达会话里 0 条消息事件者：返回（空会话 id 集, 隔离发现）。
 
-    判定基于 stale 过滤后的消息事件数（P0-1 语义）：源把消息删光后会话
-    计数为 0，即视为本轮投影不该再喂的空会话。
+    判定基于已采集的消息事件数（collection 语义，无 staleness 过滤）：
+    一个会话适配产出里本来就没有消息事件，即视为本轮投影不喂的空会话。
     """
     if not session_ids:
         return set(), []
@@ -455,7 +454,7 @@ def detect_empty_sessions(
         GateFinding(
             "empty_session", "soft",
             families.get(sid, ""), sid, "-",
-            "0 current message events after staleness filtering; excluded "
+            "0 collected message events; excluded "
             "from this round's projection",
         )
         for sid in sorted(empty)
@@ -470,7 +469,7 @@ def detect_message_count_mismatch(
 
     比较基准与投影 merge 规则严格一致：对每个触达会话的 canonical id，
     期望值 = 本轮投影输入（``projectable``）里同 canonical id 各 ce 会话
-    的当前消息事件数的 **max**（``_merge_session_pair`` 的计数规则）。
+    的消息事件数的 **max**（``_merge_session_pair`` 的计数规则）。
     只查触达会话，代价与本轮规模成正比。
     """
     if not session_ids:
@@ -482,7 +481,7 @@ def detect_message_count_mismatch(
         )
         for row in con.execute(
             "SELECT session_id, family, native_session_id FROM ce_sessions "
-            "WHERE generation_id=? AND stale_at IS NULL",
+            "WHERE generation_id=?",
             (generation_id,),
         )
         if row[0] in session_ids
@@ -513,9 +512,9 @@ def detect_message_count_mismatch(
         findings.append(GateFinding(
             "message_count_mismatch", "soft",
             str(families[0]) if families else "", sid, "-",
-            f"canonical_sessions.message_count={stored} but max current "
+            f"canonical_sessions.message_count={stored} but max collected "
             f"message-event count across copies is {expected.get(canon, 0)} "
-            f"— projection/staleness regression guard fired",
+            f"— projection regression guard fired",
         ))
     return findings
 
