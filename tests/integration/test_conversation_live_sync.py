@@ -2136,3 +2136,224 @@ def test_unregistered_family_slots_are_never_marked_removed(
     assert third["status"] == "no-op"
     assert third["n_removed"] == 0
     assert third["unregistered_families"] == []
+
+
+# =============================================================== P1-12: gates
+#
+# The authority-ingest path's data-quality gates are ported into the live apply
+# (engine: ``live_gates``): hard gates fail closed BEFORE the write transaction
+# (secret leak, temporal order, duplicate native session), soft gates land in
+# ``ce_ingest_quarantine`` inside the transaction and never block the batch.
+
+
+from personal_knowledge.application.conversation.live_gates import (  # noqa: E402
+    GateFinding,
+    bad_timestamp,
+    collect_timestamp_quarantine_findings,
+    run_hard_gates,
+)
+from personal_knowledge.application.conversation.live_sync import (  # noqa: E402
+    LiveGateError,
+)
+
+# The classic AWS documentation example key: matches ``AKIA[0-9A-Z]{16}``.
+POISON_KEY = "AKIAIOSFODNN7EXAMPLE"
+
+
+def _poisoned_session(session_id: str) -> str:
+    """A valid codex export whose user message carries a fake AWS key."""
+
+    records: list[dict] = [
+        {
+            "type": "session_meta",
+            "session_id": session_id,
+            "timestamp": "2026-07-01T10:00:00Z",
+            "model": "gpt-5",
+        },
+        {
+            "type": "event_msg",
+            "session_id": session_id,
+            "timestamp": "2026-07-01T10:01:00Z",
+            "payload": {
+                "type": "user_message",
+                "message": f"please use {POISON_KEY} for the deploy",
+            },
+        },
+        {
+            "type": "response_item",
+            "session_id": session_id,
+            "turn_id": "turn_1",
+            "item_id": f"resp_{session_id}_1",
+            "role": "assistant",
+            "content": f"answer 1 of {session_id}",
+            "timestamp": "2026-07-01T10:01:05Z",
+        },
+    ]
+    return "\n".join(json.dumps(record) for record in records) + "\n"
+
+
+def _inverted_session(session_id: str) -> str:
+    """A codex export whose last record predates the session_meta timestamp.
+
+    The codex adapter derives ``ended_at`` from the last record's timestamp,
+    so this is the minimal ended_at < started_at shape (and every event lands
+    before the session window, firing the drift-tolerance gate too).
+    """
+
+    records: list[dict] = [
+        {
+            "type": "session_meta",
+            "session_id": session_id,
+            "timestamp": "2026-07-01T11:00:00Z",
+            "model": "gpt-5",
+        },
+        {
+            "type": "event_msg",
+            "session_id": session_id,
+            "timestamp": "2026-07-01T10:00:00Z",
+            "payload": {"type": "user_message", "message": f"q of {session_id}"},
+        },
+        {
+            "type": "response_item",
+            "session_id": session_id,
+            "turn_id": "turn_1",
+            "item_id": f"resp_{session_id}_1",
+            "role": "assistant",
+            "content": f"answer of {session_id}",
+            "timestamp": "2026-07-01T10:00:05Z",
+        },
+    ]
+    return "\n".join(json.dumps(record) for record in records) + "\n"
+
+
+def _bad_timestamp_session(session_id: str) -> str:
+    """A codex export with one bare epoch-seconds timestamp mid-session.
+
+    The bad value sits in the middle, so the session bounds stay parseable
+    (no temporal hard gate can fire) and only the soft gate sees the defect.
+    """
+
+    records: list[dict] = [
+        {
+            "type": "session_meta",
+            "session_id": session_id,
+            "timestamp": "2026-07-01T10:00:00Z",
+            "model": "gpt-5",
+        },
+        {
+            "type": "event_msg",
+            "session_id": session_id,
+            "timestamp": "1750000000",  # bare epoch seconds: quarantine
+            "payload": {"type": "user_message", "message": f"q of {session_id}"},
+        },
+        {
+            "type": "response_item",
+            "session_id": session_id,
+            "turn_id": "turn_1",
+            "item_id": f"resp_{session_id}_1",
+            "role": "assistant",
+            "content": f"answer of {session_id}",
+            "timestamp": "2026-07-01T10:01:05Z",
+        },
+    ]
+    return "\n".join(json.dumps(record) for record in records) + "\n"
+
+
+def _meta_only_session(session_id: str) -> str:
+    """A codex export with only session_meta: a session with 0 message events."""
+
+    return json.dumps(
+        {
+            "type": "session_meta",
+            "session_id": session_id,
+            "timestamp": "2026-07-01T10:00:00Z",
+            "model": "gpt-5",
+        }
+    ) + "\n"
+
+
+def _assert_zero_data_rows(db: Path) -> None:
+    """The hard-gate abort wrote nothing at all — no row, no slot, no log."""
+
+    for table in (
+        "ce_sessions", "ce_events", "ce_event_generations", "ce_live_slots",
+        "ce_live_sync_log", "ce_ingest_quarantine",
+    ):
+        assert _rows(db, f"SELECT 1 FROM {table}") == [], table
+
+
+def test_hard_gate_secret_leak_aborts_apply_with_zero_writes(tmp_path: Path) -> None:
+    """(a) Poisoned content: apply aborts, the store is untouched.
+
+    Rewriting the file without the secret and re-applying must then succeed —
+    a hard gate leaves no residue to clean up.
+    """
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror, names=("a.jsonl",))
+    _write(mirror, "poison.jsonl", _poisoned_session("sess_poison"))
+    db = tmp_path / "live.sqlite"
+
+    with pytest.raises(LiveGateError) as excinfo:
+        live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    codes = {f.code for f in excinfo.value.findings}
+    assert "secret_content_leak" in codes
+    finding = next(f for f in excinfo.value.findings if f.code == "secret_content_leak")
+    assert POISON_KEY not in finding.detail  # the report must not leak the secret
+    _assert_zero_data_rows(db)
+
+    # No residue: the fixed batch applies cleanly afterwards.
+    _write(mirror, "poison.jsonl", _codex_session("sess_poison", 1))
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert report["status"] == "ok"
+    assert report["hard_gate_failures"] == []
+    assert report["quarantined"]["count"] == 0
+
+
+def test_hard_gate_temporal_inversion_aborts_apply(tmp_path: Path) -> None:
+    """(b) ended_at < started_at: fail closed, zero writes."""
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror, names=("a.jsonl",))
+    _write(mirror, "inverted.jsonl", _inverted_session("sess_inverted"))
+    db = tmp_path / "live.sqlite"
+
+    with pytest.raises(LiveGateError) as excinfo:
+        live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    codes = {f.code for f in excinfo.value.findings}
+    assert "temporal_inversion" in codes
+    assert "event_time_out_of_range" in codes  # events before the window too
+    _assert_zero_data_rows(db)
+
+
+def test_soft_gate_bad_timestamp_quarantines_and_batch_proceeds(
+    tmp_path: Path,
+) -> None:
+    """(c) Bare epoch-seconds timestamp: quarantine row, rest of batch lands."""
+
+    mirror = tmp_path / "mirror"
+    _build_corpus(mirror, names=("a.jsonl",))
+    _write(mirror, "badts.jsonl", _bad_timestamp_session("sess_badts"))
+    db = tmp_path / "live.sqlite"
+
+    report = live_sync_once(db=db, mirror_root=mirror, generation_id=GENERATION)
+    assert report["status"] == "ok"
+    assert report["hard_gate_failures"] == []
+    assert report["quarantined"]["count"] >= 1
+    assert any(
+        f["code"] == "occurred_at_epoch_seconds"
+        for f in report["quarantined"]["findings"]
+    )
+
+    rows = _rows(
+        db,
+        "SELECT family, session_id, reason, detail FROM ce_ingest_quarantine "
+        "WHERE reason='occurred_at_epoch_seconds'",
+    )
+    assert len(rows) == 1
+    assert rows[0][1]  # a session id is recorded
+
+    # The rest of the batch is untouched: the healthy session is projected.
+    healthy = _canonical_session_for_content(db, "question 1 of sess_a")
+    assert healthy
+    # ...and so is the quarantined session's own data (quarantine fl

@@ -35,6 +35,10 @@ Tables:
                                   across content edits (Milestone 1, additive)
   - ``ce_live_sync_log``         — append-only log of live in-place applies
   - ``ce_live_state``            — singleton live-sync coordination state
+  - ``ce_ingest_quarantine``     — P1-12 live data-quality soft-gate isolation:
+                                    one row per (session, defect) the gates
+                                    flagged; written inside the apply
+                                    transaction, never blocks a batch
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = "v2.1.0"
+SCHEMA_VERSION = "v2.2.0"
 
 V2_TABLES = (
     "ce_source_artifacts",
@@ -61,6 +65,7 @@ V2_TABLES = (
     "ce_live_slots",
     "ce_live_sync_log",
     "ce_live_state",
+    "ce_ingest_quarantine",
 )
 
 _DDL: tuple[str, ...] = (
@@ -335,6 +340,29 @@ _DDL: tuple[str, ...] = (
         key         TEXT PRIMARY KEY,
         value       TEXT
     )
+    """,
+    # ---- P1-12 live data-quality soft-gate isolation ----------------------
+    # One row per (session, defect) the live gates flagged (bad timestamps,
+    # empty sessions, message-count guard). Written INSIDE the apply
+    # transaction (so a rollback also rolls the quarantine back) and never
+    # blocks a batch — hard gates fail closed BEFORE the transaction instead.
+    # Self-healing: an apply first deletes the quarantine rows of the sessions
+    # it covers, then writes this round's findings, so a defect fixed upstream
+    # does not leave a stale row behind (mirrors authority_ingest.write_quarantine).
+    """
+    CREATE TABLE IF NOT EXISTS ce_ingest_quarantine (
+        quarantine_id TEXT PRIMARY KEY,
+        generation_id TEXT NOT NULL,
+        family        TEXT NOT NULL,
+        session_id    TEXT NOT NULL,
+        reason        TEXT NOT NULL,
+        detail        TEXT,
+        created_at    TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_ce_quarantine_session
+        ON ce_ingest_quarantine(session_id)
     """,
     """
     CREATE INDEX IF NOT EXISTS ix_ce_events_gen_art

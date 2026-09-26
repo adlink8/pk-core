@@ -85,6 +85,20 @@ Correctness notes
 * **Fast path.** A ``(mtime_ns, size)`` fingerprint per collected path is kept in
   ``ce_live_state['mirror_fingerprints']``, so an unchanged file is neither
   hashed nor parsed.
+* **Data-quality gates (P1-12).** The authority-ingest path's correctness gates
+  are ported into this apply (engine: :mod:`.live_gates`). The **hard gates**
+  (secret leak in batch content, session ``ended_at < started_at``, event
+  ``occurred_at`` outside the session window ± a 5-minute clock-drift
+  tolerance, two different slots emitting genuinely *disjoint* sessions under
+  one native id) run BEFORE ``BEGIN IMMEDIATE`` and see only this batch's
+  prepared adaptations — any finding raises :class:`LiveGateError` and nothing
+  at all is written. The **soft gates** (defective timestamps, sessions with
+  zero current message events, a projection-vs-actual message-count guard)
+  never block the batch: they land in the ``ce_ingest_quarantine`` table
+  (written inside the transaction, self-healing per covered session) and in
+  the report's ``quarantined`` entry. The secret scan is bounded to the
+  batch's new/changed content by construction — unchanged slots are never
+  re-read, so the store is never rescanned.
 * **Schema.** All DDL (including ``ce_live_slots`` / ``ce_live_state`` /
   ``ce_live_sync_log``, the four ``*_versions`` history tables and the three
   supporting indexes) is owned by ``event_schema``; this module declares no DDL
@@ -174,6 +188,15 @@ from personal_knowledge.application.conversation.event_repository import (
     _insert_events,
     _insert_relations,
     _insert_sessions,
+)
+from personal_knowledge.application.conversation.live_gates import (
+    GateFinding,
+    LiveGateError,
+    collect_timestamp_quarantine_findings,
+    detect_empty_sessions,
+    detect_message_count_mismatch,
+    run_hard_gates,
+    write_quarantine,
 )
 
 # ``ce_live_state`` keys owned by this engine.
@@ -1578,6 +1601,8 @@ def _empty_report(status: str, generation_id: str, started: float, **extra) -> d
         "rows_stale_cleared": 0,
         "relations_ignored_duplicates": 0,
         "relations_endpoint_refreshed": 0,
+        "hard_gate_failures": [],
+        "quarantined": {"count": 0, "findings": []},
         "per_family": {},
         "touched_sessions": [],
         "duration_s": round(time.monotonic() - started, 3),
@@ -1724,6 +1749,23 @@ def live_sync_once(
                 unregistered_families=sorted(unregistered_families),
             )
 
+        # P1-12: hard data-quality gates, BEFORE the write lock. They see only
+        # this batch's prepared adaptations (the slots about to change), so the
+        # scan cost is proportional to the batch, never to the store. Any hard
+        # finding aborts here: the transaction below never starts and nothing —
+        # not even a quarantine row — is written. (``event_schema`` DDL and the
+        # content-addressed blobs are the only on-disk residue, exactly as for
+        # any other pre-transaction failure of this engine.)
+        gate_hard = run_hard_gates(prepared)
+        if gate_hard:
+            raise LiveGateError(gate_hard)
+        gate_soft = collect_timestamp_quarantine_findings(prepared)
+        covered_sessions = {
+            str(session.session_id)
+            for item in prepared
+            for session in item["result"].sessions
+        }
+
         n_added = sum(1 for item in prepared if item["kind"] == "added")
         n_changed = len(prepared) - n_added
         per_family: dict[str, dict] = {}
@@ -1799,7 +1841,26 @@ def live_sync_once(
                     ],
                 )
 
-            projection = _project_sessions(con, generation_id, touched)
+            # P1-12 soft gates, inside the same transaction as every write:
+            # sessions with zero current message events are quarantined and
+            # excluded from this round's projection input; the message-count
+            # guard compares the just-written projection counters with the
+            # actual current message rows. Quarantine rows roll back with the
+            # rest of the apply.
+            empty_sessions, empty_findings = detect_empty_sessions(
+                con, generation_id, touched
+            )
+            quarantine_findings: list[GateFinding] = (
+                list(gate_soft) + empty_findings
+            )
+            projectable = touched - empty_sessions
+            projection = _project_sessions(con, generation_id, projectable)
+            quarantine_findings += detect_message_count_mismatch(
+                con, generation_id, projectable
+            )
+            quarantined_sessions = write_quarantine(
+                con, generation_id, quarantine_findings, covered_sessions
+            )
             _assert_invariants(
                 con,
                 generation_id,
@@ -1830,6 +1891,14 @@ def live_sync_once(
                 ],
                 "unregistered_families": sorted(unregistered_families),
                 "projection": projection,
+                # P1-12 gate outcomes. ``hard_gate_failures`` is always empty
+                # in a returned report: a non-empty set raises before the
+                # transaction, so a completed apply is by definition clean.
+                "hard_gate_failures": [],
+                "quarantined": {
+                    "count": quarantined_sessions,
+                    "findings": [f.to_dict() for f in quarantine_findings],
+                },
                 "duration_s": round(time.monotonic() - started, 3),
             }
             _write_sync_log(con, report)
@@ -2011,6 +2080,10 @@ def _write_sync_log(con: sqlite3.Connection, report: dict) -> None:
                     "relations_endpoint_refreshed": report.get(
                         "relations_endpoint_refreshed", 0
                     ),
+                    "hard_gate_failures": report.get("hard_gate_failures", []),
+                    "quarantined": report.get(
+                        "quarantined", {"count": 0, "findings": []}
+                    ),
                     "projection": report["projection"],
                     "duration_s": report["duration_s"],
                 },
@@ -2031,6 +2104,7 @@ __all__ = [
     "FINGERPRINT_STATE_KEY",
     "LAST_SYNC_STATE_KEY",
     "REMOVED_SLOTS_STATE_KEY",
+    "LiveGateError",
     "LiveSyncError",
     "live_sync_once",
     "scan_mirror",
