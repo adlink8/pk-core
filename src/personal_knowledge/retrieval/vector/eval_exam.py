@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
-# 终极评测：87 题答案集考卷 × 两档（纯向量 / 向量+Jev裁判）
+# 终极评测：答案集考卷 × 两档（纯向量 / 向量+Jev裁判）
 # 记分：命中 = top-k 内任一文档的会话匹配 answer_set 任一前缀
-import sqlite3, json, time, urllib.request, sys
+# 2026-09-28: 加 --exam/--out 参数与垃圾块检测（默认值不变，v1 行为可复现）
+import sqlite3, json, time, urllib.request, sys, argparse
 import numpy as np
 
 DB = r"D:/ADLINK/数据分析/var/db/conversation_vector.sqlite"
-EXAM = r"D:/ADLINK/数据分析/docs/retrieval/exam_v1.json"
+DEF_EXAM = r"D:/ADLINK/数据分析/docs/retrieval/exam_v1.json"
+JUNK_SIGS = ("<system-reminder", "<user_info", "<environment_context",
+             '<data-role="user-context">', "<additional_data>")
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--exam", default=DEF_EXAM, help="考卷 JSON 路径")
+ap.add_argument("--out", default=None, help="逐题明细输出 JSON 路径")
+ARGS = ap.parse_args()
+EXAM = ARGS.exam
 
 def embed(texts):
     body = json.dumps({"model": "bge-m3", "input": texts}).encode("utf-8")
@@ -32,13 +41,16 @@ for sid, sj, seg, emb in con.execute(
         "SELECT s.canonical_session_id, s.summary_json, s.seg_no, v.embedding "
         "FROM summaries s JOIN summary_vectors v USING(summary_id) WHERE s.status='ok'"):
     docs.append({"sid": sid, "seg": seg, "kind": "要点", "text": doc_text(sj),
-                 "label": json.loads(sj).get("theme", ""), "vec": json.loads(emb)})
+                 "label": json.loads(sj).get("theme", ""), "vec": json.loads(emb),
+                 "junk": False})
 for cid, sid, text, emb in con.execute(
         "SELECT c.chunk_id, c.canonical_session_id, c.text, c.embedding "
         "FROM quote_chunks c WHERE EXISTS (SELECT 1 FROM summaries s WHERE "
         "s.canonical_session_id=c.canonical_session_id AND s.status='ok')"):
+    junk = text.lstrip().lower().startswith(JUNK_SIGS)
     docs.append({"sid": sid, "seg": 0, "kind": "原话", "text": text[:800],
-                 "label": text[:70].replace("\n", " "), "vec": json.loads(emb)})
+                 "label": text[:70].replace("\n", " "), "vec": json.loads(emb),
+                 "junk": junk})
 M = np.array([d["vec"] for d in docs], dtype=np.float32)
 M /= (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
 print(f"语料 {len(docs)}（层2 {sum(1 for d in docs if d['kind']=='要点')} + 层1 {sum(1 for d in docs if d['kind']=='原话')}）", flush=True)
@@ -73,7 +85,7 @@ sys.path.insert(0, r"D:/ADLINK/数据分析/src/personal_knowledge/retrieval/vec
 import query as Q  # 复用 get_judge 单例
 res = {"vec": {"h1": 0, "h3": 0, "h5": 0, "rr": 0.0},
        "jev": {"h1": 0, "h3": 0, "h5": 0, "rr": 0.0}}
-misses = []
+misses, records, junk_hits = [], [], 0
 t0 = time.time()
 for i, (e, qe) in enumerate(zip(exam, qs), 1):
     qv = np.array(qe, dtype=np.float32)
@@ -84,6 +96,15 @@ for i, (e, qe) in enumerate(zip(exam, qs), 1):
     vr = hit_rank(cand, e["answer_set"])
     jcand = judge_pool(e["q"], cand[:30])
     jr = hit_rank(jcand, e["answer_set"])
+    top5junk = sum(1 for d in cand[:5] if d.get("junk"))
+    if top5junk:
+        junk_hits += 1
+    records.append({"q": e["q"], "topic": e.get("topic", ""),
+                    "agent": e.get("agent", ""), "origin": e.get("origin", "v1"),
+                    "vec_rank": vr, "jev_rank": jr,
+                    "top5": [{"kind": d["kind"], "sid": d["sid"], "score": round(float(scores[j]), 4),
+                              "junk": bool(d.get("junk")), "label": d["label"][:60]}
+                             for j, d in zip(order[:5], cand[:5])]})
     for key, rk in (("vec", vr), ("jev", jr)):
         if rk == 1: res[key]["h1"] += 1
         if rk and rk <= 3: res[key]["h3"] += 1
@@ -97,6 +118,12 @@ for i, (e, qe) in enumerate(zip(exam, qs), 1):
 n = len(exam)
 print(f"\n=== 纯向量     Hit@1={res['vec']['h1']}/{n}  Hit@3={res['vec']['h3']}/{n}  Hit@5={res['vec']['h5']}/{n}  MRR={res['vec']['rr']/n:.3f}")
 print(f"=== 向量+Jev  Hit@1={res['jev']['h1']}/{n}  Hit@3={res['jev']['h3']}/{n}  Hit@5={res['jev']['h5']}/{n}  MRR={res['jev']['rr']/n:.3f}")
+print(f"=== 垃圾块检测: {junk_hits}/{n} 题 top5 内出现系统上下文垃圾块 ({junk_hits*100//max(n,1)}%)")
 print(f"\n未进前三的 {len(misses)} 题：")
 for q, aset, vr, jr in misses[:10]:
     print(f"  [向量#{vr}|jev#{jr}] {q[:40]}")
+if ARGS.out:
+    with open(ARGS.out, "w", encoding="utf-8") as f:
+        json.dump({"exam": EXAM, "n": n, "metrics": res, "junk_top5_questions": junk_hits,
+                   "misses": misses, "records": records}, f, ensure_ascii=False, indent=1)
+    print(f"逐题明细已写 {ARGS.out}")

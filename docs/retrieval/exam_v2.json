@@ -1,0 +1,1766 @@
+[
+ {
+  "meta": {
+   "generated_at": "2026-09-28",
+   "version": "v2",
+   "purpose": "扩大版考卷：v1 87 题原样保留 + 新增 86 题（家族覆盖再平衡）。answer_set=源会话+兄弟会话(上限3)。",
+   "brother_rule": "兄弟=跨家族且id十六进制片段(>=10位)互含（跨通道镜像）；或同家族且标准化引语共享>=3条且最长共享>=60字（深内容重合）。上限 gold+3。",
+   "pool": "docs/retrieval/exam_v2_pool.json（90 候选分层采样自 1860 摘要，排除 v1 已覆盖及其兄弟）",
+   "conventions": "新题 origin=v2-20260928；新题 answer_set 用完整 canonical_session_id（v1 部分用截断前缀，均兼容 startswith 匹配）；v1 题目零改动保证基线可比",
+   "db_readonly": "var/db/conversation_vector.sqlite 全程 mode=ro 只读"
+  }
+ },
+ {
+  "q": "当时让我给项目生成适配实际的 copilot-instructions.md 初始化文件，是咋生成的来着？",
+  "source": "cs|copilot|9a8d6",
+  "answer_set": [
+   "cs|copilot|9a8d6"
+  ],
+  "topic": "给Android项目生成copilot-instructions.md初始化文件",
+  "agent": "copilot"
+ },
+ {
+  "q": "我那台 PJE110 手机跑起来又卡顿又发热、上下文还短，当时特化调优是咋弄的？",
+  "source": "cs|legacy|cs/codex/01a05c",
+  "answer_set": [
+   "cs|legacy|cs/codex/01a05c"
+  ],
+  "topic": "PJE110手机本地AI助手卡顿发热特化调优",
+  "agent": "legacy"
+ },
+ {
+  "q": "当时装 Android Studio 全放 D 盘、建 HelloWorld 还特意用 Java 不用 Kotlin，最后咋跑通的？",
+  "source": "cs|legacy|cs/codex/01a065",
+  "answer_set": [
+   "cs|legacy|cs/codex/01a065"
+  ],
+  "topic": "Android Studio全D盘部署与Java版HelloWorld",
+  "agent": "legacy"
+ },
+ {
+  "q": "live_sub 那个换成输出较高的音频就彻底宕机的问题，后来咋修的？能不能根据播放的音频实时自适应调参？",
+  "source": "cs|legacy|cs/grok/01a0b9",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a0b9",
+   "cs|legacy|cs/grok/ce:28",
+   "cs|legacy|cs/workbuddy/1d4"
+  ],
+  "topic": "live_sub高音量宕机修复与自适应切段",
+  "agent": "legacy"
+ },
+ {
+  "q": "asmr.one 的数据在本机做微调那个事，有中文和日语双语字幕的升级到最高级，后来弄成啥样了？",
+  "source": "cs|zcode|sess_17",
+  "answer_set": [
+   "cs|zcode|sess_17"
+  ],
+  "topic": "asmr.one微调数据准备与双语字幕升级",
+  "agent": "zcode"
+ },
+ {
+  "q": "项目测试当时为啥用 pytest？单元测试回归测试集成测试契约测试那几层补到啥程度了？",
+  "source": "cs|zcode|sess_c74",
+  "answer_set": [
+   "cs|zcode|sess_c74",
+   "cs|legacy|cs/zcode/sess_2"
+  ],
+  "topic": "asmr项目pytest测试体系分层搭建",
+  "agent": "zcode"
+ },
+ {
+  "q": "我自己的数据集微调之后，怎么评判模型没废掉反而是性能提升了？当时那个测试集咋测的来着？",
+  "source": "cs|zcode|sess_cda",
+  "answer_set": [
+   "cs|zcode|sess_cda",
+   "cs|legacy|cs/antigravity/ce",
+   "cs|legacy|cs/antigravity/a3"
+  ],
+  "topic": "微调后模型性能评判与测试集可信度",
+  "agent": "zcode"
+ },
+ {
+  "q": "全链路自动完成求职那个流程，岗位名额不写死、按背景匹配动态调整数量，当时咋设计的？",
+  "source": "cs|legacy|cs/grok/01a0847",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a0847",
+   "cs|legacy|cs/grok/ce:b9"
+  ],
+  "topic": "全链路自动化求职流程与动态岗位名额设计",
+  "agent": "legacy"
+ },
+ {
+  "q": "按 ats-scanner-prompt 核对 review-ats 那个 pack，matcher 可提取性最后咋判的？",
+  "source": "cs|legacy|cs/grok/01a084fe-2603-7ea3-b266-2f9",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a084fe-2603-7ea3-b266-2f9",
+   "cs|legacy|cs/grok/ce:87"
+  ],
+  "topic": "ATS角色说明书核对pack的matcher可提取性",
+  "agent": "legacy"
+ },
+ {
+  "q": "ATS 扫描打分那次，为啥不让五维分覆盖 matcher 的分数？这个规矩当时咋定的来着？",
+  "source": "cs|legacy|cs/grok/01a08502-9a51-70d3-b4b6-2df",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a08502-9a51-70d3-b4b6-2df",
+   "cs|legacy|cs/grok/ce:87",
+   "cs|legacy|cs/grok/ce:fe",
+   "cs|legacy|cs/grok/01a084fe-2603-7ea3-b266-2f9"
+  ],
+  "topic": "ATS评分JSON与五维分/matcher分数规则",
+  "agent": "legacy"
+ },
+ {
+  "q": "只做 JD 条款和证据对照、不改简历不评分那次，clause-map 最后咋覆盖全部条款的？",
+  "source": "cs|legacy|cs/grok/01a0850f",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a0850f",
+   "cs|legacy|cs/grok/ce:71",
+   "cs|legacy|cs/grok/ce:ac"
+  ],
+  "topic": "JD条款×证据对照生成clause-map",
+  "agent": "legacy"
+ },
+ {
+  "q": "校招自动填表那个插件，底稿模块放开随意改、存储用覆盖还是各存一份，当时咋权衡的？后来 TDD 开发跑通没？",
+  "source": "cs|legacy|cs/grok/01a0b2a",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a0b2a",
+   "cs|legacy|cs/grok/ce:c7",
+   "cs|legacy|cs/grok/ce:a2",
+   "cs|legacy|cs/grok/ce:4f",
+   "cs|legacy|cs/grok/01a0b2b",
+   "cs|legacy|cs/grok/01a0b3"
+  ],
+  "topic": "校招自动填表插件底稿模块放开与TDD改造",
+  "agent": "legacy"
+ },
+ {
+  "q": "Azure 学生额度开 Ubuntu 虚拟机、部署 RustDesk 中继给平板远程控制那事，链接时灵时不灵最后咋解决的？",
+  "source": "cs|zcode|sess_ca",
+  "answer_set": [
+   "cs|zcode|sess_ca"
+  ],
+  "topic": "Azure学生VM创建与RustDesk中继部署",
+  "agent": "zcode"
+ },
+ {
+  "q": "report-deepread-quality 那个质量报告脚本当时咋写的？质量报告文件最后长啥样？",
+  "source": "cs|grok|019f6d9c-8c9",
+  "answer_set": [
+   "cs|grok|019f6d9c-8c9"
+  ],
+  "topic": "GSD Phase5深读质量报告脚本report-deepread-quality",
+  "agent": "grok"
+ },
+ {
+  "q": "BATCH-001 那批歌重写成专属乐评深读、不要模板那次，都有啥要求来着？最后验证过没？",
+  "source": "cs|grok|019f6da8-b89",
+  "answer_set": [
+   "cs|grok|019f6da8-b89",
+   "cs|grok|019f6dad-1a8",
+   "cs|grok|019f6dad-1ac"
+  ],
+  "topic": "BATCH-001专属乐评深读重写与验证",
+  "agent": "grok"
+ },
+ {
+  "q": "BATCH-005 重写那次，Start 演唱会变体的歌词只能用 raw-lyrics 是咋处理的？",
+  "source": "cs|grok|019f6da8-b9a",
+  "answer_set": [
+   "cs|grok|019f6da8-b9a"
+  ],
+  "topic": "BATCH-005重写与Start演唱会变体raw-lyrics约束",
+  "agent": "grok"
+ },
+ {
+  "q": "BATCH-007 那批 editorial 深读，npm run verify:deepread-batch 跑到退出码 0 是咋整的？",
+  "source": "cs|grok|019f6dad-1c1",
+  "answer_set": [
+   "cs|grok|019f6dad-1c1",
+   "cs|grok|019f6dbb-578"
+  ],
+  "topic": "BATCH-007 editorial深读升级与verify脚本校验",
+  "agent": "grok"
+ },
+ {
+  "q": "BATCH-008 那三首深读，someone 和 someone-start-concert 是咋区分开的？body 加到多少来着？",
+  "source": "cs|grok|019f6db7-3c9",
+  "answer_set": [
+   "cs|grok|019f6db7-3c9",
+   "cs|grok|019f6dbb-57c",
+   "cs|grok|019f6da8-ba6"
+  ],
+  "topic": "BATCH-008深读someone变体区分与body加厚",
+  "agent": "grok"
+ },
+ {
+  "q": "在 H 盘工具U盘里只给 GPU-Z 写界面档案那次，截图和 uitree 咋采集的？map.json 按啥规范写的？",
+  "source": "cs|legacy|cs/grok/01a0418d-9e96-7f23-a3a5-fb4",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a0418d-9e96-7f23-a3a5-fb4",
+   "cs|legacy|cs/grok/ce:59"
+  ],
+  "topic": "H盘GPU-Z界面档案采集（截图+uitree+map.json）",
+  "agent": "legacy"
+ },
+ {
+  "q": "HWiNFO64 传感器窗补录那次，启动框老点不中是咋绕过的？后来 map.json 更新了啥？",
+  "source": "cs|legacy|cs/grok/01a041bb-7bc8",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a041bb-7bc8",
+   "cs|legacy|cs/grok/ce:15"
+  ],
+  "topic": "HWiNFO64传感器窗补录与启动框点击修复",
+  "agent": "legacy"
+ },
+ {
+  "q": "xAI Grok Build 那个对抗性验证，拿不准就默认 refuted true，最后目标到底驳没驳回？",
+  "source": "cs|legacy|cs/grok/01a0426",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a0426"
+  ],
+  "topic": "xAI Grok Build工具链对抗性验证（判定不通过）",
+  "agent": "legacy"
+ },
+ {
+  "q": "Grok Build harness 验证那次，40 个 ID 的 map、截图、catalog、INDEX 匹配性咋核的？",
+  "source": "cs|legacy|cs/grok/01a05365-0f7f-7473-bb32-fca",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a05365-0f7f-7473-bb32-fca",
+   "cs|legacy|cs/grok/ce:d5",
+   "cs|legacy|cs/grok/ce:bac",
+   "cs|legacy|cs/grok/ce:3a",
+   "cs|legacy|cs/grok/01a05365-0f7f-7473-bb32-fc9"
+  ],
+  "topic": "Grok Build工具录入对抗验证40个ID catalog核对",
+  "agent": "legacy"
+ },
+ {
+  "q": "笔记本老蓝屏那事儿，我把驱动卸了还是蓝屏，后来到底查出啥原因了？",
+  "source": "cs|codex|019d61d",
+  "answer_set": [
+   "cs|codex|019d61d",
+   "cs|codex|019d60f",
+   "cs|workbuddy|762",
+   "cs|codex|019d565"
+  ],
+  "topic": "笔记本蓝屏0x00000119驱动排查",
+  "agent": "codex"
+ },
+ {
+  "q": "补齐缺失歌词、建解读风格审计那个并行子任务，当时咋分工弄完的？",
+  "source": "cs|codex|019d75ed-d4e",
+  "answer_set": [
+   "cs|codex|019d75ed-d4e"
+  ],
+  "topic": "shang-bu-liao歌词补录与解读风格审计",
+  "agent": "codex"
+ },
+ {
+  "q": "ni-hao-bu-hao、on-the-road 那几首歌专辑分类定不下来，当时咋处理的？",
+  "source": "cs|codex|019d76bb-0e1",
+  "answer_set": [
+   "cs|codex|019d76bb-0e1",
+   "cs|codex|019d76bb-0d"
+  ],
+  "topic": "孙燕姿三首歌专辑重分类未解决JSON",
+  "agent": "codex"
+ },
+ {
+  "q": "当时想把 clash 的安装包安全分享给别人，SHA256 校验值咋生成的来着？",
+  "source": "cs|codex|019da8a",
+  "answer_set": [
+   "cs|codex|019da8a"
+  ],
+  "topic": "Clash安装包安全分享与SHA256校验",
+  "agent": "codex"
+ },
+ {
+  "q": "opencode 里配置本地 Ollama 模型的方法，当时是读哪个文件查到的？",
+  "source": "cs|legacy|cs/opencode/ses_297b5",
+  "answer_set": [
+   "cs|legacy|cs/opencode/ses_297b5"
+  ],
+  "topic": "opencode本地Ollama模型配置方法",
+  "agent": "legacy"
+ },
+ {
+  "q": "Git Bash 里 oh-my-zsh 前面老显示不明符号，字体装好之后你帮我配置的，最后咋弄好的？",
+  "source": "cs|mimo|ses_13e60",
+  "answer_set": [
+   "cs|mimo|ses_13e60",
+   "cs|mimo|ses_13e5",
+   "cs|mimo|ses_13e6c"
+  ],
+  "topic": "Git Bash oh-my-zsh乱码与Nerd Font配置",
+  "agent": "mimo"
+ },
+ {
+  "q": "知识图谱链路实跑验证那次，说好不改业务代码，最后全链路走通没？卡在哪儿？",
+  "source": "cs|codex|019f22e",
+  "answer_set": [
+   "cs|codex|019f22e"
+  ],
+  "topic": "Phase 04知识图谱链路实跑验证与阻塞点",
+  "agent": "codex"
+ },
+ {
+  "q": "严格限时、不做额外研究，生成恰好 Phase08 六个 PLAN 文件那次，最后都交出来没？",
+  "source": "cs|codex|019f5957",
+  "answer_set": [
+   "cs|codex|019f5957",
+   "cs|codex|019f206",
+   "cs|codex|019f5962"
+  ],
+  "topic": "限时生成Phase08六个PLAN计划文件",
+  "agent": "codex"
+ },
+ {
+  "q": "执行 08-04 计划做 timeline 前后端那次，我在 api.ts 里的改动是咋保住没被覆盖的？",
+  "source": "cs|codex|019f599",
+  "answer_set": [
+   "cs|codex|019f599"
+  ],
+  "topic": "08-04 timeline前后端与api.ts用户改动保护",
+  "agent": "codex"
+ },
+ {
+  "q": "按 GSD 规范做技术栈调研那次，RAPTOR、GraphRAG 和层级检索的适配边界咋定的？",
+  "source": "cs|codex|019f6516",
+  "answer_set": [
+   "cs|codex|019f6516",
+   "cs|codex|019f6517-a"
+  ],
+  "topic": "RAPTOR/GraphRAG技术栈调研与层级检索边界",
+  "agent": "codex"
+ },
+ {
+  "q": "Phase 16 补全缺失测试、修失败用例那次，不让 git add -A、只暂存相关文件最后咋执行的？",
+  "source": "cs|grok|019f69ce",
+  "answer_set": [
+   "cs|grok|019f69ce",
+   "cs|grok|019f6995"
+  ],
+  "topic": "Phase 16补测试与git暂存约束执行",
+  "agent": "grok"
+ },
+ {
+  "q": "narrative_memory 从 13 到 17 那几个 phase 的全量测试，最后精确计数是多少来着？",
+  "source": "cs|grok|019f69ee-b07f",
+  "answer_set": [
+   "cs|grok|019f69ee-b07f",
+   "cs|grok|019f69ee-b07e"
+  ],
+  "topic": "narrative_memory Phase13-17全量测试计数",
+  "agent": "grok"
+ },
+ {
+  "q": "多层小说分析那个非代码落地方案，计算逻辑自下而上、呈现自上而下，层级不固定三层，当时咋定的？",
+  "source": "cs|grok|019f6b75-f799",
+  "answer_set": [
+   "cs|grok|019f6b75-f799",
+   "cs|grok|019f6b79-27db",
+   "cs|grok|019f6b79-27da"
+  ],
+  "topic": "多层小说分析非代码落地方案（自下而上计算）",
+  "agent": "grok"
+ },
+ {
+  "q": "这项目里有啥适合夜间持续跑、白天验收的活儿？当时评估的结论是啥？",
+  "source": "cs|zcode|sess_5c",
+  "answer_set": [
+   "cs|zcode|sess_5c",
+   "cs|zcode|sess_60"
+  ],
+  "topic": "夜间持续跑白天验收任务评估",
+  "agent": "zcode"
+ },
+ {
+  "q": "小说分析管线卡住、后端端口冲突那次，诊断下来是啥问题？分析质量咋说的？",
+  "source": "cs|zcode|sess_b4",
+  "answer_set": [
+   "cs|zcode|sess_b4",
+   "cs|zcode|sess_93"
+  ],
+  "topic": "小说分析管线卡住与后端端口冲突诊断",
+  "agent": "zcode"
+ },
+ {
+  "q": "当时 CI 一直红到底为啥？还有作为公开仓库，脱敏情况后来查的咋样？",
+  "source": "cs|zcode|sess_c9c",
+  "answer_set": [
+   "cs|zcode|sess_c9c",
+   "cs|legacy|cs/codex/01a028",
+   "cs|zcode|sess_74",
+   "cs|legacy|cs/workbuddy/b0"
+  ],
+  "topic": "NovelMind CI红因排查与公开仓库脱敏评估",
+  "agent": "zcode"
+ },
+ {
+  "q": "ai-memory 系统初始化那个事，V1 的 schema、生命周期、检索当时补齐没？",
+  "source": "cs|codex|019d4c3",
+  "answer_set": [
+   "cs|codex|019d4c3",
+   "cs|codex|019dba25-a",
+   "cs|codex|019d4be5-c3",
+   "cs|codex|019d4bfc-13",
+   "cs|codex|019d4be5-c6"
+  ],
+  "topic": "AI-Memory系统初始化与V1基础补齐",
+  "agent": "codex"
+ },
+ {
+  "q": "我的 memory 系统里是不是有 rag 项目里的那些内容？当时看完 rag 项目咋对比的来着？",
+  "source": "cs|codex|019d58a",
+  "answer_set": [
+   "cs|codex|019d58a"
+  ],
+  "topic": "AI-Memory与rag项目内容对比",
+  "agent": "codex"
+ },
+ {
+  "q": "那个写博客的项目，AI 后来改成默认用本地的了，当时是咋切的？.planning 里咋计划的？",
+  "source": "cs|codex|019d610",
+  "answer_set": [
+   "cs|codex|019d610"
+  ],
+  "topic": "博客项目AI网关默认切本地",
+  "agent": "codex"
+ },
+ {
+  "q": "最新的那个 jav 模型为啥这么火？不就是判断置信度的吗，跟通用大模型的区别到底是啥？",
+  "source": "cs|antigravity|d",
+  "answer_set": [
+   "cs|antigravity|d",
+   "cs|zcode|sess_29d3"
+  ],
+  "topic": "jav(Jev)验证模型原理与通用大模型区别",
+  "agent": "antigravity"
+ },
+ {
+  "q": "苏格拉底式的提问学习方法、用自己的语言复述，为啥这种学习方法有效？当时还聊了哪些类似的？",
+  "source": "cs|chatgpt|69ff2",
+  "answer_set": [
+   "cs|chatgpt|69ff2",
+   "cs|legacy|cs/chatgpt/chatgpt:69ff"
+  ],
+  "topic": "苏格拉底式提问与复述式学习方法讨论",
+  "agent": "chatgpt"
+ },
+ {
+  "q": "idea 里没有 org.json 那个包，我那段 Java 代码当时咋改才能跑起来？jar 直接下载咋弄的？",
+  "source": "cs|chatgpt|b32bf",
+  "answer_set": [
+   "cs|chatgpt|b32bf",
+   "cs|legacy|cs/chatgpt/chatgpt:b3"
+  ],
+  "topic": "新大陆云Java代码org.json适配IDEA",
+  "agent": "chatgpt"
+ },
+ {
+  "q": "PyQt 的 QLabel 点击后图片能动起来那个咋写的？还有视频监控推流监听 8888 端口那个弄完没？",
+  "source": "cs|chatgpt|dc04c",
+  "answer_set": [
+   "cs|chatgpt|dc04c",
+   "cs|legacy|cs/chatgpt/chatgpt:dc"
+  ],
+  "topic": "PyQt QLabel点击动图与视频推流8888端口",
+  "agent": "chatgpt"
+ },
+ {
+  "q": "个人决策 cockpit 那次硬化审计，按 a11y、响应式、状态模型、隐私清单逐项核查，最后修了哪些真实 GAP？",
+  "source": "cs|kimi|wd_workspace_4945bab4034d:agent-10",
+  "answer_set": [
+   "cs|kimi|wd_workspace_4945bab4034d:agent-10"
+  ],
+  "topic": "个人决策cockpit硬化审计与GAP修复",
+  "agent": "kimi"
+ },
+ {
+  "q": "L1 L2 现在的查重逻辑到底合理不？要不要交叉查重？还有 12000 字符上限是不是太少了？",
+  "source": "cs|kimi|wd_workspace_4945bab4034d:main:session_d",
+  "answer_set": [
+   "cs|kimi|wd_workspace_4945bab4034d:main:session_d",
+   "cs|zcode|sess_8f"
+  ],
+  "topic": "知识单元L1/L2查重逻辑与12000字符上限",
+  "agent": "kimi"
+ },
+ {
+  "q": "端侧离线大模型那个安卓方向，我觉得 coloros 的小布助手都能做，我的还有啥做的必要？当时咋聊的？",
+  "source": "cs|legacy|cs/antigravity/b6",
+  "answer_set": [
+   "cs|legacy|cs/antigravity/b6"
+  ],
+  "topic": "安卓端侧离线大模型必要性与小布助手对比",
+  "agent": "legacy"
+ },
+ {
+  "q": "按 bounce 事实包改简历那次，2027 届、无锡到岗这些信息是咋写进去的？",
+  "source": "cs|legacy|cs/grok/ce:02",
+  "answer_set": [
+   "cs|legacy|cs/grok/ce:02",
+   "cs|legacy|cs/grok/ce:e2"
+  ],
+  "topic": "bounce事实包改简历（2027届无锡到岗）",
+  "agent": "legacy"
+ },
+ {
+  "q": "sync.py 的 --compress-new 是不是只在 --write 成功后才调的？dry-run 绝不 subprocess 那个咋核的？",
+  "source": "cs|legacy|cs/grok/ce:6dc7",
+  "answer_set": [
+   "cs|legacy|cs/grok/ce:6dc7",
+   "cs|legacy|cs/grok/01a05b7d-d9dd-7a70-8374-334"
+  ],
+  "topic": "sync.py --compress-new调用时机与dry-run核查",
+  "agent": "legacy"
+ },
+ {
+  "q": "校园 HR 那个契约评审，按 campus-hr-prompt 的 JSON 契约输出，最后咋写的来着？",
+  "source": "cs|legacy|cs/grok/ce:745",
+  "answer_set": [
+   "cs|legacy|cs/grok/ce:745",
+   "cs|legacy|cs/grok/ce:3c"
+  ],
+  "topic": "campus-hr-prompt契约评审输出",
+  "agent": "legacy"
+ },
+ {
+  "q": "DSH 会话存储那个错误结论后来纠偏了，本地持久化路径到底是啥来着？",
+  "source": "cs|legacy|cs/workbuddy/8e7",
+  "answer_set": [
+   "cs|legacy|cs/workbuddy/8e7",
+   "cs|legacy|cs/workbuddy/b7"
+  ],
+  "topic": "DSH会话存储结论纠偏与本地持久化路径",
+  "agent": "legacy"
+ },
+ {
+  "q": "往小米手环 8Pro 里装小软件咋开发来着？手环数据支不支持导出，不支持咋第三方弄？",
+  "source": "cs|qoder|a0ee993",
+  "answer_set": [
+   "cs|qoder|a0ee993",
+   "cs|legacy|cs/qoder/a"
+  ],
+  "topic": "小米手环8Pro开发与数据导出",
+  "agent": "qoder"
+ },
+ {
+  "q": "当时问 PackyCode 站点的 api 请求地址是多少、有几个那个更稳，最后用的哪个来着？",
+  "source": "cs|workbuddy|243",
+  "answer_set": [
+   "cs|workbuddy|243"
+  ],
+  "topic": "PackyCode站点api请求地址选型",
+  "agent": "workbuddy"
+ },
+ {
+  "q": "编译原理那几个实验最后打包成可执行文件咋弄的？还有虚拟机网络 NAT 没用上那次咋回事？",
+  "source": "cs|workbuddy|f3e",
+  "answer_set": [
+   "cs|workbuddy|f3e"
+  ],
+  "topic": "编译原理实验打包与虚拟机NAT配置",
+  "agent": "workbuddy"
+ },
+ {
+  "q": "当时扫一个仓库把技术栈、外部集成写进 STACK.md 和 INTEGRATIONS.md 那个活儿，咋要求的来着？",
+  "source": "cs|codex|019f122c-8",
+  "answer_set": [
+   "cs|codex|019f122c-8",
+   "cs|claude|10a329",
+   "cs|grok|019f68b2-f266-7b60-8a5d-84c",
+   "cs|grok|019f6d89-bac",
+   "cs|legacy|cs/workbuddy/cb0"
+  ],
+  "topic": "宠物医院仓库技术栈扫描写STACK/INTEGRATIONS",
+  "agent": "codex"
+ },
+ {
+  "q": "Phase 2 主数据 API 那次，department、medicine 那些实体和 /api/admin/ 管理接口咋统一的？",
+  "source": "cs|codex|019f1354-7",
+  "answer_set": [
+   "cs|codex|019f1354-7",
+   "cs|codex|019f1369"
+  ],
+  "topic": "Phase 2主数据API与/api/admin/接口统一",
+  "agent": "codex"
+ },
+ {
+  "q": "Phase 5 前端视觉重构验收那次，UI-01 到 UI-06 最后都算被代码覆盖了没？",
+  "source": "cs|codex|019f164",
+  "answer_set": [
+   "cs|codex|019f164",
+   "cs|codex|019f0d8",
+   "cs|codex|019f1871"
+  ],
+  "topic": "Phase 5前端视觉验收UI-01..UI-06覆盖",
+  "agent": "codex"
+ },
+ {
+  "q": "首页信任卡片、服务入口四卡片缺图那次，用项目已有的宠物医生图片咋补的？",
+  "source": "cs|codex|019f280f-b",
+  "answer_set": [
+   "cs|codex|019f280f-b",
+   "cs|codex|019f0d8"
+  ],
+  "topic": "首页信任卡片与服务入口缺图修复",
+  "agent": "codex"
+ },
+ {
+  "q": "/doctors 页面顶部 hero 缺医生和动物图片那次咋补的？那几段原型说明文字最后删了没？",
+  "source": "cs|codex|019f281",
+  "answer_set": [
+   "cs|codex|019f281",
+   "cs|codex|019f0d8"
+  ],
+  "topic": "/doctors hero补图与原型说明删除",
+  "agent": "codex"
+ },
+ {
+  "q": "清理测试数据、保留一个月的正常医院真实数据那个事，落实到 GSD 文档咋执行的？",
+  "source": "cs|zcode|sess_c91",
+  "answer_set": [
+   "cs|zcode|sess_c91"
+  ],
+  "topic": "清理测试数据保留一个月真实数据并落实GSD",
+  "agent": "zcode"
+ },
+ {
+  "q": "T5AI 板子 UI 竖屏改横屏、数值不显示，连“爆炸”三个字都显示不全，那次咋修好的？",
+  "source": "cs|codex|019eb1c",
+  "answer_set": [
+   "cs|codex|019eb1c",
+   "cs|codex|019ea0d"
+  ],
+  "topic": "T5AI横屏UI与爆炸中文显示修复",
+  "agent": "codex"
+ },
+ {
+  "q": "PWA 安卓阶段那个 GSD 计划修订，按流程先核对检查报告再只改规划文档，当时咋走的？",
+  "source": "cs|codex|019f63fd",
+  "answer_set": [
+   "cs|codex|019f63fd",
+   "cs|codex|019f640",
+   "cs|codex|019f63ff-d"
+  ],
+  "topic": "PWA安卓阶段GSD计划修订流程",
+  "agent": "codex"
+ },
+ {
+  "q": "Agent Hub 那个 PWA 里 codex 项目全部显示未分组、zcode 条数为 0，那个 bug 当时咋回事？",
+  "source": "cs|grok|019f679e",
+  "answer_set": [
+   "cs|grok|019f679e"
+  ],
+  "topic": "Agent Hub PWA中codex未分组与zcode条数为0排查",
+  "agent": "grok"
+ },
+ {
+  "q": "我那个多会话跨会话提炼内容、拼凑我个人思考和成长经历的需求，当时咋落地的？",
+  "source": "cs|legacy|cs/zcode/sess_d",
+  "answer_set": [
+   "cs|legacy|cs/zcode/sess_d"
+  ],
+  "topic": "跨会话提炼个人思考与成长经历（Pi Agent/AgentView）",
+  "agent": "legacy"
+ },
+ {
+  "q": "每次让 Codex 用子代理都没法指定 gpt-5.6-luna 当模型，那事儿最后咋解决的？",
+  "source": "cs|zcode|sess_0aa",
+  "answer_set": [
+   "cs|zcode|sess_0aa",
+   "cs|codex|019f49b0-a"
+  ],
+  "topic": "Codex子代理无法指定gpt-5.6-luna排查",
+  "agent": "zcode"
+ },
+ {
+  "q": "DevSpace 当时咋跟我的 gpt 连上的？还有本地 mcp 老断联，查出来是啥原因？",
+  "source": "cs|zcode|sess_35",
+  "answer_set": [
+   "cs|zcode|sess_35"
+  ],
+  "topic": "DevSpace接入ChatGPT与本地MCP断联排查",
+  "agent": "zcode"
+ },
+ {
+  "q": "MAA 定时启动刷玉那个时间表当时咋定的？MAA 到底装在哪了来着？",
+  "source": "cs|zcode|sess_3e6",
+  "answer_set": [
+   "cs|zcode|sess_3e6"
+  ],
+  "topic": "MAA定时刷玉时间表与安装位置",
+  "agent": "zcode"
+ },
+ {
+  "q": "Wallpaper Engine 那些壁纸工艺能不能用 AI 做？工具支不支持接入 AI 或者 MCP，当时咋查的？",
+  "source": "cs|zcode|sess_55",
+  "answer_set": [
+   "cs|zcode|sess_55"
+  ],
+  "topic": "Wallpaper Engine壁纸工艺AI/MCP接入可行性",
+  "agent": "zcode"
+ },
+ {
+  "q": "Phase 07 目标倒推验收那次，Wave 9/10 跟前几个 Phase 和三库设计冲突没？",
+  "source": "cs|codex|019f110",
+  "answer_set": [
+   "cs|codex|019f110"
+  ],
+  "topic": "Phase 07目标倒推验收与Wave 9/10冲突核查",
+  "agent": "codex"
+ },
+ {
+  "q": "codebase-memory-mcp 接进 Codex 那次，MCP 到底生效没？它那个 SQLite 图建图用不用 LLM？",
+  "source": "cs|codex|019f1dc5",
+  "answer_set": [
+   "cs|codex|019f1dc5"
+  ],
+  "topic": "codebase-memory-mcp接入Codex与SQLite建图原理",
+  "agent": "codex"
+ },
+ {
+  "q": "执行 Phase 14 的正式 GSD 规划那次，子代理不让用 5.6sol，最后整个阶段咋跑完验收的？",
+  "source": "cs|codex|019f49a",
+  "answer_set": [
+   "cs|codex|019f49a",
+   "cs|zcode|sess_22"
+  ],
+  "topic": "Phase 14 GSD规划执行验收（子代理禁用5.6sol）",
+  "agent": "codex"
+ },
+ {
+  "q": "13.5 和 14 阶段规划文件一致性检查那次，blocker 和验证缺口都查出啥了？",
+  "source": "cs|codex|019f4a0",
+  "answer_set": [
+   "cs|codex|019f4a0",
+   "cs|zcode|sess_22"
+  ],
+  "topic": "13.5/14规划文件一致性检查与验证缺口",
+  "agent": "codex"
+ },
+ {
+  "q": "修文档漂移那次，refresh_knowledge_units --inspect 换成 pk-ku 命令，都对齐了哪些文档来着？",
+  "source": "cs|grok|019f68c9-791a",
+  "answer_set": [
+   "cs|grok|019f68c9-791a",
+   "cs|grok|019f68c1-7a3e"
+  ],
+  "topic": "P1文档漂移修复对齐pk-sync/pk-ku CLI",
+  "agent": "grok"
+ },
+ {
+  "q": "pk-ku canary 那个 --label-with-llm 命令当时咋实现的？FAIL 禁止强制推广那条咋卡的？",
+  "source": "cs|grok|019f6912-92f5",
+  "answer_set": [
+   "cs|grok|019f6912-92f5",
+   "cs|grok|019f68c9-7917"
+  ],
+  "topic": "pk-ku canary --label-with-llm实现与FAIL门禁",
+  "agent": "grok"
+ },
+ {
+  "q": "当时把所有旧数据先隔离那波，为啥说从杂乱旧数据里筛不如直接重建重新提取？你理解的 trace 是啥来着？",
+  "source": "cs|legacy|cs/codex/019ff3",
+  "answer_set": [
+   "cs|legacy|cs/codex/019ff3",
+   "cs|zcode|sess_794"
+  ],
+  "topic": "旧知识隔离、重建重新提取与trace口径",
+  "agent": "legacy"
+ },
+ {
+  "q": "第二大脑那套分层协同理念，说好是吸收进来不是引入四层新权威，那条检索链路后来接通没？",
+  "source": "cs|legacy|cs/grok/01a05b5",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a05b5",
+   "cs|legacy|cs/grok/ce:a1",
+   "cs|legacy|cs/grok/ce:662"
+  ],
+  "topic": "第二大脑分层理念吸收与检索链路接通",
+  "agent": "legacy"
+ },
+ {
+  "q": "Node 内核测试那次，conversation.reflection.stage 加进 allowlist 后 conversation-turn 有没有挂？",
+  "source": "cs|legacy|cs/grok/01a05b7d-d9dd-7a70-8374-333",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a05b7d-d9dd-7a70-8374-333",
+   "cs|legacy|cs/grok/ce:33",
+   "cs|legacy|cs/grok/ce:e7"
+  ],
+  "topic": "conversation.reflection.stage入allowlist内核测试",
+  "agent": "legacy"
+ },
+ {
+  "q": "跑指定 pytest 那次，sync.py 里 --compress-new 的调用时机和 dry-run 不碰 subprocess 咋核的？",
+  "source": "cs|legacy|cs/grok/01a05b7d-d9dd-7a70-8374-334",
+  "answer_set": [
+   "cs|legacy|cs/grok/01a05b7d-d9dd-7a70-8374-334",
+   "cs|legacy|cs/grok/ce:6dc7"
+  ],
+  "topic": "sync.py压缩新逻辑pytest核查",
+  "agent": "legacy"
+ },
+ {
+  "q": "当时把 C 盘的模型挪到 D 盘路径咋弄的？我说我是 4060 的 GPU，配置上咋定的来着？",
+  "source": "cs|zcode|sess_47",
+  "answer_set": [
+   "cs|zcode|sess_47"
+  ],
+  "topic": "C盘模型迁D盘与4060配置下的记忆层重构",
+  "agent": "zcode"
+ },
+ {
+  "q": "当时说不看分类、只给单个会话打标签，压出来的结构模板啥样？云端嵌入模型最多能吃多少 token？",
+  "source": "cs|zcode|sess_52",
+  "answer_set": [
+   "cs|zcode|sess_52"
+  ],
+  "topic": "单会话打标签压缩模板与云端嵌入token上限",
+  "agent": "zcode"
+ },
+ {
+  "q": "personal-data 那个 mcp 当时测试都能获取到啥数据来着？",
+  "source": "cs|zcode|sess_d7",
+  "answer_set": [
+   "cs|zcode|sess_d7",
+   "cs|zcode|sess_db",
+   "cs|codex|019f2b7"
+  ],
+  "topic": "personal-data MCP数据获取能力测试",
+  "agent": "zcode"
+ },
+ {
+  "q": "部署 TeleCodex 用 Telegram 调本机 Codex 那次，代理和认证的问题咋解决的？",
+  "source": "cs|codex|019d86b",
+  "answer_set": [
+   "cs|codex|019d86b"
+  ],
+  "topic": "TeleCodex部署Telegram调本机Codex（代理认证）",
+  "agent": "codex"
+ },
+ {
+  "q": "答辩 PPT 按论文四个阶段排版那次，每个阶段多少页、页面内容咋定的来着？",
+  "source": "cs|codex|019dfda",
+  "answer_set": [
+   "cs|codex|019dfda",
+   "cs|codex|019e0be"
+  ],
+  "topic": "开源大数据平台答辩PPT按论文四阶段排版",
+  "agent": "codex"
+ },
+ {
+  "q": "Python 期末速记版转 PDF 那次，第 04 章判断题里那些裸代码、**break** 标记的版式风险咋查的？",
+  "source": "cs|codex|019e8c15-d",
+  "answer_set": [
+   "cs|codex|019e8c15-d",
+   "cs|codex|019e8c16-0",
+   "cs|codex|019e8c15-1",
+   "cs|codex|019e8c15-9",
+   "cs|codex|019e8c23-e",
+   "cs|codex|019e8c23-b"
+  ],
+  "topic": "Python期末速记版第04章Markdown转PDF版式排查",
+  "agent": "codex"
+ },
+ {
+  "q": "Gemini CLI 官方免费额度当时查的是多少来着？Cloudflare Tunnel 绑域名咋配的？",
+  "source": "cs|legacy|cs/opencode/ses_288",
+  "answer_set": [
+   "cs|legacy|cs/opencode/ses_288",
+   "cs|legacy|cs/opencode/ses_278"
+  ],
+  "topic": "Gemini CLI免费额度与Cloudflare Tunnel绑域名",
+  "agent": "legacy"
+ },
+ {
+  "q": "Python 期末那些程序填空题合并文件、04 章预留位替换那次，最后总题数报的多少？",
+  "source": "cs|workbuddy|age",
+  "answer_set": [
+   "cs|workbuddy|age",
+   "cs|legacy|cs/workbuddy/fd",
+   "cs|workbuddy|c5b"
+  ],
+  "topic": "Python期末程序填空题合并与总题数汇报",
+  "agent": "workbuddy"
+ },
+ {
+  "q": "当时那个比较 self.nle.list 里所有对象名称的需求，后来又扯出安卓原生折线图只要显示变化不要全屏、Main2Activity 缺零参数构造器报错，那一串最后都咋解决的？",
+  "source": "cs|legacy|cs/chatgpt/chatgpt:adfe49e8-6f96-4ad4-965b-618e49d3e7ff",
+  "answer_set": [
+   "cs|legacy|cs/chatgpt/chatgpt:adfe49e8-6f96-4ad4-965b-618e49d3e7ff",
+   "cs|chatgpt|adfe49e8-6f96-4ad4-965b-618e49d3e7ff"
+  ],
+  "topic": "Python列表对象比较与安卓原生折线图初实现",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "让独立第三方盲测质检给双轨混合检索体系做真实水平评测那回，覆盖史莱姆、龙族那三本小说的 18 个基准用例，最后跑成啥样了？",
+  "source": "cs|legacy|cs/antigravity/7365a59e-89c1-4705-b732-304a84f221ce",
+  "answer_set": [
+   "cs|legacy|cs/antigravity/7365a59e-89c1-4705-b732-304a84f221ce"
+  ],
+  "topic": "双轨混合检索体系第三方盲测18用例",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "novel-mind-new 仓库修「文档漂移」那回，按 Kimi 漂移报告 agent-1 段落只改 docs/architecture 下 5 个文件，核实出哪些核心事实、改完没？",
+  "source": "cs|legacy|cs/workbuddy/98d151dc-099b-477c-8d52-e097e30ce125",
+  "answer_set": [
+   "cs|legacy|cs/workbuddy/98d151dc-099b-477c-8d52-e097e30ce125"
+  ],
+  "topic": "novel-mind-new文档漂移修复（Kimi报告agent-1）",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Seanime 前端中文本地化最后一个 plan 09-05 全局终扫那回，扫描命中远超 PLAN 预估，最后真漏网英文清成啥样了？",
+  "source": "cs|legacy|cs/workbuddy/6a304f5f-6d8e-4f17-a065-13fd2661506d",
+  "answer_set": [
+   "cs|legacy|cs/workbuddy/6a304f5f-6d8e-4f17-a065-13fd2661506d"
+  ],
+  "topic": "Seanime中文化Phase9全局终扫清残留",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "课程工作区那个 .planning 目录乱糟糟的整理那回，清了 7 张 tmp_vfy 临时图、把 course-skills 那几个目录整合成统一插件，还补了 5 条外部代码源映射，最后定成啥结构了？",
+  "source": "cs|legacy|cs/qoder/8a86dabe-9b7c-451f-8e9e-f6ec5fab3258",
+  "answer_set": [
+   "cs|legacy|cs/qoder/8a86dabe-9b7c-451f-8e9e-f6ec5fab3258",
+   "cs|qoder|37e981a8-c8f6-4d04-b44b-8a16819368cf"
+  ],
+  "topic": "课程工作区.planning整理与course-plugin整合",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "给 HWMonitor 写界面档案那回，只录主窗传感器树的 CPU/GPU/盘温度，中间更新框被 QQ PDF 挡住这些破事最后咋处理的？",
+  "source": "cs|legacy|cs/grok/ce:a726a88c53f9268e6e48462bad8db2028a27d6f521be0b9610d7c1620122a69e",
+  "answer_set": [
+   "cs|legacy|cs/grok/ce:a726a88c53f9268e6e48462bad8db2028a27d6f521be0b9610d7c1620122a69e"
+  ],
+  "topic": "HWMonitor界面档案编写与传感器树采集",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "宠物医院后台做只读逻辑漏洞审计那回，最后揪出的 Vaccine 接口缺角色校验那个越权漏洞是啥情况？",
+  "source": "cs|legacy|cs/workbuddy/02dd9c35-547f-4804-b4cd-a25d586f0237",
+  "answer_set": [
+   "cs|legacy|cs/workbuddy/02dd9c35-547f-4804-b4cd-a25d586f0237"
+  ],
+  "topic": "宠物医院后台Spring Boot只读审计IDOR",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "SmolChat Android 那次真机漏洞排查，二次启动卡死在「正在加载模型」的生命周期竞态缺陷，复现步骤和最终结论是啥？",
+  "source": "cs|legacy|cs/grok/ce:75ef2f1265d605d6e808dbfcec557081aa1e4bf30d4bd236547af4d6535617a0",
+  "answer_set": [
+   "cs|legacy|cs/grok/ce:75ef2f1265d605d6e808dbfcec557081aa1e4bf30d4bd236547af4d6535617a0"
+  ],
+  "topic": "SmolChat真机排查ChatActivity加载卡死缺陷",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "用 codex 装的那个技能给 C 盘做全面体检那回，AppData 独占 85.6GB，清完自动清理项释放了大概多少空间？",
+  "source": "cs|legacy|cs/qoder/b761e2ca-cf64-44e6-9bfe-0d264ca7b285",
+  "answer_set": [
+   "cs|legacy|cs/qoder/b761e2ca-cf64-44e6-9bfe-0d264ca7b285"
+  ],
+  "topic": "C盘体检清理释放21GB",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "ZCodeProxy 那个代理适配 Cline 工具调用的改造，proxy.js 透传 tools 和 tool_calls 那套最后跑通没有？",
+  "source": "cs|legacy|cs/codex/019fa92a-1917-76e0-bda9-c8138f3c4976",
+  "answer_set": [
+   "cs|legacy|cs/codex/019fa92a-1917-76e0-bda9-c8138f3c4976"
+  ],
+  "topic": "ZCodeProxy适配Cline工具调用",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Seanime 条目详情页 entry 目录中文化那回，torrent-stream-page 漏加 import、torrent-stream-overlay 局部变量 t 遮蔽这些坑是咋排的？",
+  "source": "cs|legacy|cs/workbuddy/77678257-9f4e-40d3-ba31-d8de72e09fef",
+  "answer_set": [
+   "cs|legacy|cs/workbuddy/77678257-9f4e-40d3-ba31-d8de72e09fef"
+  ],
+  "topic": "Seanime entry详情页中文化与torrent坑修复",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "那阵子搞 AI 视觉多模态，1080P 渲染实时检测 3D 骨骼和坐姿，还把 ActivityWatch 部署到 D 盘换了自定义界面，当时都落地成啥样了？",
+  "source": "cs|legacy|cs/antigravity/a483b5b1-77c0-4d37-a264-6a75e6bc29a6",
+  "answer_set": [
+   "cs|legacy|cs/antigravity/a483b5b1-77c0-4d37-a264-6a75e6bc29a6"
+  ],
+  "topic": "AI视觉多模态服务与ActivityWatch定制",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "做日文履历书那回，本人承诺下面署名要放右边、照片尺寸得对齐资料，还强调虚假信息一个字都不许有，最后出了哪几版？",
+  "source": "cs|legacy|cs/opencode/ses_292c7d370ffeCJiWdWq9nYMV1T",
+  "answer_set": [
+   "cs|legacy|cs/opencode/ses_292c7d370ffeCJiWdWq9nYMV1T"
+  ],
+  "topic": "中日双语求职简历制作与版式调整",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "NovelMind 托管那回，Heroku 那 312 刀学生优惠确认能用之后，前后端部署和三部小说的数据迁移最后咋落的？",
+  "source": "cs|legacy|cs/antigravity/8f608856-a7f5-4b56-9497-dd20319a4bb9",
+  "answer_set": [
+   "cs|legacy|cs/antigravity/8f608856-a7f5-4b56-9497-dd20319a4bb9"
+  ],
+  "topic": "NovelMind云端部署与小说数据迁移",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "那回扫码授权公益小程序做儿童素养教育计划捐赠，中间还碰上 429 频率限制，后面咋弄完的？",
+  "source": "cs|legacy|cs/workbuddy/6607f36d-cc59-4afe-9200-22afdd55ffe8",
+  "answer_set": [
+   "cs|legacy|cs/workbuddy/6607f36d-cc59-4afe-9200-22afdd55ffe8"
+  ],
+  "topic": "公益小程序授权与捐赠引导",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "seanime 里给 Asmr_Track 加 Completed 字段做完听状态回填那次 TDD 任务，先跑真实 RED 再到 GREEN 是咋走的？",
+  "source": "cs|legacy|cs/workbuddy/6359783a-1ead-4280-9455-0e4de1ef97f4",
+  "answer_set": [
+   "cs|legacy|cs/workbuddy/6359783a-1ead-4280-9455-0e4de1ef97f4"
+  ],
+  "topic": "seanime ASMR完听状态回填TDD",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "U 盘工作台交付那回，40 款工具加统一安全启动网关加 WPF 窗口，最后的使用方法是咋交代的？",
+  "source": "cs|legacy|cs/grok/ce:2b348a33284ff89a9d600cb7179dcadea6ac8051e25367681719d3a62c918725",
+  "answer_set": [
+   "cs|legacy|cs/grok/ce:2b348a33284ff89a9d600cb7179dcadea6ac8051e25367681719d3a62c918725"
+  ],
+  "topic": "U盘工作台交付与使用说明",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "鸣潮 MOD 从哪下载、外观 MOD 会不会封号那个咨询，还有 2026 巡回演唱会「致予新世界」的歌手名单，当时都查到啥了？",
+  "source": "cs|legacy|cs/chatgpt/chatgpt:6a60248d-5b88-83e8-ae7b-3eda481c4ad8",
+  "answer_set": [
+   "cs|legacy|cs/chatgpt/chatgpt:6a60248d-5b88-83e8-ae7b-3eda481c4ad8"
+  ],
+  "topic": "鸣潮MOD渠道与演唱会信息查询",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "那回问个人 agent 进度、几个 agent 是不是只是设定不同，顺带把 aimemo 初始化跑了一遍，当时结论是啥？",
+  "source": "cs|legacy|cs/opencode/ses_2acf46278ffeMahee0QdiaYV19",
+  "answer_set": [
+   "cs|legacy|cs/opencode/ses_2acf46278ffeMahee0QdiaYV19"
+  ],
+  "topic": "个人agent架构澄清与AI-Memory初始化",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "最早用记事本写批处理一键改文件后缀那个，ren *.txt *.md 想改成任何后缀都能用，最后给的啥方案？",
+  "source": "cs|legacy|cs/chatgpt/chatgpt:66dbe177-b35c-8013-8c52-2268365b4c84",
+  "answer_set": [
+   "cs|legacy|cs/chatgpt/chatgpt:66dbe177-b35c-8013-8c52-2268365b4c84",
+   "cs|chatgpt|66dbe177-b35c-8013-8c52-2268365b4c84"
+  ],
+  "topic": "记事本批处理批量改文件后缀",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "嫌每日简报老推舒适区内容陷进信息茧房，改成主线 50%、邻近 30%、远域 20% 那回，还聊了智能机器人产业该从哪层切入，当时定的啥？",
+  "source": "cs|legacy|cs/chatgpt/chatgpt:6a31e3f8-54cc-83ea-ad21-37afb302b5e7",
+  "answer_set": [
+   "cs|legacy|cs/chatgpt/chatgpt:6a31e3f8-54cc-83ea-ad21-37afb302b5e7",
+   "cs|chatgpt|6a31e3f8-54cc-83ea-ad21-37afb302b5e7"
+  ],
+  "topic": "每日简报反茧房配比与机器人产业切入",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "想拿手机 3D 扫描房子建模装修那回，Scaniverse 提示设备不适配，后来换的哪个、免费版够不够扫全家？",
+  "source": "cs|legacy|cs/chatgpt/chatgpt:6a8be19b-cf0c-83ee-b2bd-6af099be4e9f",
+  "answer_set": [
+   "cs|legacy|cs/chatgpt/chatgpt:6a8be19b-cf0c-83ee-b2bd-6af099be4e9f"
+  ],
+  "topic": "手机3D扫描房屋建模方案选型",
+  "agent": "legacy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Phase 07 验收报告的 C1/C2/C3 三个阻塞项修复那回，质量报告对齐到 164 个会话、Chroma 异常必须明确报 blocked，最后咋验收的？",
+  "source": "cs|codex|019f111a-70cd-7d01-aee6-a095a615690e",
+  "answer_set": [
+   "cs|codex|019f111a-70cd-7d01-aee6-a095a615690e"
+  ],
+  "topic": "Phase07验收阻塞项C1-C3修复",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "给 adlink8/Obsidian 建 GitHub Project 面板那回，Project #2 改名成啥、Issue #2 到 #11 的自定义字段咋补齐的？",
+  "source": "cs|codex|019ea718-fb1d-7471-9bdd-e6d9ebb4f9f6",
+  "answer_set": [
+   "cs|codex|019ea718-fb1d-7471-9bdd-e6d9ebb4f9f6"
+  ],
+  "topic": "GitHub Project面板搭建与Issue导入",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "宠物项目里 PetMapper.xml 的 type 错读成 breed 那个契约修复，type 和 breed 双字段回填不互相覆盖的规则最后咋定的？",
+  "source": "cs|codex|019f136f-bad4-7f60-aef6-9019949d7737",
+  "answer_set": [
+   "cs|codex|019f136f-bad4-7f60-aef6-9019949d7737"
+  ],
+  "topic": "宠物类型契约pet_type/breed双字段修复",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "NovelMind Phase 08 那份 08-AI-SPEC.md 的 AI 设计契约，「脚本编排、模型受限」的 Hybrid Extraction 是咋设计的？",
+  "source": "cs|codex|019f5946-4f20-70b0-8674-ee6acfceb50d",
+  "answer_set": [
+   "cs|codex|019f5946-4f20-70b0-8674-ee6acfceb50d"
+  ],
+  "topic": "Phase08 AI设计契约Hybrid Extraction",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "那回查 ChatGPT 额度顺便深扫 C 盘，Docker 明明迁到 D 盘了 C 盘还显示 18 个 G，junction 误算那事最后咋证实的？",
+  "source": "cs|codex|019f27a3-7042-74d1-9d1f-6e828658a135",
+  "answer_set": [
+   "cs|codex|019f27a3-7042-74d1-9d1f-6e828658a135"
+  ],
+  "topic": "Docker junction误算与C盘深扫",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Obsidian 库 08-01 那次只做最小闭环，新建 System/Library-Ops/README.md 锁定边界规则，最后 5 个文件 diff 核对结果咋样？",
+  "source": "cs|codex|019de361-386e-71a3-9eeb-4645c90fa35f",
+  "answer_set": [
+   "cs|codex|019de361-386e-71a3-9eeb-4645c90fa35f"
+  ],
+  "topic": "Obsidian 08-01最小闭环Library-Ops",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Target D 那次连着把 Phase 27-01 落了地，18 项定向测试加全仓 810 passed，当时剩余的核心卡点是啥？",
+  "source": "cs|codex|019f72d7-1e06-7730-8e78-81e618560655",
+  "answer_set": [
+   "cs|codex|019f72d7-1e06-7730-8e78-81e618560655"
+  ],
+  "topic": "Phase27-01落地与Target D剩余卡点",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Phase 25-01 给 A 层加不可变表和约束那回，20 项测试全过，当时跟 Phase 24 的人工门禁是咋划清边界的？",
+  "source": "cs|codex|019f70ed-2e4a-7023-ba45-f34d8e501c0f",
+  "answer_set": [
+   "cs|codex|019f70ed-2e4a-7023-ba45-f34d8e501c0f"
+  ],
+  "topic": "Phase25-01 A层不可变表落地",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "把 novel-mind 仓库 onboarding 到 GSD 那回，IMPLEMENTATION-STATUS.md 标了哪些状态、首个 active milestone 定的啥？",
+  "source": "cs|codex|019ec431-cc51-7ef3-91ad-3148e9cfd551",
+  "answer_set": [
+   "cs|codex|019ec431-cc51-7ef3-91ad-3148e9cfd551"
+  ],
+  "topic": "novel-mind GSD onboarding",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "补审计链 genesis 缺口那次，定向修订了 26-01、26-02、26-04 三份计划但没动 26-03，当时为啥这么切？",
+  "source": "cs|codex|019f7251-737f-7640-b751-cd63368844b9",
+  "answer_set": [
+   "cs|codex|019f7251-737f-7640-b751-cd63368844b9"
+  ],
+  "topic": "Phase26计划修订补genesis缺口",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "把 codex、workbuddy 那几个 agent 的全局配置合并成统一配置分发那回，配置间的冲突最后按啥规则处理的？",
+  "source": "cs|codex|019ecec7-cfbc-77d2-92a5-28ddf8d79a89",
+  "answer_set": [
+   "cs|codex|019ecec7-cfbc-77d2-92a5-28ddf8d79a89"
+  ],
+  "topic": "多agent配置合并unified-agent-config",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "执行 04-02 候选包与 LLM 判定计划那回，candidates、evidence、llm_judge 三个模块加 17 个测试，验证都过了啥？",
+  "source": "cs|codex|019f21ab-b132-70c3-8dde-d23bad597b62",
+  "answer_set": [
+   "cs|codex|019f21ab-b132-70c3-8dde-d23bad597b62"
+  ],
+  "topic": "04-02候选包与LLM判定实现",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "用 LLM 替代人工验收那次，决策链和主动智能在沙箱里演示跑通、live 主库没动，当时咋划的红线？",
+  "source": "cs|codex|019f8a6b-b44c-7c01-a947-5e722a66b180",
+  "answer_set": [
+   "cs|codex|019f8a6b-b44c-7c01-a947-5e722a66b180"
+  ],
+  "topic": "LLM替代人工验收与沙箱演示",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "novel-mind GSD plan 10-03 那回，服务端校验的 Unicode 选区和可见上下文组装是咋实现的？",
+  "source": "cs|grok|019f6349-e018-7c20-aae0-0c1cd796a9ed",
+  "answer_set": [
+   "cs|grok|019f6349-e018-7c20-aae0-0c1cd796a9ed"
+  ],
+  "topic": "plan10-03服务端选区校验与上下文组装",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "novel-mind v0.8 Phase 13-18 修复后复验那回，单元 176、集成 109、前端 172 全过，alembic head 对的哪个？",
+  "source": "cs|grok|019f6a04-140c-7772-acfe-79e76727baf7",
+  "answer_set": [
+   "cs|grok|019f6a04-140c-7772-acfe-79e76727baf7"
+  ],
+  "topic": "Phase13-18修复后复验",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "novel-mind 结构工作区 UAT 前审计那回，拿 novel_id=91 当样本查证据，结果发现 3000 端口根本不是前端服务，那是啥？",
+  "source": "cs|grok|019f6d8c-129d-7991-b845-64dc4cf27cd5",
+  "answer_set": [
+   "cs|grok|019f6d8c-129d-7991-b845-64dc4cf27cd5"
+  ],
+  "topic": "Structure Workspace UAT审计与端口排查",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "给数据分析仓库做 GSD 代码库映射那次，CONVENTIONS 和 TESTING 两个文件里 check_shim_budget 预期 tools 22 和 entrypoints 26 的差异是咋解释的？",
+  "source": "cs|grok|019f68b2-f266-7b60-8a5d-84e4cce94cab",
+  "answer_set": [
+   "cs|grok|019f68b2-f266-7b60-8a5d-84e4cce94cab"
+  ],
+  "topic": "GSD代码库映射CONVENTIONS/TESTING",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "BATCH-007 那批 6 首歌深度解读重写，验证脚本里歌词 ' / ' 分隔符去空格导致匹配失败那个坑，最后咋绕过去的？",
+  "source": "cs|grok|019f6da8-ba24-7e61-a461-e7c189fe0007",
+  "answer_set": [
+   "cs|grok|019f6da8-ba24-7e61-a461-e7c189fe0007"
+  ],
+  "topic": "BATCH-007深度解读重写与验证脚本坑",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "novel-mind Phase 15 全流程执行那回，15-01 到 15-03 共 59 个测试，实验入口默认关掉是咋处理的？",
+  "source": "cs|grok|019f6984-473b-7b40-ad7f-bf4986563df2",
+  "answer_set": [
+   "cs|grok|019f6984-473b-7b40-ad7f-bf4986563df2"
+  ],
+  "topic": "Phase15执行与实验入口默认关闭",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Phase 16 一口气做完 16-01 到 16-03 那回，迁移唯一约束、依赖图边去重这些问题是咋修的？",
+  "source": "cs|grok|019f69b1-69aa-72d1-857b-99eeac172c47",
+  "answer_set": [
+   "cs|grok|019f69b1-69aa-72d1-857b-99eeac172c47"
+  ],
+  "topic": "Phase16全流程与迁移约束修复",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "BATCH-013 那批 deep-read 升级成歌曲专属编辑内容，跑 verify:deepread-batch 直到 exit 0，当时卡过啥规则？",
+  "source": "cs|grok|019f6db1-1548-7683-82b0-f058fd8261d9",
+  "answer_set": [
+   "cs|grok|019f6db1-1548-7683-82b0-f058fd8261d9"
+  ],
+  "topic": "BATCH-013深度解读升级验证",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Phase 13 收尾那回，authority.py 的 async generator 表达式报错修完，13-03 的 provenance 和 manifests 也落了，验证结果咋样？",
+  "source": "cs|grok|019f695b-a5f2-7bd2-aea1-70370a6384d7",
+  "answer_set": [
+   "cs|grok|019f695b-a5f2-7bd2-aea1-70370a6384d7"
+  ],
+  "topic": "Phase13收尾与provenance落地",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "BATCH-009 那 6 首孙燕姿歌曲升级歌曲专属编辑内容那回，禁用脚手架短语、正文不少于 160 字这些规则最后全过没？",
+  "source": "cs|grok|019f6db1-1447-7ae1-b103-7bc79657c595",
+  "answer_set": [
+   "cs|grok|019f6db1-1447-7ae1-b103-7bc79657c595"
+  ],
+  "topic": "BATCH-009歌曲专属编辑升级",
+  "agent": "grok",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "那回聊「力工」这个词是不是中国互联网特产、国外咋看，最后给的政策产业链中间层工程人定位是咋说的？",
+  "source": "cs|chatgpt|6a26d27c-a1fc-83ea-8936-1b8688f6ee0a",
+  "answer_set": [
+   "cs|chatgpt|6a26d27c-a1fc-83ea-8936-1b8688f6ee0a",
+   "cs|legacy|cs/chatgpt/chatgpt:6a26d27c-a1fc-83ea-8936-1b8688f6ee0a"
+  ],
+  "topic": "力工现象讨论与职业路线定位",
+  "agent": "chatgpt",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "让整理个人使用画像好在不同 AI 工具间保持一致协作那回，明确只收长期记忆里客观存在的规则，最后画像都收了啥？",
+  "source": "cs|chatgpt|6a0966b9-f9a8-83ea-9109-9fcaf79ec91b",
+  "answer_set": [
+   "cs|chatgpt|6a0966b9-f9a8-83ea-9109-9fcaf79ec91b",
+   "cs|legacy|cs/chatgpt/chatgpt:6a0966b9-f9a8-83ea-9109-9fcaf79ec91b"
+  ],
+  "topic": "个人AI使用画像整理",
+  "agent": "chatgpt",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "安卓折线图那个 Timer-0 线程刷 UI 直接 CalledFromWrongThreadException 崩掉，runOnUiThread 那个解法当时咋给的？",
+  "source": "cs|chatgpt|8a471430-1279-4d60-a320-a25f9d30527b",
+  "answer_set": [
+   "cs|chatgpt|8a471430-1279-4d60-a320-a25f9d30527b",
+   "cs|legacy|cs/chatgpt/chatgpt:8a471430-1279-4d60-a320-a25f9d30527b"
+  ],
+  "topic": "安卓折线图线程异常排查",
+  "agent": "chatgpt",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "讨论 novel-mind 本质是不是 RAG 那回，向量化之后还需不需要知识图谱和混合检索，当时结论是啥？",
+  "source": "cs|chatgpt|6a2421be-cc24-83ea-b2da-9986be629eef",
+  "answer_set": [
+   "cs|chatgpt|6a2421be-cc24-83ea-b2da-9986be629eef",
+   "cs|legacy|cs/chatgpt/chatgpt:6a2421be-cc24-83ea-b2da-9986be629eef"
+  ],
+  "topic": "novel-mind RAG本质与知识图谱讨论",
+  "agent": "chatgpt",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "安卓自定义 ChartView 一直 ClassNotFoundException、包名对不上 com.example.newland 那回，加上 resource linking failed，最后咋排查的？",
+  "source": "cs|chatgpt|24959f58-f069-4a5f-8784-bdd94906daa3",
+  "answer_set": [
+   "cs|chatgpt|24959f58-f069-4a5f-8784-bdd94906daa3",
+   "cs|legacy|cs/chatgpt/chatgpt:24959f58-f069-4a5f-8784-bdd94906daa3"
+  ],
+  "topic": "ChartView类加载与资源链接报错排查",
+  "agent": "chatgpt",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "GitHub 学生优惠那一堆产品各属于哪个领域那回，最后给的 90 天 IoT 加 DevOps 外企路线图长啥样？",
+  "source": "cs|chatgpt|698de4a7-c0f0-832b-8cb3-a5edbebdd6ab",
+  "answer_set": [
+   "cs|chatgpt|698de4a7-c0f0-832b-8cb3-a5edbebdd6ab",
+   "cs|legacy|cs/chatgpt/chatgpt:698de4a7-c0f0-832b-8cb3-a5edbebdd6ab"
+  ],
+  "topic": "GitHub学生包梳理与IoT DevOps路线",
+  "agent": "chatgpt",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "ECharts 时间轴折线图死活不显示那回，x_time 数据转时间戳格式加容器初始化三步，最后咋跑通的？",
+  "source": "cs|chatgpt|62ab1eef-fe7c-4e5c-bfae-b2ddeeb311bb",
+  "answer_set": [
+   "cs|chatgpt|62ab1eef-fe7c-4e5c-bfae-b2ddeeb311bb",
+   "cs|legacy|cs/chatgpt/chatgpt:62ab1eef-fe7c-4e5c-bfae-b2ddeeb311bb"
+  ],
+  "topic": "ECharts时间折线图不显示排查",
+  "agent": "chatgpt",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "TP-Link 摄像头 PyQt5 客户端加人脸识别那回，face_recognition 库要装 dlib 装不上，最后用的啥替代？",
+  "source": "cs|chatgpt|d8073eba-38f9-412b-9e99-c70c5c81a993",
+  "answer_set": [
+   "cs|chatgpt|d8073eba-38f9-412b-9e99-c70c5c81a993",
+   "cs|legacy|cs/chatgpt/chatgpt:d8073eba-38f9-412b-9e99-c70c5c81a993"
+  ],
+  "topic": "PyQt5摄像头人脸识别库选型",
+  "agent": "chatgpt",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "给 5 个 Python 脚本加阿里巴巴 Java 手册风格中文注释那回，只加注释绝不碰逻辑，当时咋保证不破坏代码的？",
+  "source": "cs|workbuddy|d21e7bf4d11b4ccb957b9a12a2e63471",
+  "answer_set": [
+   "cs|workbuddy|d21e7bf4d11b4ccb957b9a12a2e63471"
+  ],
+  "topic": "Python脚本阿里规范中文注释",
+  "agent": "workbuddy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "查 Grok CLI 到底从哪读全局人格那回，compat.claude 顺带读的 ~/.claude 不算数，SOUL.md 最后落到哪个文件了？",
+  "source": "cs|workbuddy|d277a4c2-7cfc-48a9-8d22-2987ef6a789e",
+  "answer_set": [
+   "cs|workbuddy|d277a4c2-7cfc-48a9-8d22-2987ef6a789e"
+  ],
+  "topic": "Grok CLI全局指令位置确认",
+  "agent": "workbuddy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "6 个 Java 实验报告批量补截图标注和心得那回，Python 脚本正则老匹配不上，最后插到 w:sectPr 之前是咋定的？",
+  "source": "cs|workbuddy|6082cc2f-320a-4f6c-9cbd-200b0e0f13db",
+  "answer_set": [
+   "cs|workbuddy|6082cc2f-320a-4f6c-9cbd-200b0e0f13db"
+  ],
+  "topic": "Java实验报告批量补全脚本",
+  "agent": "workbuddy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "WSL 2 报 HCS_E_HYPERV_NOT_INSTALLED 那回，顺带机械革命开机 USB-C 充不进电也查了，那个 Phantom 设备是咋回事？",
+  "source": "cs|workbuddy|ade9146f-9523-4081-ac0a-39f567c69284",
+  "answer_set": [
+   "cs|workbuddy|ade9146f-9523-4081-ac0a-39f567c69284"
+  ],
+  "topic": "WSL2启动失败与USB-C充电排查",
+  "agent": "workbuddy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "6 月 8 号那期 AI 动态推送，WWDC 自研 Ajax 大模型、Qwen3.7-Plus 这些条目是咋筛出来聚焦到最近几天的？",
+  "source": "cs|workbuddy|18a22c91-357b-4955-bffe-e05efeb31e6e",
+  "answer_set": [
+   "cs|workbuddy|18a22c91-357b-4955-bffe-e05efeb31e6e"
+  ],
+  "topic": "2026-06-08 AI动态推送",
+  "agent": "workbuddy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "5 月 25 号那期 AI 动态推送，Karpathy 人才动向和具身智能家用量产那些条目，当时两大方向咋分的？",
+  "source": "cs|workbuddy|ff3546ad-22b0-4aac-a36c-246ccf7c8f1c",
+  "answer_set": [
+   "cs|workbuddy|ff3546ad-22b0-4aac-a36c-246ccf7c8f1c"
+  ],
+  "topic": "2026-05-25 AI动态推送",
+  "agent": "workbuddy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "389MB 的 Java 教材 PDF 硬要压进 200MB 那回，Ghostscript 只压到 323、img2pdf 组装也还有 237，最后咋取舍的？",
+  "source": "cs|workbuddy|dc4bee14-b701-4353-bc0b-75bc8324cff2",
+  "answer_set": [
+   "cs|workbuddy|dc4bee14-b701-4353-bc0b-75bc8324cff2"
+  ],
+  "topic": "大体积教材PDF压缩攻坚",
+  "agent": "workbuddy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "帕鲁装 mod 那回，推翻了 1.0 破坏 pak 格式的判断，曼波角色 mod 提取部署、XXMI 迁 D 盘，最后配置成啥样？",
+  "source": "cs|workbuddy|36d586b0-79ef-4e34-bc04-ce0d5fbf1b86",
+  "answer_set": [
+   "cs|workbuddy|36d586b0-79ef-4e34-bc04-ce0d5fbf1b86"
+  ],
+  "topic": "帕鲁mod部署与XXMI迁移",
+  "agent": "workbuddy",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "OC-1 到 OC-10 那轮代码拆分，49 个文件六千多行变动，还把 887MB 的 sessions.db 对半拆，验收和基线对比结果咋样？",
+  "source": "cs|zcode|sess_216aae8c-ede0-466a-ae07-41a2066d8162",
+  "answer_set": [
+   "cs|zcode|sess_216aae8c-ede0-466a-ae07-41a2066d8162"
+  ],
+  "topic": "OC-10代码拆分与sessions.db拆分",
+  "agent": "zcode",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "删掉 zcode 里 33 个非通用 GSD 技能那回，顺着扒了 Codex 架构的 Rust 核心、Node CLI、Electron 三层，当时理解到哪了？",
+  "source": "cs|zcode|sess_0512aea7-f0de-43b0-9ad0-5c52d6e1fae8",
+  "answer_set": [
+   "cs|zcode|sess_0512aea7-f0de-43b0-9ad0-5c52d6e1fae8"
+  ],
+  "topic": "GSD技能清理与Codex架构探究",
+  "agent": "zcode",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "本机 500M 宽带测速那回，走代理下载 433Mbps、16 线程直连 393，这算达标不、瓶颈在哪？",
+  "source": "cs|zcode|sess_05e44f82-8330-4f04-8190-03ac1bd70cc4",
+  "answer_set": [
+   "cs|zcode|sess_05e44f82-8330-4f04-8190-03ac1bd70cc4"
+  ],
+  "topic": "500M宽带测速与代理对比",
+  "agent": "zcode",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "宠物医院管理系统阶段二三验收那回，3 个 BLOCKER 修完 11/11、13/13 全过，防超卖是咋验证的？",
+  "source": "cs|zcode|sess_94599322-1369-43de-b92c-b2ec71935bee",
+  "answer_set": [
+   "cs|zcode|sess_94599322-1369-43de-b92c-b2ec71935bee"
+  ],
+  "topic": "宠物医院系统阶段验收与防超卖",
+  "agent": "zcode",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "novel-mind 后端加路由偏好持久化那回，app_settings 键值表配 Alembic 迁移，AIUsageLog 异步写入咋保证不影响主调用？",
+  "source": "cs|kimi|wd_novel-mind_064a8fb3b6d0:agent-6:session_a7acf1e2-f8ec-4c45-b88c-cf2d77126827",
+  "answer_set": [
+   "cs|kimi|wd_novel-mind_064a8fb3b6d0:agent-6:session_a7acf1e2-f8ec-4c45-b88c-cf2d77126827"
+  ],
+  "topic": "路由偏好持久化与AI用量统计",
+  "agent": "kimi",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "NovelMind 前端布局、导航、设计 token 响应式只读评估那回，确认主题切换不支持系统跟随，还有哪些缺口？",
+  "source": "cs|kimi|wd_novel-mind_5d7fc96acdbd:agent-0:session_f489311e-f38a-48c9-a93b-146227a915dc",
+  "answer_set": [
+   "cs|kimi|wd_novel-mind_5d7fc96acdbd:agent-0:session_f489311e-f38a-48c9-a93b-146227a915dc"
+  ],
+  "topic": "前端响应式现状只读评估",
+  "agent": "kimi",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "绿地新建 personal decision cockpit 前端那回，Phase 36 等价范围只做应用壳加今日总览，手写脚手架踩了啥坑？",
+  "source": "cs|kimi|wd_workspace_4945bab4034d:agent-3:session_75a7614e-bb86-42a3-8750-b0083d947d24",
+  "answer_set": [
+   "cs|kimi|wd_workspace_4945bab4034d:agent-3:session_75a7614e-bb86-42a3-8750-b0083d947d24",
+   "cs|legacy|cs/kimi/session_75a7614e-bb86-42a3-8750-b0083d947d24"
+  ],
+  "topic": "决策cockpit前端Phase36搭建",
+  "agent": "kimi",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "novel-mind 后端 25 个 ruff lint 错误清理那回，F841 元组解包的变量用下划线替代不删整行，这规则咋执行的？",
+  "source": "cs|kimi|wd_novel-mind_064a8fb3b6d0:agent-3:session_a7acf1e2-f8ec-4c45-b88c-cf2d77126827",
+  "answer_set": [
+   "cs|kimi|wd_novel-mind_064a8fb3b6d0:agent-3:session_a7acf1e2-f8ec-4c45-b88c-cf2d77126827"
+  ],
+  "topic": "后端25个ruff lint修复",
+  "agent": "kimi",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "摸底个人数据分析系统后端那回，确认 api_server 是 stdlib http.server 不是 FastAPI、前端资源走 Node server.mjs，这结论咋来的？",
+  "source": "cs|kimi|wd_workspace_4945bab4034d:agent-0:session_75a7614e-bb86-42a3-8750-b0083d947d24",
+  "answer_set": [
+   "cs|kimi|wd_workspace_4945bab4034d:agent-0:session_75a7614e-bb86-42a3-8750-b0083d947d24",
+   "cs|legacy|cs/kimi/session_75a7614e-bb86-42a3-8750-b0083d947d24"
+  ],
+  "topic": "后端架构摸底与前端承载方式",
+  "agent": "kimi",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "System/AI-Memory 初始化那回，查出双入口规范分叉，最后 INDEX.md 定成唯一主入口，旧入口咋处理的？",
+  "source": "cs|copilot|d75fc3bf-f81a-4ebb-bf9e-c856eb810ccb",
+  "answer_set": [
+   "cs|copilot|d75fc3bf-f81a-4ebb-bf9e-c856eb810ccb"
+  ],
+  "topic": "AI-Memory初始化与入口收敛",
+  "agent": "copilot",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Obsidian 知识库那俩脚本，generate-index.py 扫 Vault 生成 JSON、memory-cli.py 解析子命令，数据流向当时是咋理清的？",
+  "source": "cs|copilot|b6ec3470-a65d-4dc1-aeae-96f952d88a96",
+  "answer_set": [
+   "cs|copilot|b6ec3470-a65d-4dc1-aeae-96f952d88a96"
+  ],
+  "topic": "AI-Memory脚本逻辑与数据流",
+  "agent": "copilot",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "那次初始化 system ai-memory 顺带全量巡检提结构优化建议，2 个进行中项目 7 个 Skills 的盘点结果咋说的？",
+  "source": "cs|copilot|eacf3af1-ed55-4d1a-9714-bfdfd7f8fe67",
+  "answer_set": [
+   "cs|copilot|eacf3af1-ed55-4d1a-9714-bfdfd7f8fe67"
+  ],
+  "topic": "AI-Memory初始化巡检与结构建议",
+  "agent": "copilot",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "vscode-real-time-translator 那个实时翻译插件，当时咋测的、咋确认插件两块都启动了？",
+  "source": "cs|copilot|7289f394-ab29-4d50-abf2-2e80b15c5f1a",
+  "answer_set": [
+   "cs|copilot|7289f394-ab29-4d50-abf2-2e80b15c5f1a"
+  ],
+  "topic": "VS Code实时翻译插件测试验证",
+  "agent": "copilot",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "把本地 Codex 配置迁到 Claude Code 那回，对比出 6 个 Codex 独有的 skills，是哪几个、咋同步的？",
+  "source": "cs|mimo|ses_13e6ffa83ffeRo42EFjr6rMQf3",
+  "answer_set": [
+   "cs|mimo|ses_13e6ffa83ffeRo42EFjr6rMQf3"
+  ],
+  "topic": "Codex配置迁移Claude Code与skills对比",
+  "agent": "mimo",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Windows 终端美化那回，想搞流星或月亮的动态背景，还发现 Git 装在 D 盘非默认路径，后来配置成啥了？",
+  "source": "cs|mimo|ses_13e670d63ffeVtOJgi8ivXc3yt",
+  "answer_set": [
+   "cs|mimo|ses_13e670d63ffeVtOJgi8ivXc3yt"
+  ],
+  "topic": "Windows终端美化与动态背景",
+  "agent": "mimo",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "CodeBuddy 填好了配置却启动不了那回，settings.json 换模型、models.json 自定义模型这两层是咋理清的？",
+  "source": "cs|mimo|ses_13e6ffacfffeWqF76YBzKDQawI",
+  "answer_set": [
+   "cs|mimo|ses_13e6ffacfffeWqF76YBzKDQawI"
+  ],
+  "topic": "CodeBuddy配置排查与自定义模型",
+  "agent": "mimo",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "让我看 Python 题库 OCR 提取的流程然后照 PDF 标准做计算机组成作业那回，主要卡清晰度，当时推进到哪了？",
+  "source": "cs|mimo|ses_13e6ffa61ffeHrNZTDZ0i6SafZ",
+  "answer_set": [
+   "cs|mimo|ses_13e6ffa61ffeHrNZTDZ0i6SafZ"
+  ],
+  "topic": "题库OCR流程与计算机组成作业",
+  "agent": "mimo",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "NovelMind 前端全面审计那回，next-env.d.ts 不存在、README 提的 shadcn/ui 没进依赖，还查出哪些缺件？",
+  "source": "cs|antigravity|c3670cda-4484-49bc-aec5-bb7d14a4c46a",
+  "answer_set": [
+   "cs|antigravity|c3670cda-4484-49bc-aec5-bb7d14a4c46a"
+  ],
+  "topic": "NovelMind前端全面审计缺件清单",
+  "agent": "antigravity",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "antigravity 里选 Gemini 3.5 Flash 初始化项目那回，API 调用老报 400，最后查明是啥原因？",
+  "source": "cs|antigravity|0d3d45d2-7a08-4f94-900a-b255d5d1c391",
+  "answer_set": [
+   "cs|antigravity|0d3d45d2-7a08-4f94-900a-b255d5d1c391"
+  ],
+  "topic": "Gemini 3.5 Flash地区限制400",
+  "agent": "antigravity",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "TraceMemo Reader Skill 装进 Codex 和 Antigravity 目录那回，health 接口返回 ok 加 ready 验证通过，token 环境变量咋配的？",
+  "source": "cs|antigravity|8d4ba3e9-8468-4421-bc63-91b2267b7512",
+  "answer_set": [
+   "cs|antigravity|8d4ba3e9-8468-4421-bc63-91b2267b7512",
+   "cs|legacy|cs/antigravity/8d4ba3e9-8468-4421-bc63-91b2267b7512"
+  ],
+  "topic": "TraceMemo Reader Skill安装验证",
+  "agent": "antigravity",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "career-os 项目全面分析那回，tracker.tsv 实际投递数为 0 说明从没实战，识别出的 13 个问题里最狠的是哪几个？",
+  "source": "cs|claude|4f8336e0-702b-4e4e-a32d-d045aadf7ee3",
+  "answer_set": [
+   "cs|claude|4f8336e0-702b-4e4e-a32d-d045aadf7ee3"
+  ],
+  "topic": "career-os项目分析与13问题清单",
+  "agent": "claude",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "personal-blog-writer 那个项目，Phase 2 混合 AI 框架接进 GUI 的 Ask AI、29 个单元测试全过，前后端分离咋定的？",
+  "source": "cs|gemini|1eef5110-9095-417d-8a5c-be05b14f9e55",
+  "answer_set": [
+   "cs|gemini|1eef5110-9095-417d-8a5c-be05b14f9e55"
+  ],
+  "topic": "personal-blog-writer Phase2与Ask AI集成",
+  "agent": "gemini",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "AI 管理助手查询执行那回，LLM 不直接调后端、选完工具后端执行 Java 再转自然语言，这条链路当时咋讲清的？",
+  "source": "cs|cursor|15189bbb-1af0-40b9-9a94-9b240431eacd",
+  "answer_set": [
+   "cs|cursor|15189bbb-1af0-40b9-9a94-9b240431eacd"
+  ],
+  "topic": "AI管理助手LLM调用链路",
+  "agent": "cursor",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "Target D 那回核算完真实进度，顺手修了 Phase 27 F-01 的控制排序缺陷，流内按 sequence、跨流按 UTC 决胜是咋改的？",
+  "source": "cs|codex|019f7342-2874-7342-b866-9c0c6df5f039",
+  "answer_set": [
+   "cs|codex|019f7342-2874-7342-b866-9c0c6df5f039",
+   "cs|codex|019f7258-3af3-7600-bb04-4233d7ed8168"
+  ],
+  "topic": "Target D核算与F-01控制排序修复",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ },
+ {
+  "q": "孙燕姿 deep-reads 仓库 Batch 03 alternate versions 重分类那回，e-lover-2 映射到哪张专辑、era 字段咋定的？",
+  "source": "cs|codex|019d7678-7aac-7762-b1c0-c9845e52c9da",
+  "answer_set": [
+   "cs|codex|019d7678-7aac-7762-b1c0-c9845e52c9da"
+  ],
+  "topic": "Batch03专辑重分类alternate versions",
+  "agent": "codex",
+  "origin": "v2-20260928"
+ }
+]
