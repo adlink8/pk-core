@@ -69,7 +69,7 @@ def judge_pool(query, cand):
         out.append(d)
     return sorted(out, key=lambda d: -d.get("jev", 0))
 
-sys.path.insert(0, r"D:/ADLINK/数据分析/tmp/pilot")
+sys.path.insert(0, r"D:/ADLINK/数据分析/src/personal_knowledge/retrieval/vector")
 import query as Q  # 复用 get_judge 单例
 res = {"vec": {"h1": 0, "h3": 0, "h5": 0, "rr": 0.0},
        "jev": {"h1": 0, "h3": 0, "h5": 0, "rr": 0.0}}

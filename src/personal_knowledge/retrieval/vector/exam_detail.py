@@ -6,7 +6,7 @@ import numpy as np
 DB = r"D:/ADLINK/数据分析/var/db/conversation_vector.sqlite"
 EXAM = r"D:/ADLINK/数据分析/docs/retrieval/exam_v1.json"
 OUT_MD = r"D:/ADLINK/数据分析/docs/retrieval/exam_report.md"
-OUT_JSON = r"D:/ADLINK/数据分析/tmp/pilot/exam_detail.json"
+OUT_JSON = r"D:/ADLINK/数据分析/src/personal_knowledge/retrieval/vector/exam_detail.json"
 
 def embed(texts):
     body = json.dumps({"model": "bge-m3", "input": texts}).encode("utf-8")
@@ -47,7 +47,7 @@ print(f"语料 {len(docs)}", flush=True)
 exam = [e for e in json.load(open(EXAM, encoding="utf-8")) if isinstance(e, dict) and e.get("q")]
 qs = embed([e["q"] for e in exam])
 
-sys.path.insert(0, r"D:/ADLINK/数据分析/tmp/pilot")
+sys.path.insert(0, r"D:/ADLINK/数据分析/src/personal_knowledge/retrieval/vector")
 import query as Q
 engine = Q.get_judge()
 

@@ -97,7 +97,7 @@ def rank_of(cand, prefix, segs):
                  if d["sid"].startswith(prefix) and (segs is None or d["seg"] in segs)), None)
 
 res = {"vec": {"h1": 0, "h3": 0}, "rrk": {"h1": 0, "h3": 0}, "jev": {"h1": 0, "h3": 0}}
-json.dump(judged, open(r"D:/ADLINK/数据分析/tmp/pilot/judged_dump.json", "w", encoding="utf-8"),
+json.dump(judged, open(r"D:/ADLINK/数据分析/src/personal_knowledge/retrieval/vector/judged_dump.json", "w", encoding="utf-8"),
           ensure_ascii=False, indent=1)
 
 for i, (plan, jl) in enumerate(zip(plans, judged)):

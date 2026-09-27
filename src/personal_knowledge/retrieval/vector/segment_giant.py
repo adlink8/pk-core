@@ -5,7 +5,7 @@ import sqlite3, json, re, time, os, urllib.request
 DB = r"D:/ADLINK/数据分析/data/canonical/agent/structured/db/agent_conversations.sqlite"
 KEY = open(r"C:/Users/li/.stepfun.key").read().strip()
 API = "https://api.stepfun.com/v1/chat/completions"
-OUT = r"D:/ADLINK/数据分析/tmp/pilot"
+OUT = r"D:/ADLINK/数据分析/src/personal_knowledge/retrieval/vector"
 WINDOW = 200  # 每段有效消息数
 
 NOISE = [re.compile(r"^The TodoWrite tool hasn.?t been used", re.I),
