@@ -107,7 +107,7 @@ for sid in eligible:
 recs = []
 for sid, ostart, oend, texts in chunks:
     text = "\n".join(texts)
-    if len(text) < 20:
+    if len(text) < 60:
         continue
     cid = "qc|%s|%d-%d" % (sid, ostart, oend)
     if cid not in done_chunks:

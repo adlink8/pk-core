@@ -113,20 +113,48 @@ def log(event, detail=""):
         con_out.commit()
 
 # ---------- 选样 ----------
+# 手动增量模式：python full_run.py --incremental
+#   只处理"最后活动 >48h"的会话；已压过的会话消息数涨 ≥50% 才重压（覆盖旧摘要）
+#   不注册任何计划任务，压缩永远手动触发（日常同步由 live-sync 01:00 负责，与此无关）
+INCREMENTAL = "--incremental" in sys.argv
 con = sqlite3.connect("file:%s?mode=ro" % DB_AUTH, uri=True)
 MC = ("WITH m AS (SELECT canonical_session_id, COUNT(*) n FROM canonical_messages "
       "WHERE COALESCE(is_system,0)=0 AND COALESCE(is_sidechain,0)=0 "
       "AND role IN ('user','assistant') GROUP BY 1) ")
 sessions = con.execute(MC + "SELECT s.canonical_session_id, s.agent, COALESCE(s.cwd,''), "
-    "COALESCE(s.started_at,''), m.n FROM m JOIN canonical_sessions s USING(canonical_session_id) "
+    "COALESCE(s.started_at,''), m.n, COALESCE(s.ended_at, s.started_at) FROM m JOIN canonical_sessions s "
+    "USING(canonical_session_id) "
     "WHERE s.merged=0 AND m.n > 4 AND s.canonical_session_id NOT LIKE '%subagent%' "
     "ORDER BY s.started_at DESC").fetchall()
 done = {r[0] for r in con_out.execute(
     "SELECT DISTINCT canonical_session_id FROM summaries WHERE status='ok'")}
-todo = [s for s in sessions if s[0] not in done]
+done_meta = {r[0]: r[1] for r in con_out.execute(
+    "SELECT canonical_session_id, MAX(n_msgs) FROM summaries WHERE status='ok' GROUP BY 1")}
 skipped_short = {r[0] for r in con_out.execute(
     "SELECT DISTINCT canonical_session_id FROM summaries WHERE status='skipped_short'")}
-todo = [s for s in todo if s[0] not in skipped_short]
+rejected = {r[0] for r in con_out.execute(
+    "SELECT DISTINCT canonical_session_id FROM summaries WHERE status='moderation_rejected'")}
+todo = []
+if INCREMENTAL:
+    import calendar
+    cutoff = time.time() - 48 * 3600
+    for s in sessions:
+        sid, n, last = s[0], s[4], s[5]
+        try:
+            t = calendar.timegm(time.strptime(str(last)[:19], "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            continue
+        if t > cutoff:
+            continue  # 48h 冷却期内，先不压
+        stored = done_meta.get(sid)
+        if sid in done and n < stored * 1.5:
+            continue  # 已压且消息数没涨够 50%
+        if sid in rejected:
+            continue
+        todo.append(s)
+else:
+    todo = [s for s in sessions if s[0] not in done
+            and s[0] not in skipped_short and s[0] not in rejected]
 by_agent = {}
 for s in todo:
     by_agent[s[1]] = by_agent.get(s[1], 0) + 1
@@ -195,7 +223,7 @@ def save_summary(sid, agent, cwd, started_at, seg_no, rng, n_msgs, chars, pt, ct
 def process(sess):
     if stop_flag.is_set():
         return
-    sid, agent, cwd, started_at, n = sess
+    sid, agent, cwd, started_at, n = sess[0], sess[1], sess[2], sess[3], sess[4]
     msgs = transcript_parts(sid)
     if not msgs:
         save_summary(sid, agent, cwd, started_at, 1, [0, 0], 0, 0, 0, 0, "none", None, 0, "skipped_short")
@@ -218,7 +246,8 @@ def process(sess):
             resp, err = call_api(sys_p, text)
             if err:
                 if attempts == MAX_ATTEMPTS:
-                    save_summary(sid, agent, cwd, started_at, seg_no, rng, len(chunk), chars, 0, 0, "error", None, attempts, "failed")
+                    st = "moderation_rejected" if "HTTP 451" in err else "failed"
+                    save_summary(sid, agent, cwd, started_at, seg_no, rng, len(chunk), chars, 0, 0, "error", None, attempts, st)
                     with stat_lock: stats["fail"] += 1
                     log("fail", f"{sid[:40]} seg{seg_no} {err}")
                 continue
