@@ -14,7 +14,7 @@ XML_PATH = Path(__file__).parent / f"{TASK}.task.xml"
 XML = """<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>live_sync 唯一写者：增量采集各客户端会话直写权威库（fail-closed 门禁+quarantine），随后 FTS 增量索引。P5 调度切换 2026-09-26。</Description>
+    <Description>live_sync 唯一写者：增量采集各客户端会话直写权威库（fail-closed 门禁+quarantine），随后 FTS 增量索引。调度=每日 01:00（2026-09-26 由 15 分钟周期改为每日）。</Description>
     <URI>\\{task}</URI>
   </RegistrationInfo>
   <Principals>
@@ -39,13 +39,10 @@ XML = """<?xml version="1.0" encoding="UTF-16"?>
     <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
   </Settings>
   <Triggers>
-    <TimeTrigger>
-      <StartBoundary>2026-09-26T12:00:00+08:00</StartBoundary>
-      <Repetition>
-        <Interval>PT15M</Interval>
-        <StopAtDurationEnd>false</StopAtDurationEnd>
-      </Repetition>
-    </TimeTrigger>
+    <CalendarTrigger>
+      <StartBoundary>2026-09-27T01:00:00+08:00</StartBoundary>
+      <DaysInterval>1</DaysInterval>
+    </CalendarTrigger>
   </Triggers>
   <Actions Context="Author">
     <Exec>
