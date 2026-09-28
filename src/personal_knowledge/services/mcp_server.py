@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -129,11 +130,16 @@ async def handle_call_tool(
     }
     print(f"[mcp] call {name} args={log_arguments}", file=sys.stderr, flush=True)
 
+    # 2026-09-29 调用详单（mcp_tools/call_log.py）：每次真实调用落一条
+    # （客户端/参数/耗时/成败/结果摘要），落库前过隐私闸；fail-open 不影响服务。
+    _t0 = time.perf_counter()
+    _err = None
     try:
         # 轻量分派：转发到按域拆分的 handlers 包
         text = render_tool(name, arguments)
     except Exception as e:
         # 捕获所有异常,返回错误信息(而非让 server 崩溃)
+        _err = repr(e)
         tb = traceback.format_exc()
         text = f"工具 {name} 执行失败: {e}\n\n{tb}"
         print(f"[mcp] error {name}: {e}", file=sys.stderr, flush=True)
@@ -142,6 +148,13 @@ async def handle_call_tool(
     safe = guard_mcp_payload(text)
     if safe != text:
         print(f"[mcp] privacy_guard sealed tool={name}", file=sys.stderr, flush=True)
+    try:
+        from personal_knowledge.mcp_tools import call_log
+        call_log.record(server, name, arguments,
+                        (time.perf_counter() - _t0) * 1000,
+                        _err is None, _err, safe)
+    except Exception:
+        pass
     return [types.TextContent(type="text", text=safe)]
 
 
