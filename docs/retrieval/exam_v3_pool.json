@@ -1,0 +1,196 @@
+{
+ "meta": {
+  "generated_at": "2026-09-28",
+  "origin": "v3-20260928",
+  "purpose": "v3 新题型扩题依据（可复现）。每题记录素材会话与依据；时间取自 conversation_fts.sqlite sessions_meta.started_at（权威时间源，只读）。",
+  "counts": {
+   "A_aggregate": 5,
+   "B_time": 4,
+   "C_multi_source": 2,
+   "total": 11
+  },
+  "partial_note": "目标 30 题（A/B/C 各≤10）。实际按质量线产出 11 题：C 类『同主题不同会话各自完整回答』在语料中稀缺——asks 相似度挖掘命中的多为跨通道镜像对与 GSD 罐头话术簇（恰为已知坑），不足以支撑更多真 C 题；A 类凑足 5、B 类凑足 4 后其余候选因主题与 v2 撞车或窗口不唯一被否。宁缺毋滥，如实 PARTIAL。"
+ },
+ "questions": [
+  {
+   "type": "aggregate",
+   "agent": "codex",
+   "topic": "多台服务器部署运维史（聚合）",
+   "q": "我那几台服务器——阿里云、新加坡 VPS、DigitalOcean，还有家里那台老 Debian——前后都部署或者运维过哪些东西？把动过这些服务器的会话都翻出来。",
+   "answer_set": [
+    "cs|codex|019dd68e-f92f-7e12-b82f-19e4381abc7f",
+    "cs|codex|019e2a2b-1784-7863-b176-c62bc6ffbcb5",
+    "cs|codex|019e5f66-c76c-7722-b1a1-64b3905da004",
+    "cs|legacy|cs/codex/01a0225e-9928-7b13-9aae-2b2058f9b33d",
+    "cs|legacy|cs/pi/019fe9dd-2c1b-7036-a9df-56e49e7c2bc4"
+   ],
+   "evidence": {
+    "cs|codex|019dd68e-f92f-7e12-b82f-19e4381abc7f": "04-29 阿里云：Datadog Agent 配置上报、Syncthing 课程目录同步、AnythingLLM Docker 部署",
+    "cs|codex|019e2a2b-1784-7863-b176-c62bc6ffbcb5": "05-15 云端 OpenCode 部署：Python venv + Cloudflare Tunnel 反代 + AI-Memory MCP smoke 通过",
+    "cs|codex|019e5f66-c76c-7722-b1a1-64b3905da004": "05-25 新加坡服务器：Nginx 直连反代入口、Basic Auth、HTTPS 证书、fail2ban/SSH 加固",
+    "cs|legacy|cs/codex/01a0225e-9928-7b13-9aae-2b2058f9b33d": "08-21 DigitalOcean：New API AI 聚合网关部署、SSH 连通性验证（阿里云超时）",
+    "cs|legacy|cs/pi/019fe9dd-2c1b-7036-a9df-56e49e7c2bc4": "08-10 老 Debian 13：升级 105 包、ufw/fail2ban、AdGuard Home(41万规则)/Samba/Gitea/WOL 部署"
+   }
+  },
+  {
+   "type": "aggregate",
+   "agent": "legacy",
+   "topic": "思必驰校招全套准备（聚合）",
+   "q": "为了思必驰那个研发效能与质量平台岗，我从岗位库适配、简历定制、HR 电话模拟一路干到模拟面试和面试手册重写，这一整套准备都散在哪些会话里？",
+   "answer_set": [
+    "cs|legacy|cs/codex/01a067b5-c724-7ea0-8fac-428d5e285b51",
+    "cs|zcode|sess_48851a17-9312-4641-8798-7dbcc1952ab1",
+    "cs|legacy|cs/antigravity/cf090e12-0263-449c-8bf5-793d2b03b4ad",
+    "cs|legacy|cs/workbuddy/bc5b091e-7f45-47f8-9ed0-1b80fb46deb6",
+    "cs|legacy|cs/workbuddy/e4548cd0-e0b7-42a6-b88c-e282df2f2eb0",
+    "cs|zcode|sess_b945a815-de23-4e95-b544-0070e96d2044"
+   ],
+   "evidence": {
+    "cs|legacy|cs/codex/01a067b5-c724-7ea0-8fac-428d5e285b51": "09-03 Career OS 导入思必驰 35 条苏州校招岗、思必驰 3 份简历按 JD 定制 1 页",
+    "cs|zcode|sess_48851a17-9312-4641-8798-7dbcc1952ab1": "09-05 查思必驰 2027 届两个岗 JD、无实习打法、STAR 简历策略",
+    "cs|legacy|cs/antigravity/cf090e12-0263-449c-8bf5-793d2b03b4ad": "09-08 思必驰岗全维度辅导：面试流程拆解、30 分钟视频面节奏、哈希底层",
+    "cs|legacy|cs/workbuddy/bc5b091e-7f45-47f8-9ed0-1b80fb46deb6": "09-17 思必驰 HR 电话模拟、拿到视频面邀请、3 处复盘",
+    "cs|legacy|cs/workbuddy/e4548cd0-e0b7-42a6-b88c-e282df2f2eb0": "09-17 模拟思必驰研发效能岗面试：SQLite 索引/B+ 树、PKS 双哈希去重应答",
+    "cs|zcode|sess_b945a815-de23-4e95-b544-0070e96d2044": "09-21 思必驰面试手册全局重写、基本面尽调（14 轮融资/科创板 IPO）"
+   }
+  },
+  {
+   "type": "aggregate",
+   "agent": "codex",
+   "topic": "生产级 watchdog 脚本三连（聚合）",
+   "q": "6月18号搞生产级 watchdog 脚本那一摊：重制、隔离测试、还有验证那一路，分别是哪些会话？",
+   "answer_set": [
+    "cs|codex|019ed9e6-5919-7510-bce5-c71992584ea6",
+    "cs|codex|019eda24-bf69-7c41-ba38-8788c6629ee2",
+    "cs|chatgpt|6a336fd6-baec-83ea-8ac2-2eb2f7a5a09d"
+   ],
+   "evidence": {
+    "cs|codex|019ed9e6-5919-7510-bce5-c71992584ea6": "06-18 完成生产级 watchdog 重制、skill 修复及 current-plan 分类管理",
+    "cs|codex|019eda24-bf69-7c41-ba38-8788c6629ee2": "06-18 tunnel-client 生产 watchdog 脚本隔离测试、闪退根因排查并生成报告",
+    "cs|chatgpt|6a336fd6-baec-83ea-8ac2-2eb2f7a5a09d": "06-18 MCP 可用性排查、生产级 watchdog 脚本验证与 Skill 迭代"
+   },
+   "time_check": "三会话 sessions_meta.started_at 均为 2026-06-18，已核实"
+  },
+  {
+   "type": "aggregate",
+   "agent": "codex",
+   "topic": "novel-mind CI 门禁体系（聚合）",
+   "q": "novel-mind 的 CI 和发布门禁最后是咋搭起来的？从缺口盘点、统一工作流到聚合门控、release gate，把这条线上的会话都列出来。",
+   "answer_set": [
+    "cs|codex|019f5474-23ad-7753-a6a2-f774a6b73a38",
+    "cs|grok|019f55dc-a5ea-7dc0-973f-0ffaebd705a2",
+    "cs|grok|019f55e1-52cf-7a52-a73e-ed4716604fcf",
+    "cs|codex|019f5a36-c4fc-7560-9fc2-31fa877de63b"
+   ],
+   "evidence": {
+    "cs|codex|019f5474-23ad-7753-a6a2-f774a6b73a38": "07-12 novel-mind CI 缺口只读盘点",
+    "cs|grok|019f55dc-a5ea-7dc0-973f-0ffaebd705a2": "07-12 GSD 06-06 统一 CI 工作流与相关配置",
+    "cs|grok|019f55e1-52cf-7a52-a73e-ed4716604fcf": "07-12 GSD 06-07 CI 聚合门控、分支保护与发布门控",
+    "cs|codex|019f5a36-c4fc-7560-9fc2-31fa877de63b": "07-13 gap plan 08-10：release gate 与 PostgreSQL 测试闭环"
+   }
+  },
+  {
+   "type": "aggregate",
+   "agent": "codex",
+   "topic": "宠物医院毕设服务器线（聚合）",
+   "q": "宠物医院那个毕设在我服务器上从上线到卸载走了一整轮：巡检部署、绑域名、故障恢复、全量清理、后来又重新部署验证。这一整条服务器线的会话都有哪些？",
+   "answer_set": [
+    "cs|codex|019d654e-1f7d-78f0-8a32-f47161454cc0",
+    "cs|codex|019d71b1-fa95-78c1-9010-edaeb297b9f4",
+    "cs|codex|019dcca4-3441-7371-b7ba-e256ca8bd9b2",
+    "cs|workbuddy|a27b6f2c-523b-4618-b480-f8629adc9023",
+    "cs|codex|019f1340-220b-7823-b2da-eba72d891803",
+    "cs|codex|019f1340-8895-7873-9b5e-dfaa790a0452"
+   ],
+   "evidence": {
+    "cs|codex|019d654e-1f7d-78f0-8a32-f47161454cc0": "04-07 阿里云巡检、旧服务卸载及宠物医院系统部署",
+    "cs|codex|019d71b1-fa95-78c1-9010-edaeb297b9f4": "04-09 Nginx 站点绑定 pet.shuoyan.me、ICP 备案拦截根因",
+    "cs|codex|019dcca4-3441-7371-b7ba-e256ca8bd9b2": "04-27 /api/user/login 超时根因（HDFS 占内存）、停 HDFS 恢复 200",
+    "cs|workbuddy|a27b6f2c-523b-4618-b480-f8629adc9023": "05-21 宠物医院全量清理：Docker 容器/镜像/卷、Nginx 配置、systemd 服务",
+    "cs|codex|019f1340-220b-7823-b2da-eba72d891803": "06-29 Phase1 阿里云远程部署验证：18080 监听、nginx conf.d/petcare.conf",
+    "cs|codex|019f1340-8895-7873-9b5e-dfaa790a0452": "06-29 deploy-aliyun.ps1 健壮性重构（去 cmd.exe /c 包裹）、-DryRun 保留"
+   },
+   "note": "019f1340 前缀下存在两个不同会话（220b 远程部署 / 8895 脚本修复），已用完整 sid 消歧"
+  },
+  {
+   "agent": "grok",
+   "topic": "07-12 novel-mind GSD 06-03（时间限定）",
+   "q": "7月12号那天 novel-mind 一口气跑了六个 GSD 计划（06-02 到 06-07），其中交付 frozen fixture、做对抗验证和 Judge 校准的 06-03 那场，是哪个会话？",
+   "answer_set": [
+    "cs|grok|019f55b6-4d48-79d3-b818-0deea006c013"
+   ],
+   "evidence": {
+    "cs|grok|019f55b6-4d48-79d3-b818-0deea006c013": "07-12 执行 GSD 06-03：frozen fixture、对抗验证、G/J 隔离与 Judge 校准"
+   },
+   "time_check": "全语料检索 frozen fixture|Judge 校准：07-12 当天仅此一场执行会话；同日 06-02/06-04/06-05/06-06/06-07 为干扰项，其余 Judge 校准命中均为 Target D 罐头簇（其他日期）"
+  },
+  {
+   "agent": "antigravity",
+   "topic": "06-06 novel-mind 后端全面审计（时间限定）",
+   "q": "6月6号那次对 novel-mind 后端的全面审计，把文件、依赖的缺失项一个个排查出来的，是哪个会话？",
+   "answer_set": [
+    "cs|antigravity|eca1ebe7-0a81-47fe-8298-917f45f688a4",
+    "cs|legacy|cs/antigravity/4ada93aa-70c1-45e9-adbe-8cd37c57cbb0"
+   ],
+   "evidence": {
+    "cs|antigravity|eca1ebe7-0a81-47fe-8298-917f45f688a4": "06-06 NovelMind 后端项目全面审计与缺失项排查（antigravity 本尊）",
+    "cs|legacy|cs/antigravity/4ada93aa-70c1-45e9-adbe-8cd37c57cbb0": "06-06 同内容后端审计（legacy 导入版，uuid 不同非镜像，两个都真实含审计内容）"
+   },
+   "time_check": "06-06 当天审计共 4 场：后端×2（本 answer_set）+ 前端×2（干扰项）；『后端』锚点+日期唯一锁定；6-13 v0.3 审计在窗口外"
+  },
+  {
+   "agent": "legacy",
+   "topic": "09-07 智联/BOSS 双版简历（时间限定）",
+   "q": "9月7号定稿的那两版校招简历——智联和 BOSS 直聘的「技术支持/运维」加「智能硬件 IoT」——是哪场会话弄完交付的？",
+   "answer_set": [
+    "cs|legacy|cs/antigravity/43029a62-2f88-48e9-836d-a6001c69523d"
+   ],
+   "evidence": {
+    "cs|legacy|cs/antigravity/43029a62-2f88-48e9-836d-a6001c69523d": "09-07 智联/BOSS 双版简历多轮优化审计后交付"
+   },
+   "time_check": "09-07 全语料简历相关仅 2 场：本 gold + Career OS 求职自动化（无简历定制内容，干扰项）；其他简历定制会话均在 09-03/09-08/09-15 等窗口外"
+  },
+  {
+   "agent": "grok",
+   "topic": "07-17 孙燕姿 deep-reads 技术债务体检（时间限定）",
+   "q": "7月17号给孙燕姿那个 deep-reads 仓库做技术债务体检、出了份 CONCERNS.md 的，是哪场会话？",
+   "answer_set": [
+    "cs|grok|019f6d89-bb5f-7ab1-afdb-eb191143c4a2"
+   ],
+   "evidence": {
+    "cs|grok|019f6d89-bb5f-7ab1-afdb-eb191143c4a2": "07-17 分析 Stefanie Sun deep-reads 技术债务与风险并生成 CONCERNS.md"
+   },
+   "time_check": "全语料 CONCERNS 共 4 处：06-29 petcare / 07-05 career-os / 07-16 GSD 清理候选（不同仓库不同日期）/ 07-17 孙燕姿（gold）；仓库锚点+日期唯一"
+  },
+  {
+   "agent": "workbuddy",
+   "topic": "内网远程访问方案（多来源）",
+   "q": "人在外面想连回家里内网的机器，都有哪些路子？把正经讲过方案的会话都翻出来，别只给一条。",
+   "answer_set": [
+    "cs|workbuddy|12cb69fcd5e64410bf61b0e15e8db898",
+    "cs|chatgpt|6a26c381-1260-83ea-a691-3320685b3831",
+    "cs|zcode|sess_2017f195-8515-4d9e-897f-8c31c0d1abb6"
+   ],
+   "evidence": {
+    "cs|workbuddy|12cb69fcd5e64410bf61b0e15e8db898": "05-04 对比远程方案，推荐 ZeroTier/frp 实现非局域网 SSH（方案对比完整）",
+    "cs|chatgpt|6a26c381-1260-83ea-a691-3320685b3831": "06-08 开发板=边缘网关、云服务器=公网服务的上下游架构定位（思路完整）",
+    "cs|zcode|sess_2017f195-8515-4d9e-897f-8c31c0d1abb6": "06-24 frp 实操落地：frpc+frps+阿里云安全组放行，设备经 VPS 访问本地服务"
+   }
+  },
+  {
+   "agent": "legacy",
+   "topic": "英语学习规划（多来源）",
+   "q": "我想把英语重新捡起来，之前跟 AI 聊过好几种不同的学法规划，都有哪些会话正经聊过这事？",
+   "answer_set": [
+    "cs|legacy|cs/antigravity/46131ee1-2d88-4cb0-80df-f31d8ad85b18",
+    "cs|legacy|cs/chatgpt/chatgpt:6a46fbcb-dccc-83ea-835b-26fb0c0fb4b7",
+    "cs|chatgpt|697aafa7-e564-8331-989d-81eec0a2b247"
+   ],
+   "evidence": {
+    "cs|legacy|cs/antigravity/46131ee1-2d88-4cb0-80df-f31d8ad85b18": "09-06 四级备考体系：28 套模拟题、艾宾浩斯复习日历、精读带练",
+    "cs|legacy|cs/chatgpt/chatgpt:6a46fbcb-dccc-83ea-835b-26fb0c0fb4b7": "07-03 DevOps 英语 Day1-Day15：15 类故障场景日志阅读学习材料",
+    "cs|chatgpt|697aafa7-e564-8331-989d-81eec0a2b247": "01-29 英语/日语学习目标与每日学习量，适配外企实习和赴日路线"
+   }
+  }
+ ]
+}

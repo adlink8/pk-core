@@ -45,6 +45,14 @@ def main():
                     errors.append(f"[{i}] 缺字段 {f}: {str(e.get('q'))[:30]}")
             if e.get("answer_set") and not isinstance(e["answer_set"], list):
                 errors.append(f"[{i}] answer_set 不是列表")
+            # v3 兼容：type 字段只允许 aggregate / 缺省(single)。
+            # 为何审——aggregate 题在 eval 里走 partial recall@5 单独记分，type 拼错会被当 single 混入。
+            if e.get("type") and e["type"] != "aggregate":
+                errors.append(f"[{i}] 非法 type={e['type']}（只允许 aggregate 或缺省）")
+            # aggregate 题依据定义 answer_set 应为 3-6 个会话（跨会话聚合的最小/最大规模）
+            if e.get("type") == "aggregate" and isinstance(e.get("answer_set"), list) \
+                    and not (3 <= len(e["answer_set"]) <= 6):
+                errors.append(f"[{i}] aggregate answer_set 规模 {len(e['answer_set'])} 不在 3-6")
 
     qcounter = Counter(e["q"].strip() for e in qs)
     dups = [q for q, c in qcounter.items() if c > 1]
