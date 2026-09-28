@@ -37,6 +37,11 @@
 #         并打印降级警告；--fts 可强制走 FTS（测试/省 GPU 用）。
 #   回退：本改动只在嵌入失败分支生效，嵌入正常时行为与改动一/二完全一致；
 #         git checkout 本文件即整体回退。
+#
+# 改动四（2026-09-29 MCP 接入）：main() 编排逻辑抽到 serving.py，本文件只剩
+#         参数解析+打印薄壳。行为保持重构（同一查询输出逐位一致，有回归基线）；
+#         serving.load_pool_cached() 供 MCP 常驻进程复用语料（mtime 失效）。
+#         回退：git checkout 本文件 + serving.py。
 # ===================================================================================
 import sqlite3, json, sys, urllib.request, subprocess
 import numpy as np
@@ -173,48 +178,6 @@ def should_fallback(pool):
             break
     return False, ""
 
-def fts_fallback(q, k):
-    """嵌入服务不可用时的 FTS 会话级兜底检索（改动三实现，详见文件头）。
-    复用 conversation_fts.search_sessions（独立索引库，权威库只读）。
-    FTS 是消息级 AND：整句多短语必须同现于一条消息，长自然句常零命中；
-    故整句无命中时放宽为分词检索、按会话合并（先命中词数、再总命中数排序），
-    与向量语义的差距在输出里明示。"""
-    sys.path.insert(0, r"D:/ADLINK/数据分析/src/personal_knowledge")
-    from retrieval.conversation_fts import search_sessions
-    try:
-        results = search_sessions(q, limit=k)
-    except Exception as e:
-        print("FTS 兜底检索也失败（索引库不可用？）：%r" % e)
-        return 1
-    relaxed = False
-    if not results:
-        terms = [t for t in q.split() if len(t) >= 2][:6]
-        merged = {}
-        for t in terms:
-            try:
-                for r in search_sessions(t, limit=max(k * 3, 15)):
-                    m = merged.setdefault(r["session_id"], dict(r))
-                    m["hits"] += r["hits"]
-                    m["_terms"] = m.get("_terms", 0) + 1
-                    if r["best_score"] > m["best_score"]:
-                        m["best_score"], m["snippet"] = r["best_score"], r["snippet"]
-            except Exception:
-                continue
-        results = sorted(merged.values(),
-                         key=lambda r: (-r.get("_terms", 1), -r["hits"]))[:k]
-        relaxed = bool(results)
-        if relaxed:
-            print("(FTS 整句无命中，已放宽为分词合并——结果排序较向量路径粗)")
-    if not results:
-        print("(FTS 无命中。注意：FTS 只覆盖权威库已入库会话)")
-        return 0
-    for rank, r in enumerate(results, 1):
-        extra = f"  命中词{r.get('_terms', '?')}个" if relaxed else ""
-        print(f"{rank}. [FTS] hits={r['hits']}{extra}  {r['snippet'][:90].replace(chr(10), ' ')}")
-        print(f"   session={r['session_id'][:52]}  agent={r['agent'] or '?'}  "
-              f"started={(r['started_at'] or '?')[:16]}  bm25={r['best_score']:.3f}")
-    return 0
-
 def main():
     args = sys.argv[1:]
     rerank = "--rerank" in args
@@ -242,71 +205,21 @@ def main():
         return
     if judge_mode is None:
         judge_mode = "fallback"  # 2026-09-28 起新默认，旧"永远重排"用 --judge 切回
-    if force_fts:
-        print("(--fts：强制 FTS 全文检索)")
-        return fts_fallback(q, k)
-    docs = load_pool()
-    try:
-        qv = np.array(embed(q), dtype=np.float32)
-    except Exception as e:
-        print("(警告: 嵌入服务不可用[%s]，自动降级 FTS 全文检索)" % e)
-        return fts_fallback(q, k)
-    M = np.array([d["vec"] for d in docs], dtype=np.float32)
-    M /= (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
-    qv /= (np.linalg.norm(qv) + 1e-9)
-    scores = M @ qv
-    order = np.argsort(-scores)
-    n_recall = max(k * 10, 50)
-    s2c = load_twin_map() if collapse else None
-    pool_idx, n_dupes = [], 0
-    if s2c:
-        # 只有映射簇内的文档参与归并（同簇只留最高分），名额让给不同簇；未映射会话不动
-        seen = set()
-        for i in order:
-            rep = s2c.get(docs[i]["sid"])
-            if rep is not None:
-                if rep in seen:
-                    if len(pool_idx) < n_recall:
-                        n_dupes += 1  # 只统计本应进召回池却被归并的同簇副本
-                    continue
-                seen.add(rep)
-                docs[i]["twin_canonical"] = rep
-            pool_idx.append(i)
-            if len(pool_idx) >= n_recall:
-                break
-    else:
-        pool_idx = list(order[:n_recall])
-    pool = []
-    for i in pool_idx:
-        docs[i]["score"] = float(scores[i])
-        pool.append(docs[i])
-    if n_dupes:
-        print("(twin-collapse: 原始召回窗口内 %d 条同簇副本已归并)" % n_dupes)
-    if judge_mode == "always":
-        print("(Jev 裁判中，0.8B 快判 top-20...)")
-        judged = judge_candidates(q, pool, topn=20)
-        if judged:
-            pool = judged + [d for d in pool if "jev" not in d]
-            pool = pool[:k] + [d for d in pool[k:] if d.get("jev", 0) > 0][:k]
-    elif judge_mode == "fallback":
-        fire, why = should_fallback(pool)
-        if fire:
-            print("(纯向量不可靠[%s]，Jev 裁判重排 top-20...)" % why)
-            judged = judge_candidates(q, pool, topn=20)
-            if judged:
-                pool = judged + [d for d in pool if "jev" not in d]
-                pool = pool[:k] + [d for d in pool[k:] if d.get("jev", 0) > 0][:k]
-        else:
-            print("(纯向量置信充足，跳过裁判)")
-    elif rerank:
-        _patch_jina_reranker()
-        from sentence_transformers import CrossEncoder
-        ce = CrossEncoder("jinaai/jina-reranker-v2-base-multilingual", trust_remote_code=True)
-        pairs = [(q, d["label"]) for d in pool]
-        rs = ce.predict(pairs)
-        pool = [d for _, d in sorted(zip(rs, pool), key=lambda x: -float(x[0]))][:k]
-        print("(jina-reranker 精排后)")
-    for rank, d in enumerate(pool[:k], 1):
+    import serving  # 检索编排单一来源（改动四），lazy import 避免顶层循环
+    res = serving.search(q, k=k, judge_mode=judge_mode, collapse=collapse,
+                         force_fts=force_fts, rerank=rerank)
+    for notice in res["notices"]:
+        print(notice)
+    if res.get("failed"):
+        sys.exit(1)
+    if res["engine"] == "fts":
+        for rank, r in enumerate(res["hits"], 1):
+            extra = f"  命中词{r['terms']}个" if "terms" in r else ""
+            print(f"{rank}. [FTS] hits={r['hits']}{extra}  {r['snippet'][:90].replace(chr(10), ' ')}")
+            print(f"   session={r['session_id'][:52]}  agent={r['agent'] or '?'}  "
+                  f"started={(r['started_at'] or '?')[:16]}  bm25={r['bm25']:.3f}")
+        return
+    for rank, d in enumerate(res["hits"], 1):
         print(f"{rank}. {d['kind']}  {d['label'][:90]}")
         print(f"   session={d['sid'][:52]}  seg={d['seg']} range={d['range']}  score={d['score']:.4f}"
               + (f"  [twin簇代表 {d['twin_canonical'][:40]}]" if d.get("twin_canonical") else ""))

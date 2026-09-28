@@ -16,6 +16,8 @@ import mcp.types as types  # noqa: E402
 
 # core: KU-first 默认面；full: 含历史兼容别名与时间线
 CORE_TOOL_NAMES = frozenset({
+    "conversation_search",
+    "conversation_search_semantic",
     "search_semantic",
     "search_semantic_cards",
     "stats",
@@ -82,6 +84,58 @@ FULL_ONLY_TOOL_NAMES = frozenset({
 })
 
 ALL_TOOLS = [
+    types.Tool(
+        name="conversation_search",
+        description=(
+            "会话全文检索(FTS,关键词精确匹配,零外部依赖,毫秒级)。"
+            "在全部已入库会话的消息原文里做检索,适合带具体关键词的定位:"
+            "工具名/文件名/报错串/人名/项目代号等。"
+            "与 conversation_search_semantic(语义)互补;关键词命中率更高但不理解同义改写。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "关键词查询,空格分词,如 'PJE110 卡顿'、'twin_map fail-open'",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "返回会话数(默认 5)",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+            },
+            "required": ["query"],
+        },
+    ),
+    types.Tool(
+        name="conversation_search_semantic",
+        description=(
+            "会话语义检索(8,050 向量:1,860 摘要+6,190 用户原话,bge-m3)。"
+            "适合'我大概记得弄过这么件事'的自然语言回忆查询。"
+            "内置双胞胎归并、低置信自动裁判重排、嵌入服务宕机自动降级 FTS。"
+            "返回会话 id、命中类型(要点/原话)与相似度分数。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "自然语言回忆式查询,如 '当时手机上跑模型又卡又热怎么调优的'",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "返回条数(默认 5)",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 20,
+                },
+            },
+            "required": ["query"],
+        },
+    ),
     types.Tool(
         name="search_semantic",
         description=(

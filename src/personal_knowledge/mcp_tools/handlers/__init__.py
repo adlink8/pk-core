@@ -16,6 +16,7 @@ services/mcp_server.py 会原样 re-export 以兼容旧 import 名。
 from __future__ import annotations
 
 import personal_knowledge.mcp_tools.handlers.agent as agent
+import personal_knowledge.mcp_tools.handlers.conversation as conversation
 import personal_knowledge.mcp_tools.handlers.data as data
 import personal_knowledge.mcp_tools.handlers.decision as decision
 import personal_knowledge.mcp_tools.handlers.intelligence as intelligence
@@ -24,6 +25,7 @@ import personal_knowledge.mcp_tools.handlers.proactive as proactive
 
 # 统一分派表：工具名 -> 处理函数
 HANDLERS = {
+    "conversation": conversation,
     "data": data,
     "intelligence": intelligence,
     "decision": decision,
@@ -52,6 +54,7 @@ def render_tool(name: str, arguments: dict) -> str:
 
 __all__ = [
     "agent",
+    "conversation",
     "data",
     "decision",
     "intelligence",
