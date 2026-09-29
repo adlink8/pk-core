@@ -46,10 +46,17 @@ def main() -> int:
     subprocess.Popen(SERVER_CMD, stdout=log_fh, stderr=log_fh,
                      creationflags=flags, cwd=str(ROOT), close_fds=True)
     log("service not responding -> restarted (detached)")
-    # 给一次自检确认，结果只记日志不重试（下一轮 5 分钟兜底）
+    # 2026-09-29 夜测改动：轮询自检最多 120s——服务 boot 期有预热（池+嵌入+裁判
+    # 焐热后才起 uvicorn，见 mcp_http_server._prewarm），固定 sleep(4) 必然误报
+    # "still down"；且轮询期间若一直起不来，下一轮 5 分钟兜底不变。
     import time
-    time.sleep(4)
-    log("post-restart health: " + ("ok" if alive() else "still down"))
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        time.sleep(4)
+        if alive():
+            log("post-restart health: ok")
+            return 0
+    log("post-restart health: still down after 120s")
     return 0
 
 

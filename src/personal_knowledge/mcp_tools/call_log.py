@@ -17,6 +17,7 @@ quality_note 记录本次检索置信路径（vector_confident/judge_rerank/fts_
 from __future__ import annotations
 import datetime
 import json
+import os
 import sqlite3
 import sys
 
@@ -61,7 +62,11 @@ def _quality_note(text: str) -> str:
 
 
 def client_label(server) -> str:
-    """尽力识别调用方客户端（SDK 版本间字段有差异，全防御式取值）。"""
+    """尽力识别调用方客户端（SDK 版本间字段有差异，全防御式取值）。
+    2026-09-29 夜测补：HTTP stateless 模式下 request_context.session 不携带
+    initialize 参数，实测全部落成 unknown（304 条轰炸 0 条带标签）——
+    兜底读环境变量 PERSONAL_DATA_MCP_CLIENT_TAG（HTTP 服务启动时置 'http'），
+    让 http 与 stdio 调用至少可分。"""
     try:
         sess = getattr(server.request_context, "session", None)
         for attr in ("client_params", "initialize_params"):
@@ -73,7 +78,7 @@ def client_label(server) -> str:
                 return f"{name}@{ver}" if ver else str(name)
     except Exception:
         pass
-    return "unknown"
+    return os.environ.get("PERSONAL_DATA_MCP_CLIENT_TAG") or "unknown"
 
 
 def record(server, tool: str, arguments: dict, duration_ms: int,

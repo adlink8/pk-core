@@ -63,6 +63,8 @@ import time
 import traceback
 from pathlib import Path
 
+import anyio  # 2026-09-29 夜测改动：tool 重活卸工作线程（见 handle_call_tool 内注释）
+
 from mcp.server import Server  # noqa: E402
 from mcp.server.lowlevel.server import NotificationOptions  # noqa: E402
 from mcp.server.models import InitializationOptions  # noqa: E402
@@ -135,8 +137,12 @@ async def handle_call_tool(
     _t0 = time.perf_counter()
     _err = None
     try:
-        # 轻量分派：转发到按域拆分的 handlers 包
-        text = render_tool(name, arguments)
+        # 轻量分派：转发到按域拆分的 handlers 包。
+        # 2026-09-29 夜测改动：to_thread 卸载——检索重活(语料池加载/Jev裁判重排 ~8-12s)
+        # 是同步阻塞，原先直接跑在事件循环上，HTTP 服务整个冻结：/health 探活超时
+        # →watchdog 误杀→重启丢缓存→下个请求又冷启动，形成循环(实测 21:00 连续两次重启，
+        # 且已打到真实客户端流量)。卸到工作线程后事件循环保持响应；stdio 单请求行为不变。
+        text = await anyio.to_thread.run_sync(render_tool, name, arguments)
     except Exception as e:
         # 捕获所有异常,返回错误信息(而非让 server 崩溃)
         _err = repr(e)

@@ -132,6 +132,19 @@ def _patch_jina_reranker():
         _m.create_position_ids_from_input_ids = create_position_ids_from_input_ids
 
 _JUDGE_ENGINE = None
+# 改动五（2026-09-29 夜测）：裁判并发锁 + 判定超时自愈。
+#   为何（锁）：MCP HTTP 常驻服务下多请求并发（to_thread 工作线程）会同时调同一 GGUF
+#         引擎实例，引擎管线非线程安全，并发即崩；夜测压测(10线程)必须先堵住。
+#   为何（超时）：夜测 02:25 实测引擎子进程 jev-score.exe 偶发死循环（单次判定烧 CPU
+#         2000s+、GPU 满载），decide() 无超时会永久挂起——常驻服务下锁永不释放，
+#         后续所有低置信查询全部瘫痪；夜评测卷也因此卡死一次。
+#   怎么：judge_candidates 全程持锁；每次 decide 在单线程池里跑，90s 超时记 0 分，
+#         连续 2 次超时即判引擎子进程卡死 → close()(含 kill) → 下次 get_judge 重建。
+#   回退：删掉 with _JUDGE_LOCK / pool_exec 两段即回到旧行为。
+import threading as _threading
+from concurrent.futures import ThreadPoolExecutor as _TPEx
+_JUDGE_LOCK = _threading.Lock()
+_JUDGE_TIMEOUT_S = 40  # 正常单判定 ~0.35s；夜测 GPU 恶劣竞争下 90s 确认太慢，40s 仍极宽容
 
 def get_judge():
     global _JUDGE_ENGINE
@@ -143,20 +156,40 @@ def get_judge():
     return _JUDGE_ENGINE
 
 def judge_candidates(query, pool, topn=20):
-    """Jev-Style-0.8B 判定腿（Windows 原生进程内直调，去 WSL）——原逻辑零改动"""
+    """Jev-Style-0.8B 判定腿（Windows 原生进程内直调，去 WSL）——判定语义零改动，
+    只包了超时与卡死自愈（见改动五注释）。"""
     engine = get_judge()
     judged = []
-    for i, d in enumerate(pool[:topn]):
+    with _JUDGE_LOCK:
+        pool_exec = _TPEx(max_workers=1)
+        n_timeout = 0
         try:
-            state = "用户查询：" + query + "\n\n候选内容：\n" + d.get("text", d["label"])
-            r = engine.decide(state, "这段候选内容与用户查询相关吗？",
-                              options={"relevant": "候选直接讨论或回答了查询所问的内容",
-                                       "irrelevant": "候选与查询所问无关"},
-                              category="general_relevance")
-            d["jev"] = r["probabilities"]["relevant"] if r["answer"] == "relevant" else 0.0
-        except Exception as e:
-            d["jev"] = 0.0
-        judged.append(d)
+            for i, d in enumerate(pool[:topn]):
+                try:
+                    state = "用户查询：" + query + "\n\n候选内容：\n" + d.get("text", d["label"])
+                    fut = pool_exec.submit(
+                        engine.decide, state, "这段候选内容与用户查询相关吗？",
+                        options={"relevant": "候选直接讨论或回答了查询所问的内容",
+                                 "irrelevant": "候选与查询所问无关"},
+                        category="general_relevance")
+                    r = fut.result(timeout=_JUDGE_TIMEOUT_S)
+                    n_timeout = 0
+                    d["jev"] = r["probabilities"]["relevant"] if r["answer"] == "relevant" else 0.0
+                except Exception:
+                    d["jev"] = 0.0
+                    n_timeout += 1
+                    if n_timeout >= 2:  # 连续超时=子进程卡死，杀掉重建，fail-open 继续判余下
+                        try:
+                            print("[judge] 引擎疑似卡死，杀进程重建", file=sys.stderr, flush=True)
+                            engine.close()
+                        except Exception:
+                            pass
+                        globals()["_JUDGE_ENGINE"] = None
+                        engine = get_judge()
+                        n_timeout = 0
+                judged.append(d)
+        finally:
+            pool_exec.shutdown(wait=False)
     return sorted(judged, key=lambda d: -d.get("jev", 0))
 
 def should_fallback(pool):

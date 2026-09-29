@@ -21,6 +21,8 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 os.environ.setdefault("PERSONAL_DATA_MCP_PROFILE", "core")
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+# 2026-09-29 夜测补：HTTP stateless 拿不到 clientInfo，call_log 客户端标签兜底用此值
+os.environ.setdefault("PERSONAL_DATA_MCP_CLIENT_TAG", "http")
 
 from personal_knowledge.services.mcp_server import server  # noqa: E402 复用同一 Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager  # noqa: E402
@@ -59,6 +61,23 @@ app = Starlette(
 # 新版 Starlette 无 redirect_slashes 构造参数，改在 router 属性上关闭
 app.router.redirect_slashes = False
 
+def _prewarm() -> None:
+    """2026-09-29 夜测改动：起服务前把检索链路焐热。
+    为何：冷启动三件套（语料池加载 ~6s + Ollama 嵌入首调 + Jev 裁判进 GPU ~30s+）
+    原先全部落在第一个真实请求上，且同步冻结事件循环——实测已打到真实客户端
+    流量（首个查询 8-12s 无响应）。boot 期做掉，起来即热。
+    失败不阻塞启动：预热挂了服务照起，行为退回旧冷启动。"""
+    try:
+        from personal_knowledge.retrieval.vector import serving
+        serving.load_pool_cached()
+        serving.search("检索服务冷启动预热探针", k=1)  # 池+嵌入热链路
+        serving._Q().get_judge()                        # 裁判模型显式进 GPU
+        print("[prewarm] 池+嵌入+裁判 已热", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[prewarm] 失败(不阻塞启动): {e!r}", file=sys.stderr, flush=True)
+
+
 def main() -> None:
+    _prewarm()
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8789, log_level="warning")
