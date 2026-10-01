@@ -139,7 +139,7 @@ CANONICAL_SCHEMA: dict[str, list[tuple[str, str]]] = {
         ("source", "TEXT NOT NULL CHECK(source IN ('agentsview','legacy'))"),
         ("source_message_ref", "TEXT"),  # 原 source 的 message ID（回查用）
         ("ordinal", "INTEGER NOT NULL"),
-        ("role", "TEXT NOT NULL CHECK(role IN ('user','assistant','developer','system','tool'))"),
+        ("role", "TEXT NOT NULL CHECK(role IN ('user','assistant','developer','system','tool','reasoning'))"),
         ("content", "TEXT"),  # 仅 eligible + 脱敏后
         ("content_length", "INTEGER"),
         ("timestamp", "TEXT"),

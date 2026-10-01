@@ -128,7 +128,7 @@ NORMALIZED_SCHEMA: dict[str, list[tuple[str, str]]] = {
         ("session_id", "TEXT NOT NULL REFERENCES sessions(session_id)"),
         ("source_message_id", "INTEGER"),  # AgentView messages.id（可回查）
         ("ordinal", "INTEGER NOT NULL"),
-        ("role", "TEXT NOT NULL CHECK(role IN ('user','assistant','developer','system','tool'))"),
+        ("role", "TEXT NOT NULL CHECK(role IN ('user','assistant','developer','system','tool','reasoning'))"),
         ("content", "TEXT"),  # 仅 eligible session 且二次扫描通过才有正文
         ("content_length", "INTEGER"),
         ("timestamp", "TEXT"),

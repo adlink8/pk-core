@@ -28,9 +28,11 @@ This module owns ONLY event-to-legacy mapping:
 
 It never activates a generation and never touches ``ce_generation_authority``
 (activation belongs to :mod:`.event_generations`). Projected message rows come
-only from message-kind events; reasoning, usage, compaction summaries,
-boundaries, file-context and unknown-native events are reported as excluded
-and never flattened into user facts (D-23). Each event maps to at most one row,
+from message-kind events. **D-23-rev1 (2026-09-30, user mandate "全部入库")**:
+REASONING events now project to ``canonical_messages`` rows with
+``role='reasoning'``; usage, compaction summaries, boundaries, file-context and
+unknown-native events are kept verbatim in ``canonical_event_extras`` (still
+never flattened into user facts). Each event maps to at most one row per table,
 so there is no double counting.
 
 No I/O outside the caller-provided DB path; no network, no provider calls.
@@ -59,11 +61,15 @@ from personal_knowledge.application.conversation.uniform_id_migration import (
 )
 
 # Kinds that project to canonical_messages rows, with the legacy role mapping.
+# 2026-09-30 D-23-rev1（用户令"全部入库"）：REASONING 从排除清单升格为消息行
+# role='reasoning'——思维链此前只落在 ce_events 事件层（17.7 万条不可检索）。
+# 前置条件：canonical_messages.role 的 CHECK 约束已同步放宽（schema v2.3.0）。
 MESSAGE_KINDS: dict[EventKind, str] = {
     EventKind.USER_MESSAGE: "user",
     EventKind.ASSISTANT_MESSAGE: "assistant",
     EventKind.DEVELOPER_MESSAGE: "developer",
     EventKind.SYSTEM_MESSAGE: "system",
+    EventKind.REASONING: "reasoning",
 }
 
 # Kinds that project to canonical_tool_events rows, with the legacy source_kind.
@@ -73,6 +79,10 @@ TOOL_KINDS: dict[EventKind, str] = {
 }
 
 # Event kinds intentionally not flattened into a compatibility row.
+# 2026-09-30 D-23-rev1：EXCLUDED_KINDS 语义变更——这些 kind 不再是"只报告不落库"，
+# 而是整行留底到 canonical_event_extras（usage/boundary/file_context/
+# compaction/unknown_native/session_lifecycle 全量入库）。EXCLUDED_KINDS 名字
+# 保留（报表口径兼容），语义 = "进 extras 留底表的事件种类"。
 EXCLUDED_KINDS: frozenset[EventKind] = frozenset(
     kind
     for kind in EventKind
@@ -98,6 +108,7 @@ def _chunks(values: list, size: int = _PARAM_CHUNK):
 PROJECTED_TABLES: tuple[str, ...] = (
     "canonical_sessions",
     "canonical_messages",
+    "canonical_event_extras",
     "canonical_tool_events",
 )
 
@@ -119,6 +130,14 @@ _TOOL_COLUMNS = (
     "canonical_tool_id", "canonical_session_id", "source", "source_kind",
     "tool_name", "category", "status", "call_index", "subagent_session_id",
     "content_length", "timestamp",
+)
+
+# D-23-rev1（2026-09-30）：canonical_event_extras 留底表列序
+# （与 _ensure_tables 的建表 DDL 一致）。
+_EXTRA_COLUMNS = (
+    "canonical_event_id", "canonical_session_id", "source", "kind", "ordinal",
+    "occurred_at", "native_locator", "native_payload_ref", "summary",
+    "content", "content_length",
 )
 
 
@@ -161,6 +180,9 @@ class CompatibilityProjectionReport:
     # canonical id（``|``→``/`` 替换的已知碰撞面）。id 公式固化在存量数据里
     # 不能改，碰撞只能观测：计数暴露在这里，让静默覆盖变成可审计事件。
     sanitized_id_collisions: int = 0
+    # D-23-rev1（2026-09-30）：原 EXCLUDED_KINDS 事件的全量留底行
+    # （canonical_event_extras）。excluded 仍保留四字段摘要做报表兼容。
+    extras: tuple[dict, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -169,6 +191,7 @@ class CompatibilityProjectionReport:
             "messages": list(self.messages),
             "tools": list(self.tools),
             "excluded": list(self.excluded),
+            "extras": list(self.extras),
             "fingerprint": self.fingerprint.to_dict(),
             "sanitized_id_collisions": self.sanitized_id_collisions,
         }
@@ -200,7 +223,7 @@ def compute_projection(
 
     sessions_by_id = {s["session_id"]: s for s in session_rows}
     family_by_session = {s["session_id"]: s.get("family", "") for s in session_rows}
-    messages, tools, excluded = _classify_events(
+    messages, tools, excluded, extras = _classify_events(
         generation_id, sessions_by_id, event_rows
     )
     # Keys need each session's own events (P1-19 content digest fallback), so
@@ -226,6 +249,7 @@ def compute_projection(
                                            raw_key_by_id, collisions)
     projected_tools = _project_tools(key_by_session, tools, collapsed,
                                      seen_tools, raw_key_by_id, collisions)
+    projected_extras = _project_extras(key_by_session, extras)
 
     fingerprint = _make_fingerprint(
         generation_id, projected_sessions, projected_messages, projected_tools
@@ -236,18 +260,59 @@ def compute_projection(
         messages=tuple(projected_messages),
         tools=tuple(projected_tools),
         excluded=tuple(excluded),
+        extras=tuple(projected_extras),
         fingerprint=fingerprint,
         collapsed_duplicate_ids=collapsed[0],
         sanitized_id_collisions=collisions[0],
     )
 
 
+def _project_extras(
+    key_by_session: dict[str, tuple[str, str]],
+    extras: list[dict],
+) -> list[dict]:
+    """D-23-rev1（2026-09-30）：把原 EXCLUDED_KINDS 事件整行留底到
+    canonical_event_extras。不做有损归并——事件原文字段（summary/content/
+    payload ref）原样保留，id 用 ex| 前缀按 (family, native, address) 派生，
+    与消息/工具 id 同一寻址规则。"""
+    projected: list[dict] = []
+    for event in sorted(
+        extras, key=lambda e: (e.get("ordinal") or 0, e.get("event_id") or "")
+    ):
+        sid = event["session_id"]
+        family, native = key_by_session[sid]
+        # 地址段追加 kind：usage/boundary 等多类事件共享同一原生地址
+        # （同 native_event_id），不带 kind 后缀会互吃（实测差 4.9 万行）。
+        address = (
+            adapter_address(event.get("native_event_id"),
+                            event.get("native_locator"))
+            or event["event_id"]) + "|" + EventKind(event["kind"]).value
+        projected.append({
+            "canonical_event_id": "ex|" + make_tool_id(family, native, address).split("|", 1)[1],
+            "canonical_session_id": make_session_id(family, native),
+            "source": "legacy",
+            "kind": EventKind(event["kind"]).value,
+            "ordinal": event.get("ordinal"),
+            "occurred_at": event.get("occurred_at"),
+            "native_locator": event.get("native_locator"),
+            "native_payload_ref": event.get("native_payload_ref"),
+            "summary": event.get("summary"),
+            "content": event.get("content"),
+            "content_length": len(event.get("content") or ""),
+        })
+    return projected
+
+
 def _classify_events(
     generation_id: str,
     sessions_by_id: dict[str, dict],
     event_rows: list[dict],
-) -> tuple[dict[str, list[dict]], dict[str, list[dict]], list[dict]]:
-    """Group events into message rows, tool rows and excluded events.
+) -> tuple[dict[str, list[dict]], dict[str, list[dict]], list[dict], list[dict]]:
+    """Group events into message rows, tool rows, extras rows and excluded events.
+
+    2026-09-30 D-23-rev1：excluded 桶保留（兼容报表），但同一批事件同时产出
+    extras 行（canonical_event_extras 全量留底）——"排除"只指不进消息表，
+    不再指不落库。
 
     Raises :class:`CompatibilityProjectionError` when an event references a
     session that is absent from the generation (fail closed).
@@ -255,6 +320,7 @@ def _classify_events(
     messages: dict[str, list[dict]] = {sid: [] for sid in sessions_by_id}
     tools: dict[str, list[dict]] = {sid: [] for sid in sessions_by_id}
     excluded: list[dict] = []
+    extras: list[dict] = []
     for event in sorted(
         event_rows, key=lambda e: (e.get("ordinal") or 0, e.get("event_id") or "")
     ):
@@ -276,7 +342,8 @@ def _classify_events(
                 "session_id": sid,
                 "native_locator": event.get("native_locator"),
             })
-    return messages, tools, excluded
+            extras.append(event)
+    return messages, tools, excluded, extras
 
 
 def _richer(candidate: dict, prior: dict) -> bool:
@@ -594,6 +661,11 @@ def _project_messages(
             events, key=lambda e: (e.get("ordinal") or 0, e.get("event_id") or "")
         ), start=1):
             role = MESSAGE_KINDS[EventKind(event["kind"])]
+            # D-23-rev1：reasoning 事件与同响应的 message 事件在多个适配器里
+            # 共享同一 native_event_id/locator（codex 实测 65% 撞键）——地址段
+            # 加 "|reasoning" 后缀与消息行区分， otherwise INSERT OR IGNORE
+            # 会把 reasoning 行静默吞掉。
+            reasoning_suffix = "|reasoning" if role == "reasoning" else ""
             # ``content`` is the exact mapped source body.  ``None`` means an
             # older adapter did not emit the optional field, so the bounded
             # summary remains a backward-compatible fallback.  An explicit
@@ -606,7 +678,7 @@ def _project_messages(
                 adapter_address(event.get("native_event_id"),
                                 event.get("native_locator"),
                                 address_family)
-                or event["event_id"])
+                or event["event_id"]) + reasoning_suffix
             new_id = make_message_id(family, native, address)
             collisions[0] += _note_id_collision(
                 raw_key_by_id, new_id, (family, native, address)
@@ -1006,6 +1078,25 @@ def upsert_compatibility_projection(
                 "INSERT OR IGNORE INTO ce_projected_ids VALUES (?,?)",
                 [(table, str(row[columns[0]])) for row in rows],
             )
+    # D-23-rev1：extras 留底表幂等写入（INSERT OR IGNORE，不做 read-merge-write
+    # ——留底行是事件原样投影，没有"更富副本"合并语义）。inserted 用真实
+    # changes 差值——写成构造数会让幂等重放虚报新行（live_sync 测试实锤）。
+    if report.extras:
+        cols = _EXTRA_COLUMNS
+        marks = ",".join("?" * len(cols))
+        before = con.total_changes
+        con.executemany(
+            f"INSERT OR IGNORE INTO canonical_event_extras "
+            f"({','.join(cols)}) VALUES ({marks})",
+            [tuple(row[c] for c in cols) for row in report.extras],
+        )
+        counts["canonical_event_extras"] = {
+            "inserted": con.total_changes - before, "updated": 0}
+        con.executemany(
+            "INSERT OR IGNORE INTO ce_projected_ids VALUES (?,?)",
+            [("canonical_event_extras", row["canonical_event_id"])
+             for row in report.extras],
+        )
     return counts
 
 
@@ -1046,6 +1137,7 @@ def clear_compatibility_projection(con: sqlite3.Connection) -> None:
         "canonical_sessions": "canonical_session_id",
         "canonical_messages": "canonical_message_id",
         "canonical_tool_events": "canonical_tool_id",
+        "canonical_event_extras": "canonical_event_id",
     }
     for table_name, ids in by_table.items():
         column = id_column[table_name]
@@ -1102,6 +1194,17 @@ def _ensure_tables(con: sqlite3.Connection) -> None:
             source_kind TEXT NOT NULL, tool_name TEXT, category TEXT, status TEXT,
             call_index INTEGER, subagent_session_id TEXT, content_length INTEGER,
             timestamp TEXT)"""
+    )
+    # D-23-rev1（2026-09-30，用户令"全部入库"）：原 EXCLUDED_KINDS 事件的
+    # 全量留底表——usage/边界/file_context/compaction/unknown_native 等。
+    # 留底 = 原字段原样，不做有损归并；幂等 INSERT OR IGNORE。
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS canonical_event_extras (
+            canonical_event_id TEXT PRIMARY KEY,
+            canonical_session_id TEXT NOT NULL, source TEXT NOT NULL,
+            kind TEXT NOT NULL, ordinal INTEGER, occurred_at TEXT,
+            native_locator TEXT, native_payload_ref TEXT, summary TEXT,
+            content TEXT, content_length INTEGER)"""
     )
     # Session-scope lookups/deletes (readers select one session at a time; the
     # rollback owner deletes by ``canonical_session_id IN (...)``) would
