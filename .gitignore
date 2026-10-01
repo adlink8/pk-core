@@ -124,6 +124,7 @@ Thumbs.db
 # Phase 18: machine contracts and aggregate-only governance baseline
 !governance/schema/file_inventory.schema.json
 !governance/baselines/inventory_summary.json
+!governance/manifests/source/tools.json
 
 # Build artifacts
 *.egg-info/

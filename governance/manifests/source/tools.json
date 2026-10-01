@@ -1,0 +1,320 @@
+{
+  "schema_version": 2,
+  "cohort": "tools",
+  "scope": "tracked-text-source-only",
+  "require_git_tracked": true,
+  "entries": [
+    {
+      "source": "integration/scripts/_tools/_audit_raw_fallback_coverage.py",
+      "target": "tools/forensics/_audit_raw_fallback_coverage.py",
+      "inverse": {
+        "source": "tools/forensics/_audit_raw_fallback_coverage.py",
+        "target": "integration/scripts/_tools/_audit_raw_fallback_coverage.py"
+      },
+      "sha256": "c5b1ec4dd298f45edf8f30460c8b80bed295a81aabeb8c6e7dd3250ca4336b74",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/_audit_test_gaps.py",
+      "target": "tools/forensics/_audit_test_gaps.py",
+      "inverse": {
+        "source": "tools/forensics/_audit_test_gaps.py",
+        "target": "integration/scripts/_tools/_audit_test_gaps.py"
+      },
+      "sha256": "58eb98a42935130e45292cce6ea6ba827c10be2d540479f6dae3e9fef6c3e1c9",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/_fix_shims.py",
+      "target": "tools/migrations/_fix_shims.py",
+      "inverse": {
+        "source": "tools/migrations/_fix_shims.py",
+        "target": "integration/scripts/_tools/_fix_shims.py"
+      },
+      "sha256": "75232f6d5407a5fc7628d9ad4556cd6ba360f7351184127ab0c827cac09dbf69",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/_fix_stage1_paths.py",
+      "target": "tools/migrations/_fix_stage1_paths.py",
+      "inverse": {
+        "source": "tools/migrations/_fix_stage1_paths.py",
+        "target": "integration/scripts/_tools/_fix_stage1_paths.py"
+      },
+      "sha256": "3ccb87ff42ec69ece66c045e43c5b94142bc1484f8c37a77e28f1f3f34b25f78",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/_inspect_agentsview.py",
+      "target": "tools/forensics/_inspect_agentsview.py",
+      "inverse": {
+        "source": "tools/forensics/_inspect_agentsview.py",
+        "target": "integration/scripts/_tools/_inspect_agentsview.py"
+      },
+      "sha256": "0a1209011a8853c1d2010bf4959bfa462a355267e55d9b7ce744e81c85b1b114",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/_inspect_agentsview_insights.py",
+      "target": "tools/forensics/_inspect_agentsview_insights.py",
+      "inverse": {
+        "source": "tools/forensics/_inspect_agentsview_insights.py",
+        "target": "integration/scripts/_tools/_inspect_agentsview_insights.py"
+      },
+      "sha256": "4932698fda1e5139c8b14483ff474c79be9715a667cea8d98f1d7e1a2f535b3e",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/_inspect_sqlite.py",
+      "target": "tools/forensics/_inspect_sqlite.py",
+      "inverse": {
+        "source": "tools/forensics/_inspect_sqlite.py",
+        "target": "integration/scripts/_tools/_inspect_sqlite.py"
+      },
+      "sha256": "db089574f4c581186539a7e5951aba737312ecc8e25c8e18751db0fb1f48ee18",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/_inventory_analysis.py",
+      "target": "tools/forensics/_inventory_analysis.py",
+      "inverse": {
+        "source": "tools/forensics/_inventory_analysis.py",
+        "target": "integration/scripts/_tools/_inventory_analysis.py"
+      },
+      "sha256": "fad7c1a6e048a2f55b6d76ec879084ea3db4579f0ec8697a022aabd1dc80629b",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/_probe_google_db.py",
+      "target": "tools/forensics/_probe_google_db.py",
+      "inverse": {
+        "source": "tools/forensics/_probe_google_db.py",
+        "target": "integration/scripts/_tools/_probe_google_db.py"
+      },
+      "sha256": "dc3a84933319b3766f2efd0b02168a35964c0a95d2bd00056ba810e6dfc70f9a",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/_reorganize_scripts.py",
+      "target": "tools/forensics/_reorganize_scripts.py",
+      "inverse": {
+        "source": "tools/forensics/_reorganize_scripts.py",
+        "target": "integration/scripts/_tools/_reorganize_scripts.py"
+      },
+      "sha256": "cf151448ad5cd28efbbd5d5caa954b353f7e0f648d698859240384a646de3b4a",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/build_generation_gap_analysis.py",
+      "target": "tools/supported/build_generation_gap_analysis.py",
+      "inverse": {
+        "source": "tools/supported/build_generation_gap_analysis.py",
+        "target": "integration/scripts/_tools/build_generation_gap_analysis.py"
+      },
+      "sha256": "8f7ea66d4f83695196e97fddb030606df056fba4d0451065b6687c62f7ddcb64",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/phase15_wave0_investigate.py",
+      "target": "tools/forensics/phase15_wave0_investigate.py",
+      "inverse": {
+        "source": "tools/forensics/phase15_wave0_investigate.py",
+        "target": "integration/scripts/_tools/phase15_wave0_investigate.py"
+      },
+      "sha256": "fb31a07dd318521dbed76f322a4d9cbd21540abb8fdada5f54ea26a0a1f59187",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/phase15_wave4_eval.py",
+      "target": "tools/forensics/phase15_wave4_eval.py",
+      "inverse": {
+        "source": "tools/forensics/phase15_wave4_eval.py",
+        "target": "integration/scripts/_tools/phase15_wave4_eval.py"
+      },
+      "sha256": "e4837660670689f0b603156f7f076aa6b19c061f0a7623edaa5111686c98e9ca",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/_tools/reorganize_analysis_dir.py",
+      "target": "tools/supported/reorganize_analysis_dir.py",
+      "inverse": {
+        "source": "tools/supported/reorganize_analysis_dir.py",
+        "target": "integration/scripts/_tools/reorganize_analysis_dir.py"
+      },
+      "sha256": "5f2c28648d5c6c84cf09f9821b379cc5901e06034f2aef47bd2282ba1e607979",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/examples/langchain_tool.py",
+      "target": "tools/forensics/examples/langchain_tool.py",
+      "inverse": {
+        "source": "tools/forensics/examples/langchain_tool.py",
+        "target": "integration/scripts/examples/langchain_tool.py"
+      },
+      "sha256": "4bf5a8b664b9418d512fd56965b9c71c5594f4543f923c6b991059159203dbd0",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    },
+    {
+      "source": "integration/scripts/examples/rag_inject.py",
+      "target": "tools/forensics/examples/rag_inject.py",
+      "inverse": {
+        "source": "tools/forensics/examples/rag_inject.py",
+        "target": "integration/scripts/examples/rag_inject.py"
+      },
+      "sha256": "b3aae10952ffabc2db62a69f06fc5be52e1ff3ff7ca8d6da0225a7ce09182c3f",
+      "consumers": [],
+      "dirty": true,
+      "tracked": true,
+      "authorized_untracked": true,
+      "approved_prestate": true
+    }
+  ],
+  "consumer_rewrites": [],
+  "registry": [
+    {
+      "source": "integration/scripts/_tools/_audit_raw_fallback_coverage.py",
+      "target": "tools/forensics/_audit_raw_fallback_coverage.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/_audit_test_gaps.py",
+      "target": "tools/forensics/_audit_test_gaps.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/_fix_shims.py",
+      "target": "tools/migrations/_fix_shims.py",
+      "category": "migrations"
+    },
+    {
+      "source": "integration/scripts/_tools/_fix_stage1_paths.py",
+      "target": "tools/migrations/_fix_stage1_paths.py",
+      "category": "migrations"
+    },
+    {
+      "source": "integration/scripts/_tools/_inspect_agentsview.py",
+      "target": "tools/forensics/_inspect_agentsview.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/_inspect_agentsview_insights.py",
+      "target": "tools/forensics/_inspect_agentsview_insights.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/_inspect_sqlite.py",
+      "target": "tools/forensics/_inspect_sqlite.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/_inventory_analysis.py",
+      "target": "tools/forensics/_inventory_analysis.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/_probe_google_db.py",
+      "target": "tools/forensics/_probe_google_db.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/_reorganize_scripts.py",
+      "target": "tools/forensics/_reorganize_scripts.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/build_generation_gap_analysis.py",
+      "target": "tools/supported/build_generation_gap_analysis.py",
+      "category": "supported"
+    },
+    {
+      "source": "integration/scripts/_tools/phase15_wave0_investigate.py",
+      "target": "tools/forensics/phase15_wave0_investigate.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/phase15_wave4_eval.py",
+      "target": "tools/forensics/phase15_wave4_eval.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/_tools/reorganize_analysis_dir.py",
+      "target": "tools/supported/reorganize_analysis_dir.py",
+      "category": "supported"
+    },
+    {
+      "source": "integration/scripts/examples/langchain_tool.py",
+      "target": "tools/forensics/examples/langchain_tool.py",
+      "category": "forensics"
+    },
+    {
+      "source": "integration/scripts/examples/rag_inject.py",
+      "target": "tools/forensics/examples/rag_inject.py",
+      "category": "forensics"
+    }
+  ],
+  "approval": {
+    "status": "approved-by-user",
+    "authorization": "preserve and govern; complete all tasks"
+  },
+  "manifest_sha256": "1e414ad71b14335453f705ee24532495139cdccd6ac8882093027a8d5923272c"
+}
