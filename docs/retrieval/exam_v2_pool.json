@@ -155,7 +155,7 @@
    "发现Vaccine全部接口缺少角色校验与宠物归属校验的高危越权/IDOR漏洞"
   ],
   "quotes": [
-   "你是一个资深 Java/Spring Boot 代码审计员。请对位于 `C:/Users/li/Desktop/Myproject/petcare/pet-hospital-management-system/petcare-backend` 的宠物医院后台做**只读**逻辑漏洞审计，找出类似以下性质的缺陷（不要改代码，只产出结构化报告）",
+   "你是一个资深 Java/Spring Boot 代码审计员。请对位于 `<user>/Myproject/petcare/pet-hospital-management-system/petcare-backend` 的宠物医院后台做**只读**逻辑漏洞审计，找出类似以下性质的缺陷（不要改代码，只产出结构化报告）",
    "先读实体类（`src/main/java/com/petcare/entity/`）、DTO（`dto/`）、Controller（`controller/`）、Service（`service/`）、Mapper xml（`resources/mapper/`），理解数据模型与写入路径",
    "优先报告\"会导致数据错误/越权/空指针\"的真实缺陷，忽略纯代码风格问题"
   ]
@@ -865,7 +865,7 @@
   "theme": "执行 novel-mind GSD plan 10-03：服务端 Unicode 选区校验与可见上下文组装",
   "asks": [
    "Execute GSD plan 10-03 for novel-mind at: `D:\\ADLINK\\Myproject\\novel-mind\\.planning\\phases\\10-reader-selection-ai-and-multi-session-conversations\\10-03-PLAN.md`",
-   "Follow `@C:/Users/li/.codex/get-shit-done/workflows/execute-plan.md` and SUMMARY template",
+   "Follow `@<user>/.codex/get-shit-done/workflows/execute-plan.md` and SUMMARY template",
    "Depends on 10-01 contracts. May touch different files than 10-02 — if you risk merge conflicts with API routers both plans touch, prefer selection/context services and leave lifecy",
    "Close-out: production commit → 10-03-SUMMARY → STATE/ROADMAP carefully (merge with any concurrent 10-02 updates)"
   ],
@@ -1343,7 +1343,7 @@
   "quotes": [
    "让我对每份报告添加缺失的：截图标注、实验总结、心得体会",
    "为了提高效率，我写一个Python脚本批量处理所有6个实验报告，统一插入：截图标注、实验总结、心得体会",
-   "删除 → 改为 mv 剪切到 c:\\Users\\li\\Desktop\\My project\\可删除文件\\ 你人工确认后再彻底删除"
+   "删除 → 改为 mv 剪切到 <user>\\My project\\可删除文件\\ 你人工确认后再彻底删除"
   ]
  },
  {
@@ -1491,7 +1491,7 @@
   ],
   "did": [
    "删除33个codex专用GSD技能，保留通用版及非GSD技能",
-   "排查GitHub克隆网络问题，配置代理后成功克隆adlink8/codex仓库到C:\\Users\\li\\Desktop\\Myproject",
+   "排查GitHub克隆网络问题，配置代理后成功克隆adlink8/codex仓库到<user>\\Myproject",
    "分析Codex架构：Rust核心+Node.js CLI层+Electron桌面端，通过WebSocket通信"
   ],
   "quotes": [
@@ -1818,7 +1818,7 @@
   "seg": 1,
   "theme": "查看Python题库OCR提取流程并完成计算机组成作业",
   "asks": [
-   "查看C:\\Users\\li\\Desktop\\Python题库OCR提取\\data\\raw的整个提取流程",
+   "查看<user>\\Python题库OCR提取\\data\\raw的整个提取流程",
    "完成我计算机组成的作业",
    "按照pdf里标准内容",
    "主要是清晰度"
@@ -1829,7 +1829,7 @@
    "计划阅读计算机组成作业PDF"
   ],
   "quotes": [
-   "C:\\Users\\li\\Desktop\\Python题库OCR提取\\data\\raw查看整个提取流程 然后完成我计算机组成的作业 按照 pdf 里标准内容 主要是清晰度"
+   "<user>\\Python题库OCR提取\\data\\raw查看整个提取流程 然后完成我计算机组成的作业 按照 pdf 里标准内容 主要是清晰度"
   ]
  },
  {
@@ -1839,7 +1839,7 @@
   "seg": 1,
   "theme": "NovelMind前端项目全面审计，排查文件缺失与依赖问题",
   "asks": [
-   "Thoroughly audit the NovelMind frontend project at c:/Users/li/Desktop/Myproject/novel-mind/frontend",
+   "Thoroughly audit the NovelMind frontend project at <user>/Myproject/novel-mind/frontend",
    "Read ALL existing files in detail, report full content for each file, note empty directories explicitly",
    "Identify all missing pieces: missing imports, missing components referenced but not created, missing pages, missing utility functions, missing type definitions, missing stores, mis",
    "Check package.json for missing dependencies (e.g. shadcn/ui is mentioned in README but not in deps)"
@@ -1850,7 +1850,7 @@
    "搜索确认next-env.d.ts文件不存在"
   ],
   "quotes": [
-   "Thoroughly audit the NovelMind frontend project at c:/Users/li/Desktop/Myproject/novel-mind/frontend",
+   "Thoroughly audit the NovelMind frontend project at <user>/Myproject/novel-mind/frontend",
    "Read ALL existing files in detail",
    "Identify all missing pieces: missing imports, missing components referenced but not created, missing pages, missing utility functions, missing type definitions, missing stores, missing hooks, etc."
   ]
@@ -1917,7 +1917,7 @@
   ],
   "quotes": [
    ".planning 里文件内容太混乱了 需要整理一下",
-   "C:\\Users\\li\\Desktop\\My project 该文件夹用来存放 课程文件中的代码数据",
+   "<user>\\My project 该文件夹用来存放 课程文件中的代码数据",
    ".planning是 所有工作的文件存放吗"
   ]
  },

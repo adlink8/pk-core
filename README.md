@@ -29,6 +29,14 @@
 
 ---
 
+## 🧭 文档导航
+
+- [集成与脚本总览](integration/README.md)：integration 目录的脚本索引与用法；
+- [路线图](.planning/ROADMAP.md)：阶段性目标与演进计划；
+- [仓库分区架构](docs/architecture/repository-zones.md)：代码、数据与治理目录的分区规则。
+
+---
+
 ## 🌟 核心特性
 
 - 🛡️ **100% 本地优先与隐私隔离**：代码完全开源，所有私有对话数据库（`data/`）、知识库与向量集合（`var/`）默认严格本地隔离，绝无云端数据泄露风险。

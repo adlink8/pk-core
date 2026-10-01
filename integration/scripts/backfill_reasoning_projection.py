@@ -19,8 +19,9 @@ import argparse
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, r"D:/ADLINK/数据分析/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.stdout.reconfigure(encoding="utf-8")
 
 from personal_knowledge.core.conversation_events import EventKind

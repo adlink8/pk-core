@@ -3,6 +3,12 @@ data/**
 !data/README.md
 var/**
 !var/README.md
+!var/db/
+var/db/**
+!var/db/README.md
+!var/runtime/
+var/runtime/**
+!var/runtime/README.md
 # analysis reports are runtime-generated; only a marker README is versioned
 !var/reports/
 var/reports/**

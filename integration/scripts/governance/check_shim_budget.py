@@ -6,9 +6,13 @@ import ast
 import json
 import re
 import importlib.util
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 SCRIPTS = ROOT / "tools" / "compat" / "v1_1"
 MANIFEST = ROOT / "governance" / "manifests" / "entrypoints.yaml"
 TARGET = re.compile(r"Compatibility shim ->\s*([A-Za-z0-9_.]+)")
@@ -35,7 +39,12 @@ def discover_shims() -> list[dict[str, object]]:
                     and node.func.id == "import_module" and node.args
                     and isinstance(node.args[0], ast.Constant)]
         target = imported[0] if imported else match.group(1)
-        target_path = importlib.util.find_spec(target)
+        try:
+            target_path = importlib.util.find_spec(target)
+        except ModuleNotFoundError:
+            # A dotted target whose parent package is missing must degrade to a
+            # per-shim error entry instead of crashing the whole gate.
+            target_path = None
         imports_target = bool(imported)
         result.append({"path": path.relative_to(ROOT).as_posix(), "target": target,
                        "target_exists": target_path is not None, "static_parity": imports_target,
@@ -63,7 +72,7 @@ def main() -> int:
     errors.extend(_baseline_errors(
         len(tools), int(manifest["tool_registry"]["expected_count"]), "tool", only_down=only_down
     ))
-    errors.extend(f"invalid target/parity: {s['path']}" for s in shims if not s["target_exists"] or not s["static_parity"])
+    errors.extend(f"invalid target/parity: {s['path']} -> {s['target']}" for s in shims if not s["target_exists"] or not s["static_parity"])
     result = {"ok": not errors, "shim_count": len(shims), "tool_count": len(tools),
               "errors": errors, "resolved_shims": shims,
               "retirement_preview": manifest["retirement_cohorts"] if args.preview else []}
